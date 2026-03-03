@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kumiho-memory"
+version = "0.3.12"
+description = "Universal memory provider for AI agents (Redis + Kumiho)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Kumiho Clouds", email = "support@kumiho.cloud"}
+]
+maintainers = [
+    {name = "Kumiho Clouds", email = "support@kumiho.cloud"}
+]
+keywords = [
+    "kumiho",
+    "memory",
+    "ai-agents",
+    "redis",
+    "cognitive-memory",
+    "summarization",
+    "conversational-ai",
+    "mcp",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "kumiho>=0.9.0",
+    "redis[hiredis]>=5.0.0",
+    "requests>=2.31.0",
+]
+
+[project.urls]
+Homepage = "https://kumiho.io"
+Documentation = "https://docs.kumiho.io"
+Repository = "https://github.com/kumihoclouds/kumiho-python"
+Issues = "https://github.com/kumihoclouds/kumiho-python/issues"
+Changelog = "https://github.com/kumihoclouds/kumiho-python/blob/main/kumiho-memory/RELEASE_NOTES.md"
+
+[project.optional-dependencies]
+openai = [
+    "openai>=1.0.0",
+]
+anthropic = [
+    "anthropic>=0.8.0",
+]
+all = [
+    "kumiho-memory[openai,anthropic]",
+]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-cov>=4.1.0",
+    "mypy>=1.8.0",
+    "types-requests>=2.31.0",
+]
+
+[project.scripts]
+kumiho-memory = "kumiho_memory.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kumiho_memory*"]
+
+[tool.setuptools.package-data]
+kumiho_memory = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["kumiho_memory"]
