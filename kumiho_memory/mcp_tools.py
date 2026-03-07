@@ -139,7 +139,7 @@ def tool_chat_add(args: Dict[str, Any]) -> Dict[str, Any]:
     manager = _get_manager()
     return asyncio.run(
         manager.redis_buffer.add_message(
-            project=manager.project,
+            project=args.get("project", manager.project),
             session_id=args["session_id"],
             role=args.get("role", "user"),
             content=args["message"],
@@ -153,7 +153,7 @@ def tool_chat_get(args: Dict[str, Any]) -> Dict[str, Any]:
     manager = _get_manager()
     return asyncio.run(
         manager.redis_buffer.get_messages(
-            project=manager.project,
+            project=args.get("project", manager.project),
             session_id=args["session_id"],
             limit=args.get("limit", 50),
         )
@@ -165,7 +165,7 @@ def tool_chat_clear(args: Dict[str, Any]) -> Dict[str, Any]:
     manager = _get_manager()
     return asyncio.run(
         manager.redis_buffer.clear_session(
-            manager.project,
+            args.get("project", manager.project),
             args["session_id"],
         )
     )
@@ -344,6 +344,10 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Project name for Redis key namespace. Defaults to server's configured project.",
+                },
                 "session_id": {
                     "type": "string",
                     "description": "Session identifier.",
@@ -371,6 +375,10 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Project name for Redis key namespace. Defaults to server's configured project.",
+                },
                 "session_id": {
                     "type": "string",
                     "description": "Session identifier.",
@@ -390,6 +398,10 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Project name for Redis key namespace. Defaults to server's configured project.",
+                },
                 "session_id": {
                     "type": "string",
                     "description": "Session identifier.",
