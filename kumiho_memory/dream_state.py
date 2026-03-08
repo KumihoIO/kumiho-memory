@@ -371,21 +371,32 @@ class DreamState:
             kwargs: Dict[str, Any] = {
                 "routing_key_filter": self.routing_key_filter,
                 "kref_filter": f"kref://{self.project}/**",
-                "timeout": self.event_timeout,
             }
             if cursor is not None:
                 kwargs["cursor"] = cursor
             else:
                 kwargs["from_beginning"] = True
 
+            # Use a generous gRPC deadline (5 min) for the RPC itself —
+            # connection setup, auth, and tenant resolution can be slow.
+            # The *collection window* is enforced client-side via
+            # time.monotonic() so we don't cut off the stream prematurely.
+            kwargs["timeout"] = 300.0
+
+            deadline = time.monotonic() + self.event_timeout
+
             try:
                 for event in sdk.event_stream(**kwargs):
                     collected.append(event)
                     if event.cursor:
                         last = event.cursor
+                    if time.monotonic() >= deadline:
+                        logger.debug(
+                            "Collection window elapsed after %d events",
+                            len(collected),
+                        )
+                        break
             except Exception as exc:
-                # DEADLINE_EXCEEDED is normal — it's how the stream ends
-                # after draining all available events.
                 _is_deadline = (
                     hasattr(exc, "code")
                     and callable(exc.code)
@@ -393,7 +404,7 @@ class DreamState:
                 )
                 if _is_deadline:
                     logger.debug(
-                        "Event collection complete (timeout after %d events)",
+                        "Event stream ended (timeout after %d events)",
                         len(collected),
                     )
                 else:
