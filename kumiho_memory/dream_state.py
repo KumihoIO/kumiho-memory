@@ -184,7 +184,7 @@ class DreamState:
         cursor_item_name: str = "_dream_state",
         batch_size: int = 20,
         routing_key_filter: str = "revision.*",
-        event_timeout: float = 5.0,
+        event_timeout: float = 10.0,
         dry_run: bool = False,
         max_deprecation_ratio: float = 0.5,
         allow_published_deprecation: bool = False,
@@ -384,7 +384,20 @@ class DreamState:
                     if event.cursor:
                         last = event.cursor
             except Exception as exc:
-                logger.warning("Event stream ended: %s", exc)
+                # DEADLINE_EXCEEDED is normal — it's how the stream ends
+                # after draining all available events.
+                _is_deadline = (
+                    hasattr(exc, "code")
+                    and callable(exc.code)
+                    and str(exc.code()) == "StatusCode.DEADLINE_EXCEEDED"
+                )
+                if _is_deadline:
+                    logger.debug(
+                        "Event collection complete (timeout after %d events)",
+                        len(collected),
+                    )
+                else:
+                    logger.warning("Event stream error: %s", exc)
 
             return collected, last
 
