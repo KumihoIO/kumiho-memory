@@ -2,13 +2,13 @@
 
 The Dream State runs periodically (e.g. nightly at 3 AM) to:
 
-1. Stream new memory events since the last cursor.
+1. Query revisions created or updated since the last run.
 2. Fetch full revision data for changed memories.
 3. Inspect bundles for new conversation groupings.
 4. Use an LLM to assess each memory: deprecate low-value ones,
    enrich metadata / tags, and suggest relationships.
 5. Apply the assessed changes to the Kumiho graph.
-6. Persist the cursor and generate a Markdown report.
+6. Persist the timestamp and generate a Markdown report.
 
 Usage::
 
@@ -64,7 +64,7 @@ class DreamStateStats:
     metadata_updated: int = 0
     tags_added: int = 0
     edges_created: int = 0
-    last_cursor: Optional[str] = None
+    last_cursor: Optional[str] = None  # Kept for backward-compat in report dict
     duration_ms: int = 0
     errors: List[str] = field(default_factory=list)
 
@@ -156,14 +156,10 @@ class DreamState:
     artifact_root:
         Local directory for writing report artifacts.
     cursor_item_name:
-        Item name used to persist the event-stream cursor and
+        Item name used to persist the run timestamp and
         Dream State reports (default ``_dream_state``).
     batch_size:
         Number of memories to assess per LLM call.
-    routing_key_filter:
-        Event routing-key pattern (default ``revision.*``).
-    event_timeout:
-        Seconds to wait for the event stream before stopping collection.
     dry_run:
         If *True*, assess but do **not** mutate anything in Kumiho.
     max_deprecation_ratio:
@@ -172,6 +168,9 @@ class DreamState:
     allow_published_deprecation:
         If *True*, published items may be deprecated. Use with caution.
         When relaxed, a warning is logged and recorded in the audit report.
+    kind_filter:
+        Item kind to process (default ``conversation``).  Set to empty
+        string to process all item kinds.
     """
 
     def __init__(
@@ -183,17 +182,18 @@ class DreamState:
         artifact_root: Optional[str] = None,
         cursor_item_name: str = "_dream_state",
         batch_size: int = 20,
-        routing_key_filter: str = "revision.*",
-        event_timeout: float = 10.0,
         dry_run: bool = False,
         max_deprecation_ratio: float = 0.5,
         allow_published_deprecation: bool = False,
+        kind_filter: str = "conversation",
+        # Legacy parameters — accepted but ignored for backward compatibility
+        routing_key_filter: str = "revision.*",
+        event_timeout: float = 10.0,
     ) -> None:
         self.project = project
         self.cursor_item_name = cursor_item_name
         self.batch_size = batch_size
-        self.routing_key_filter = routing_key_filter
-        self.event_timeout = event_timeout
+        self.kind_filter = kind_filter
         self.dry_run = dry_run
 
         if not (0.1 <= max_deprecation_ratio <= 0.9):
@@ -234,30 +234,36 @@ class DreamState:
 
         start = time.monotonic()
         stats = DreamStateStats()
+        run_started_at = datetime.now(timezone.utc).isoformat()
 
         try:
             # 1. Ensure cursor item exists
             cursor_kref = self._ensure_cursor_item(kumiho)
 
-            # 2. Load cursor
-            cursor = self._load_cursor(kumiho, cursor_kref)
+            # 2. Load last_run_at timestamp
+            last_run_at = self._load_last_run_at(kumiho, cursor_kref)
 
-            # 3. Collect events
-            events, last_cursor = await self._collect_events(
-                kumiho, cursor
+            # 3. Collect revisions created/updated since last run
+            revisions = await asyncio.to_thread(
+                self._collect_revisions, kumiho, last_run_at
             )
-            stats.events_processed = len(events)
-            if not events:
+            stats.events_processed = len(revisions)
+            if not revisions:
+                logger.info(
+                    "Dream State: no new revisions since %s",
+                    last_run_at or "beginning",
+                )
                 stats.duration_ms = int((time.monotonic() - start) * 1000)
+                # Still save timestamp so next run skips this window
+                self._save_last_run_at(kumiho, cursor_kref, run_started_at)
                 return self._build_result(stats, report_kref=None)
 
-            # 4. Fetch revisions
-            revisions = self._fetch_revisions(kumiho, events)
+            # 4. Inspect bundles (from revision item krefs)
+            bundle_context = self._inspect_bundles_from_revisions(
+                kumiho, revisions
+            )
 
-            # 5. Inspect bundles
-            bundle_context = self._inspect_bundles(kumiho, events)
-
-            # 6. Assess in batches
+            # 5. Assess in batches
             all_assessments: List[MemoryAssessment] = []
             for i in range(0, len(revisions), self.batch_size):
                 batch = revisions[i : i + self.batch_size]
@@ -266,15 +272,13 @@ class DreamState:
 
             stats.revisions_assessed = len(all_assessments)
 
-            # 7. Apply actions
+            # 6. Apply actions
             self._apply_actions(kumiho, all_assessments, stats)
 
-            # 8. Save cursor
-            if last_cursor:
-                self._save_cursor(kumiho, cursor_kref, last_cursor)
-                stats.last_cursor = last_cursor
+            # 7. Save last_run_at
+            self._save_last_run_at(kumiho, cursor_kref, run_started_at)
 
-            # 9. Generate report
+            # 8. Generate report
             stats.duration_ms = int((time.monotonic() - start) * 1000)
             report_kref = self._generate_report(
                 kumiho, cursor_kref, stats, all_assessments
@@ -293,7 +297,7 @@ class DreamState:
             }
 
     # ------------------------------------------------------------------
-    # Cursor management
+    # Timestamp management (replaces event-stream cursor)
     # ------------------------------------------------------------------
 
     def _ensure_cursor_item(self, sdk: Any) -> str:
@@ -340,150 +344,152 @@ class DreamState:
 
         return self._cursor_item_kref  # type: ignore[return-value]
 
-    def _load_cursor(self, sdk: Any, cursor_kref: str) -> Optional[str]:
-        """Read the last-saved event-stream cursor."""
+    def _load_last_run_at(self, sdk: Any, cursor_kref: str) -> Optional[str]:
+        """Read the last-saved run timestamp (ISO format)."""
         try:
-            return sdk.get_attribute(cursor_kref, "last_cursor")
+            return sdk.get_attribute(cursor_kref, "last_run_at")
         except Exception:
             return None
 
-    def _save_cursor(self, sdk: Any, cursor_kref: str, cursor: str) -> None:
-        """Persist the event-stream cursor and timestamp."""
-        sdk.set_attribute(cursor_kref, "last_cursor", cursor)
-        sdk.set_attribute(
-            cursor_kref,
-            "last_run_at",
-            datetime.now(timezone.utc).isoformat(),
-        )
+    def _save_last_run_at(
+        self, sdk: Any, cursor_kref: str, run_at: str
+    ) -> None:
+        """Persist the run timestamp."""
+        sdk.set_attribute(cursor_kref, "last_run_at", run_at)
 
     # ------------------------------------------------------------------
-    # Event collection
+    # Revision collection (replaces event stream)
     # ------------------------------------------------------------------
 
-    async def _collect_events(
-        self, sdk: Any, cursor: Optional[str]
-    ) -> Tuple[list, Optional[str]]:
-        """Stream events since *cursor* and return ``(events, last_cursor)``."""
+    def _collect_revisions(
+        self, sdk: Any, last_run_at: Optional[str]
+    ) -> list:
+        """Enumerate all spaces in the project, list items, and collect
+        latest revisions that were created after *last_run_at*.
 
-        def _drain() -> Tuple[list, Optional[str]]:
-            collected: list = []
-            last: Optional[str] = None
-            kwargs: Dict[str, Any] = {
-                "routing_key_filter": self.routing_key_filter,
-                "kref_filter": f"kref://{self.project}/**",
-            }
-            if cursor is not None:
-                kwargs["cursor"] = cursor
-            else:
-                kwargs["from_beginning"] = True
-
-            # Use a generous gRPC deadline (5 min) for the RPC itself —
-            # connection setup, auth, and tenant resolution can be slow.
-            # The *collection window* is enforced client-side via
-            # time.monotonic() so we don't cut off the stream prematurely.
-            kwargs["timeout"] = 300.0
-
-            deadline = time.monotonic() + self.event_timeout
-
-            try:
-                for event in sdk.event_stream(**kwargs):
-                    collected.append(event)
-                    if event.cursor:
-                        last = event.cursor
-                    if time.monotonic() >= deadline:
-                        logger.debug(
-                            "Collection window elapsed after %d events",
-                            len(collected),
-                        )
-                        break
-            except Exception as exc:
-                _is_deadline = (
-                    hasattr(exc, "code")
-                    and callable(exc.code)
-                    and str(exc.code()) == "StatusCode.DEADLINE_EXCEEDED"
-                )
-                if _is_deadline:
-                    logger.debug(
-                        "Event stream ended (timeout after %d events)",
-                        len(collected),
-                    )
-                else:
-                    logger.warning("Event stream error: %s", exc)
-
-            return collected, last
-
-        return await asyncio.to_thread(_drain)
-
-    # ------------------------------------------------------------------
-    # Revision fetching
-    # ------------------------------------------------------------------
-
-    def _fetch_revisions(self, sdk: Any, events: list) -> list:
-        """Batch-fetch latest revisions for items mentioned in *events*.
-
-        Only conversation-kind items (memory items) are returned.
-        Already-deprecated revisions are skipped.
+        This replaces the old event-stream approach which suffered from
+        gRPC DEADLINE_EXCEEDED errors and cursor issues.  Direct revision
+        queries are reliable and catch both new items and stacked revisions
+        on existing items.
         """
-        # Deduplicate item krefs from events.
-        seen_items: Dict[str, str] = {}
-        for ev in events:
-            kref_uri = ev.kref.uri
-            # Extract item-level kref (strip ?r=N or ?t=tag suffix).
-            item_kref = kref_uri.split("?")[0]
-            seen_items[item_kref] = kref_uri
-
-        if not seen_items:
-            return []
-
-        item_krefs = list(seen_items.keys())
         try:
-            revisions, _missing = sdk.batch_get_revisions(
-                item_krefs=item_krefs, tag="latest", allow_partial=True
-            )
+            project = sdk.get_project(self.project)
+            if project is None:
+                logger.warning("Project '%s' not found", self.project)
+                return []
         except Exception as exc:
-            logger.warning("batch_get_revisions failed: %s", exc)
+            logger.warning("Failed to get project '%s': %s", self.project, exc)
             return []
 
-        # Filter to conversation items, skip deprecated.
-        result = []
-        for rev in revisions:
-            item_kref_str = rev.item_kref.uri if hasattr(rev, "item_kref") else ""
-            # Accept any item kind that looks like a memory
-            kind = ""
+        # Parse the cutoff timestamp
+        cutoff: Optional[datetime] = None
+        if last_run_at:
             try:
-                kind = rev.item_kref.uri.rsplit(".", 1)[-1] if "." in rev.item_kref.uri else ""
-            except Exception:
-                pass
-            if kind == "conversation" and not getattr(rev, "deprecated", False):
-                result.append(rev)
+                cutoff = datetime.fromisoformat(last_run_at)
+                # Ensure timezone-aware
+                if cutoff.tzinfo is None:
+                    cutoff = cutoff.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Invalid last_run_at timestamp '%s', processing all",
+                    last_run_at,
+                )
 
-        return result
+        # Enumerate all spaces recursively
+        try:
+            spaces = project.get_spaces(recursive=True)
+        except Exception as exc:
+            logger.warning("Failed to enumerate spaces: %s", exc)
+            return []
+
+        collected: list = []
+        cursor_item_kref = self._cursor_item_kref
+
+        for space in spaces:
+            try:
+                kind_arg = self.kind_filter if self.kind_filter else ""
+                items = sdk.get_client().get_items(
+                    parent_path=space.path,
+                    kind_filter=kind_arg,
+                    include_deprecated=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to list items in space '%s': %s",
+                    space.path, exc,
+                )
+                continue
+
+            for item in items:
+                # Skip the _dream_state cursor item itself
+                item_kref = item.kref.uri if hasattr(item, "kref") else ""
+                if cursor_item_kref and item_kref == cursor_item_kref:
+                    continue
+
+                try:
+                    # Get the latest revision
+                    rev = item.get_revision_by_tag("latest")
+                    if rev is None:
+                        continue
+                except Exception:
+                    # No 'latest' tag — try getting all revisions
+                    try:
+                        revs = item.get_revisions()
+                        if not revs:
+                            continue
+                        rev = revs[-1]  # Most recent
+                    except Exception:
+                        continue
+
+                # Skip deprecated revisions
+                if getattr(rev, "deprecated", False):
+                    continue
+
+                # Filter by created_at timestamp
+                if cutoff is not None and rev.created_at:
+                    try:
+                        rev_time = datetime.fromisoformat(rev.created_at)
+                        if rev_time.tzinfo is None:
+                            rev_time = rev_time.replace(tzinfo=timezone.utc)
+                        if rev_time <= cutoff:
+                            continue
+                    except (ValueError, TypeError):
+                        pass  # Can't parse — include it to be safe
+
+                collected.append(rev)
+
+        logger.info(
+            "Dream State: collected %d revisions since %s",
+            len(collected),
+            last_run_at or "beginning",
+        )
+        return collected
 
     # ------------------------------------------------------------------
     # Bundle inspection
     # ------------------------------------------------------------------
 
-    def _inspect_bundles(
-        self, sdk: Any, events: list
+    def _inspect_bundles_from_revisions(
+        self, sdk: Any, revisions: list
     ) -> Dict[str, list]:
-        """For any bundle-related events, fetch current members."""
+        """For any bundle items among the collected revisions, fetch members."""
         bundles: Dict[str, list] = {}
-        for ev in events:
-            kref_uri = ev.kref.uri
-            # bundles have kind "bundle" in their kref
-            if ".bundle" not in kref_uri:
+        for rev in revisions:
+            item_kref = ""
+            try:
+                item_kref = rev.item_kref.uri if hasattr(rev, "item_kref") else ""
+            except Exception:
                 continue
-            bundle_kref = kref_uri.split("?")[0]
-            if bundle_kref in bundles:
+            if ".bundle" not in item_kref:
+                continue
+            if item_kref in bundles:
                 continue
             try:
-                bundle = sdk.get_item(bundle_kref)
+                bundle = sdk.get_item(item_kref)
                 if bundle is not None and hasattr(bundle, "get_members"):
-                    bundles[bundle_kref] = bundle.get_members()
+                    bundles[item_kref] = bundle.get_members()
             except Exception as exc:
-                logger.warning("Failed to inspect bundle %s: %s", bundle_kref, exc)
-
-        return bundles
+                logger.warning("Failed to inspect bundle %s: %s", item_kref, exc)
 
     # ------------------------------------------------------------------
     # LLM assessment

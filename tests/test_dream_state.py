@@ -28,21 +28,12 @@ class FakeKref:
 
 
 @dataclass
-class FakeEvent:
-    routing_key: str
-    kref: FakeKref
-    cursor: Optional[str] = None
-    timestamp: str = "2026-02-04T03:00:00Z"
-    author: str = "system"
-    details: Optional[Dict[str, Any]] = None
-
-
-@dataclass
 class FakeRevision:
     kref: FakeKref
     item_kref: FakeKref
     metadata: Dict[str, str] = field(default_factory=dict)
     deprecated: bool = False
+    created_at: str = "2026-03-08T12:00:00+00:00"
 
 
 class FakeItem:
@@ -50,6 +41,7 @@ class FakeItem:
         self.kref = FakeKref(kref_uri)
         self._members: list = []
         self._revisions: list = []
+        self._latest_rev: Optional[FakeRevision] = None
         self._has_get_members = has_get_members
 
     def create_revision(self, metadata: dict):
@@ -60,6 +52,16 @@ class FakeItem:
         )
         self._revisions.append(rev)
         return _RevisionHandle(rev)
+
+    def get_revision_by_tag(self, tag: str):
+        if tag == "latest" and self._latest_rev is not None:
+            return self._latest_rev
+        if self._revisions:
+            return self._revisions[-1]
+        return None
+
+    def get_revisions(self):
+        return list(self._revisions)
 
     def get_members(self):
         return self._members
@@ -74,6 +76,11 @@ class _RevisionHandle:
         self._artifacts.append((name, path))
 
 
+class FakeSpace:
+    def __init__(self, path: str):
+        self.path = path
+
+
 class FakeClient:
     """Tracks all mutation calls for assertion."""
 
@@ -83,6 +90,7 @@ class FakeClient:
         self.metadata_updates: List[tuple] = []
         self.edges: List[tuple] = []
         self._published_krefs: set = set()
+        self._items_by_space: Dict[str, List[FakeItem]] = {}
 
     def set_deprecated(self, kref, value):
         self.deprecated.append((kref.uri if hasattr(kref, "uri") else str(kref), value))
@@ -104,21 +112,28 @@ class FakeClient:
         uri = kref.uri if hasattr(kref, "uri") else str(kref)
         return uri in self._published_krefs and tag == "published"
 
+    def get_items(self, parent_path="", kind_filter="", include_deprecated=False):
+        return self._items_by_space.get(parent_path, [])
+
 
 def _build_fake_sdk(
     *,
-    events: Optional[List[FakeEvent]] = None,
     revisions: Optional[List[FakeRevision]] = None,
     items: Optional[Dict[str, FakeItem]] = None,
     attributes: Optional[Dict[str, Dict[str, str]]] = None,
     client: Optional[FakeClient] = None,
+    spaces: Optional[List[FakeSpace]] = None,
+    items_by_space: Optional[Dict[str, List[FakeItem]]] = None,
 ):
     """Create a fake ``kumiho`` module that mimics the real SDK."""
-    events = events or []
     revisions = revisions or []
     items = items or {}
     attributes = attributes if attributes is not None else {}
     client = client or FakeClient()
+    spaces = spaces or [FakeSpace("/CognitiveMemory/personal")]
+
+    if items_by_space:
+        client._items_by_space = items_by_space
 
     sdk = types.ModuleType("kumiho")
 
@@ -127,29 +142,21 @@ def _build_fake_sdk(
 
     def get_project(name):
         proj = types.SimpleNamespace()
+        proj.name = name
         proj.get_space = lambda n: types.SimpleNamespace(
             create_item=lambda name, kind: _ensure_item(items, f"kref://{name}/{n}.{kind}")
         )
         proj.create_space = lambda n: types.SimpleNamespace(
             create_item=lambda name, kind: _ensure_item(items, f"kref://{name}/{n}.{kind}")
         )
+        proj.get_spaces = lambda recursive=False: list(spaces)
         return proj
-
-    def event_stream(**kwargs):
-        yield from events
 
     def get_attribute(kref, key):
         return attributes.get(kref, {}).get(key)
 
     def set_attribute(kref, key, value):
         attributes.setdefault(kref, {})[key] = value
-
-    def batch_get_revisions(*, item_krefs=None, tag=None, allow_partial=False):
-        matched = []
-        for rev in revisions:
-            if item_krefs and rev.item_kref.uri in item_krefs:
-                matched.append(rev)
-        return matched, []
 
     def get_revision(kref_str):
         for rev in revisions:
@@ -163,10 +170,8 @@ def _build_fake_sdk(
 
     sdk.get_item = get_item
     sdk.get_project = get_project
-    sdk.event_stream = event_stream
     sdk.get_attribute = get_attribute
     sdk.set_attribute = set_attribute
-    sdk.batch_get_revisions = batch_get_revisions
     sdk.get_revision = get_revision
     sdk.get_client = get_client_fn
     sdk.Kref = FakeKref
@@ -218,16 +223,41 @@ def _cleanup_sdk():
     sys.modules.pop("kumiho", None)
 
 
+def _make_item_with_revision(
+    item_kref: str,
+    rev_kref: str,
+    metadata: Dict[str, str],
+    created_at: str = "2026-03-08T12:00:00+00:00",
+    deprecated: bool = False,
+) -> tuple:
+    """Create a FakeItem with a latest revision pre-attached."""
+    item = FakeItem(item_kref)
+    rev = FakeRevision(
+        kref=FakeKref(rev_kref),
+        item_kref=FakeKref(item_kref),
+        metadata=metadata,
+        deprecated=deprecated,
+        created_at=created_at,
+    )
+    item._latest_rev = rev
+    return item, rev
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 
-def test_run_empty_stream():
-    """No events → report with zeros, cursor unchanged."""
+def test_run_no_revisions():
+    """No revisions since last run → report with zeros."""
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
     items = {cursor_item.kref.uri: cursor_item}
-    sdk, client, attrs = _build_fake_sdk(events=[], items=items)
+    # No items in any space
+    sdk, client, attrs = _build_fake_sdk(
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={},
+    )
 
     async def run():
         ds = _make_dream_state(sdk)
@@ -245,19 +275,14 @@ def test_run_empty_stream():
 
 
 def test_run_processes_revisions():
-    """Events → fetch → assess → apply full pipeline."""
+    """Revisions found → assess → apply full pipeline."""
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
     items = {cursor_item.kref.uri: cursor_item}
 
-    ev = FakeEvent(
-        routing_key="revision.created",
-        kref=FakeKref("kref://CognitiveMemory/personal/mem1.conversation?r=1"),
-        cursor="cursor-001",
-    )
-    rev = FakeRevision(
-        kref=FakeKref("kref://CognitiveMemory/personal/mem1.conversation?r=1"),
-        item_kref=FakeKref("kref://CognitiveMemory/personal/mem1.conversation"),
-        metadata={"title": "User preference", "summary": "User likes dark mode"},
+    mem_item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/personal/mem1.conversation",
+        "kref://CognitiveMemory/personal/mem1.conversation?r=1",
+        {"title": "User preference", "summary": "User likes dark mode"},
     )
 
     llm_response = json.dumps([{
@@ -272,7 +297,10 @@ def test_run_processes_revisions():
     }])
 
     sdk, client, attrs = _build_fake_sdk(
-        events=[ev], revisions=[rev], items=items
+        revisions=[rev],
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={"/CognitiveMemory/personal": [mem_item]},
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -291,47 +319,106 @@ def test_run_processes_revisions():
                 assert report["deprecated"] == 0
                 assert report["tags_added"] == 2
                 assert report["metadata_updated"] == 1
-                assert report["cursor"] == "cursor-001"
             finally:
                 _cleanup_sdk()
 
         asyncio.run(run())
 
 
-def test_load_cursor_first_run():
-    """Returns None when no cursor exists."""
+def test_load_last_run_at_first_run():
+    """Returns None when no timestamp exists."""
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
     items = {cursor_item.kref.uri: cursor_item}
     sdk, _, attrs = _build_fake_sdk(items=items)
 
     ds = _make_dream_state(sdk)
     try:
-        result = ds._load_cursor(sdk, cursor_item.kref.uri)
+        result = ds._load_last_run_at(sdk, cursor_item.kref.uri)
         assert result is None
     finally:
         _cleanup_sdk()
 
 
-def test_save_and_load_cursor():
-    """Round-trip cursor persistence."""
+def test_save_and_load_last_run_at():
+    """Round-trip timestamp persistence."""
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
     items = {cursor_item.kref.uri: cursor_item}
     sdk, _, attrs = _build_fake_sdk(items=items)
 
     ds = _make_dream_state(sdk)
     try:
-        # Initially no cursor
-        assert ds._load_cursor(sdk, cursor_item.kref.uri) is None
+        assert ds._load_last_run_at(sdk, cursor_item.kref.uri) is None
 
-        # Save and reload
-        ds._save_cursor(sdk, cursor_item.kref.uri, "cursor-abc")
-        loaded = ds._load_cursor(sdk, cursor_item.kref.uri)
-        assert loaded == "cursor-abc"
-
-        # last_run_at should also be set
-        assert "last_run_at" in attrs.get(cursor_item.kref.uri, {})
+        ds._save_last_run_at(sdk, cursor_item.kref.uri, "2026-03-08T10:00:00+00:00")
+        loaded = ds._load_last_run_at(sdk, cursor_item.kref.uri)
+        assert loaded == "2026-03-08T10:00:00+00:00"
     finally:
         _cleanup_sdk()
+
+
+def test_revision_time_filter():
+    """Only revisions after last_run_at are collected."""
+    cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
+    items = {cursor_item.kref.uri: cursor_item}
+
+    # Old revision — should be skipped
+    old_item, old_rev = _make_item_with_revision(
+        "kref://CognitiveMemory/personal/old.conversation",
+        "kref://CognitiveMemory/personal/old.conversation?r=1",
+        {"title": "Old memory", "summary": "Before cutoff"},
+        created_at="2026-03-07T08:00:00+00:00",
+    )
+
+    # New revision — should be collected
+    new_item, new_rev = _make_item_with_revision(
+        "kref://CognitiveMemory/personal/new.conversation",
+        "kref://CognitiveMemory/personal/new.conversation?r=1",
+        {"title": "New memory", "summary": "After cutoff"},
+        created_at="2026-03-08T14:00:00+00:00",
+    )
+
+    sdk, client, attrs = _build_fake_sdk(
+        revisions=[old_rev, new_rev],
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={"/CognitiveMemory/personal": [old_item, new_item]},
+        # Set last_run_at so old items are filtered out
+        attributes={
+            cursor_item.kref.uri: {
+                "last_run_at": "2026-03-08T10:00:00+00:00",
+            }
+        },
+    )
+
+    llm_response = json.dumps([{
+        "index": 0,
+        "relevance_score": 0.8,
+        "should_deprecate": False,
+        "deprecation_reason": "",
+        "suggested_tags": ["new"],
+        "metadata_updates": {},
+        "related_indices": [],
+        "relationship_type": "",
+    }])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        async def run():
+            ds = _make_dream_state(
+                sdk,
+                summarizer=StubSummarizer(llm_response),
+                artifact_root=tmpdir,
+            )
+            ds._cursor_item_kref = cursor_item.kref.uri
+            try:
+                report = await ds.run()
+                assert report["success"] is True
+                # Only the new revision should be processed
+                assert report["events_processed"] == 1
+                assert report["revisions_assessed"] == 1
+            finally:
+                _cleanup_sdk()
+
+        asyncio.run(run())
 
 
 def test_assess_deprecation():
@@ -339,15 +426,10 @@ def test_assess_deprecation():
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
     items = {cursor_item.kref.uri: cursor_item}
 
-    ev = FakeEvent(
-        routing_key="revision.created",
-        kref=FakeKref("kref://CognitiveMemory/personal/old.conversation?r=1"),
-        cursor="cursor-dep",
-    )
-    rev = FakeRevision(
-        kref=FakeKref("kref://CognitiveMemory/personal/old.conversation?r=1"),
-        item_kref=FakeKref("kref://CognitiveMemory/personal/old.conversation"),
-        metadata={"title": "Old info", "summary": "Outdated data"},
+    mem_item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/personal/old.conversation",
+        "kref://CognitiveMemory/personal/old.conversation?r=1",
+        {"title": "Old info", "summary": "Outdated data"},
     )
 
     llm_response = json.dumps([{
@@ -362,7 +444,10 @@ def test_assess_deprecation():
     }])
 
     sdk, fake_client, attrs = _build_fake_sdk(
-        events=[ev], revisions=[rev], items=items
+        revisions=[rev],
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={"/CognitiveMemory/personal": [mem_item]},
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -390,15 +475,10 @@ def test_assess_tag_updates():
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
     items = {cursor_item.kref.uri: cursor_item}
 
-    ev = FakeEvent(
-        routing_key="revision.created",
-        kref=FakeKref("kref://CognitiveMemory/work/task.conversation?r=1"),
-        cursor="cursor-tag",
-    )
-    rev = FakeRevision(
-        kref=FakeKref("kref://CognitiveMemory/work/task.conversation?r=1"),
-        item_kref=FakeKref("kref://CognitiveMemory/work/task.conversation"),
-        metadata={"title": "CI pipeline", "summary": "Setup GitHub Actions"},
+    mem_item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/work/task.conversation",
+        "kref://CognitiveMemory/work/task.conversation?r=1",
+        {"title": "CI pipeline", "summary": "Setup GitHub Actions"},
     )
 
     llm_response = json.dumps([{
@@ -413,7 +493,10 @@ def test_assess_tag_updates():
     }])
 
     sdk, fake_client, _ = _build_fake_sdk(
-        events=[ev], revisions=[rev], items=items
+        revisions=[rev],
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/work")],
+        items_by_space={"/CognitiveMemory/work": [mem_item]},
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -445,30 +528,14 @@ def test_assess_relationships():
     kref_a = "kref://CognitiveMemory/work/a.conversation"
     kref_b = "kref://CognitiveMemory/work/b.conversation"
 
-    events = [
-        FakeEvent(
-            routing_key="revision.created",
-            kref=FakeKref(f"{kref_a}?r=1"),
-            cursor="cursor-rel-1",
-        ),
-        FakeEvent(
-            routing_key="revision.created",
-            kref=FakeKref(f"{kref_b}?r=1"),
-            cursor="cursor-rel-2",
-        ),
-    ]
-    revisions = [
-        FakeRevision(
-            kref=FakeKref(f"{kref_a}?r=1"),
-            item_kref=FakeKref(kref_a),
-            metadata={"title": "Deploy v1", "summary": "First deploy"},
-        ),
-        FakeRevision(
-            kref=FakeKref(f"{kref_b}?r=1"),
-            item_kref=FakeKref(kref_b),
-            metadata={"title": "Deploy v2", "summary": "Second deploy"},
-        ),
-    ]
+    item_a, rev_a = _make_item_with_revision(
+        kref_a, f"{kref_a}?r=1",
+        {"title": "Deploy v1", "summary": "First deploy"},
+    )
+    item_b, rev_b = _make_item_with_revision(
+        kref_b, f"{kref_b}?r=1",
+        {"title": "Deploy v2", "summary": "Second deploy"},
+    )
 
     llm_response = json.dumps([
         {
@@ -494,7 +561,10 @@ def test_assess_relationships():
     ])
 
     sdk, fake_client, _ = _build_fake_sdk(
-        events=events, revisions=revisions, items=items
+        revisions=[rev_a, rev_b],
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/work")],
+        items_by_space={"/CognitiveMemory/work": [item_a, item_b]},
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -522,15 +592,10 @@ def test_dry_run_no_mutations():
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
     items = {cursor_item.kref.uri: cursor_item}
 
-    ev = FakeEvent(
-        routing_key="revision.created",
-        kref=FakeKref("kref://CognitiveMemory/personal/dry.conversation?r=1"),
-        cursor="cursor-dry",
-    )
-    rev = FakeRevision(
-        kref=FakeKref("kref://CognitiveMemory/personal/dry.conversation?r=1"),
-        item_kref=FakeKref("kref://CognitiveMemory/personal/dry.conversation"),
-        metadata={"title": "Dry run test", "summary": "Should not mutate"},
+    mem_item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/personal/dry.conversation",
+        "kref://CognitiveMemory/personal/dry.conversation?r=1",
+        {"title": "Dry run test", "summary": "Should not mutate"},
     )
 
     llm_response = json.dumps([{
@@ -545,7 +610,10 @@ def test_dry_run_no_mutations():
     }])
 
     sdk, fake_client, attrs = _build_fake_sdk(
-        events=[ev], revisions=[rev], items=items
+        revisions=[rev],
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={"/CognitiveMemory/personal": [mem_item]},
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -581,15 +649,10 @@ def test_published_never_deprecated():
     items = {cursor_item.kref.uri: cursor_item}
 
     kref_str = "kref://CognitiveMemory/personal/pub.conversation?r=1"
-    ev = FakeEvent(
-        routing_key="revision.created",
-        kref=FakeKref(kref_str),
-        cursor="cursor-pub",
-    )
-    rev = FakeRevision(
-        kref=FakeKref(kref_str),
-        item_kref=FakeKref("kref://CognitiveMemory/personal/pub.conversation"),
-        metadata={"title": "Published doc", "summary": "Important published data"},
+    mem_item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/personal/pub.conversation",
+        kref_str,
+        {"title": "Published doc", "summary": "Important published data"},
     )
 
     llm_response = json.dumps([{
@@ -608,7 +671,11 @@ def test_published_never_deprecated():
     fake_client._published_krefs.add(kref_str)
 
     sdk, _, attrs = _build_fake_sdk(
-        events=[ev], revisions=[rev], items=items, client=fake_client
+        revisions=[rev],
+        items=items,
+        client=fake_client,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={"/CognitiveMemory/personal": [mem_item]},
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -636,23 +703,19 @@ def test_max_deprecation_guard():
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
     items = {cursor_item.kref.uri: cursor_item}
 
-    # Create 4 events/revisions, LLM says deprecate ALL of them
-    events = []
+    # Create 4 items, LLM says deprecate ALL of them
+    mem_items = []
     revisions = []
     llm_items = []
     for i in range(4):
         kref_base = f"kref://CognitiveMemory/personal/item{i}.conversation"
         kref_rev = f"{kref_base}?r=1"
-        events.append(FakeEvent(
-            routing_key="revision.created",
-            kref=FakeKref(kref_rev),
-            cursor=f"cursor-max-{i}",
-        ))
-        revisions.append(FakeRevision(
-            kref=FakeKref(kref_rev),
-            item_kref=FakeKref(kref_base),
-            metadata={"title": f"Item {i}", "summary": f"Content {i}"},
-        ))
+        item, rev = _make_item_with_revision(
+            kref_base, kref_rev,
+            {"title": f"Item {i}", "summary": f"Content {i}"},
+        )
+        mem_items.append(item)
+        revisions.append(rev)
         llm_items.append({
             "index": i,
             "relevance_score": 0.1,
@@ -666,7 +729,10 @@ def test_max_deprecation_guard():
 
     llm_response = json.dumps(llm_items)
     sdk, fake_client, _ = _build_fake_sdk(
-        events=events, revisions=revisions, items=items
+        revisions=revisions,
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={"/CognitiveMemory/personal": mem_items},
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -694,15 +760,10 @@ def test_report_generation():
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
     items = {cursor_item.kref.uri: cursor_item}
 
-    ev = FakeEvent(
-        routing_key="revision.created",
-        kref=FakeKref("kref://CognitiveMemory/work/rep.conversation?r=1"),
-        cursor="cursor-rep",
-    )
-    rev = FakeRevision(
-        kref=FakeKref("kref://CognitiveMemory/work/rep.conversation?r=1"),
-        item_kref=FakeKref("kref://CognitiveMemory/work/rep.conversation"),
-        metadata={"title": "Report test", "summary": "Testing report gen"},
+    mem_item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/work/rep.conversation",
+        "kref://CognitiveMemory/work/rep.conversation?r=1",
+        {"title": "Report test", "summary": "Testing report gen"},
     )
 
     llm_response = json.dumps([{
@@ -717,7 +778,10 @@ def test_report_generation():
     }])
 
     sdk, _, _ = _build_fake_sdk(
-        events=[ev], revisions=[rev], items=items
+        revisions=[rev],
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/work")],
+        items_by_space={"/CognitiveMemory/work": [mem_item]},
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -745,89 +809,89 @@ def test_report_generation():
         asyncio.run(run())
 
 
-def test_bundle_context():
-    """Bundle members passed to LLM for context."""
+def test_stacked_revision_detected():
+    """A new revision on an existing item (stacked) is picked up."""
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
-    bundle_item = FakeItem(
-        "kref://CognitiveMemory/personal/grp.bundle",
-        has_get_members=True,
-    )
-    bundle_item._members = [
-        types.SimpleNamespace(
-            item_kref=FakeKref("kref://CognitiveMemory/personal/mem1.conversation")
-        ),
-        types.SimpleNamespace(
-            item_kref=FakeKref("kref://CognitiveMemory/personal/mem2.conversation")
-        ),
-    ]
+    items = {cursor_item.kref.uri: cursor_item}
 
-    items = {
-        cursor_item.kref.uri: cursor_item,
-        "kref://CognitiveMemory/personal/grp.bundle": bundle_item,
-    }
-
-    events = [
-        # A bundle event
-        FakeEvent(
-            routing_key="revision.created",
-            kref=FakeKref("kref://CognitiveMemory/personal/grp.bundle?r=1"),
-            cursor="cursor-bnd-1",
-        ),
-        # A regular memory event
-        FakeEvent(
-            routing_key="revision.created",
-            kref=FakeKref("kref://CognitiveMemory/personal/mem1.conversation?r=1"),
-            cursor="cursor-bnd-2",
-        ),
-    ]
-
-    rev = FakeRevision(
-        kref=FakeKref("kref://CognitiveMemory/personal/mem1.conversation?r=1"),
-        item_kref=FakeKref("kref://CognitiveMemory/personal/mem1.conversation"),
-        metadata={"title": "Bundle member", "summary": "Part of a group"},
+    # Item already existed with r=1, now has a new stacked revision r=2
+    mem_item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/personal/existing.conversation",
+        "kref://CognitiveMemory/personal/existing.conversation?r=2",
+        {"title": "Updated preference", "summary": "User changed to light mode"},
+        created_at="2026-03-08T15:00:00+00:00",
     )
 
-    # Track what gets sent to the LLM
-    chat_calls = []
-    original_response = json.dumps([{
+    llm_response = json.dumps([{
         "index": 0,
-        "relevance_score": 0.8,
+        "relevance_score": 0.9,
         "should_deprecate": False,
         "deprecation_reason": "",
-        "suggested_tags": [],
+        "suggested_tags": ["preference-updated"],
         "metadata_updates": {},
         "related_indices": [],
         "relationship_type": "",
     }])
 
-    class TrackingAdapter:
-        async def chat(self, *, messages, model, system, max_tokens, json_mode=False):
-            chat_calls.append(messages[0]["content"])
-            return original_response
-
-    summarizer = StubSummarizer()
-    summarizer.adapter = TrackingAdapter()
-
-    sdk, _, _ = _build_fake_sdk(
-        events=events, revisions=[rev], items=items
+    sdk, client, attrs = _build_fake_sdk(
+        revisions=[rev],
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={"/CognitiveMemory/personal": [mem_item]},
+        # Last run was before this revision
+        attributes={
+            cursor_item.kref.uri: {
+                "last_run_at": "2026-03-08T10:00:00+00:00",
+            }
+        },
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         async def run():
             ds = _make_dream_state(
                 sdk,
-                summarizer=summarizer,
+                summarizer=StubSummarizer(llm_response),
                 artifact_root=tmpdir,
             )
             ds._cursor_item_kref = cursor_item.kref.uri
             try:
                 report = await ds.run()
                 assert report["success"] is True
-                # The LLM should have received bundle context
-                assert len(chat_calls) == 1
-                prompt_text = chat_calls[0]
-                assert "Bundle" in prompt_text
-                assert "grp.bundle" in prompt_text
+                assert report["events_processed"] == 1
+                assert report["revisions_assessed"] == 1
+                assert report["tags_added"] == 1
+            finally:
+                _cleanup_sdk()
+
+        asyncio.run(run())
+
+
+def test_deprecated_revisions_skipped():
+    """Already-deprecated revisions should not be collected."""
+    cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
+    items = {cursor_item.kref.uri: cursor_item}
+
+    mem_item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/personal/dep.conversation",
+        "kref://CognitiveMemory/personal/dep.conversation?r=1",
+        {"title": "Deprecated", "summary": "Already deprecated"},
+        deprecated=True,
+    )
+
+    sdk, client, attrs = _build_fake_sdk(
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={"/CognitiveMemory/personal": [mem_item]},
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        async def run():
+            ds = _make_dream_state(sdk, artifact_root=tmpdir)
+            ds._cursor_item_kref = cursor_item.kref.uri
+            try:
+                report = await ds.run()
+                assert report["success"] is True
+                assert report["events_processed"] == 0
             finally:
                 _cleanup_sdk()
 
