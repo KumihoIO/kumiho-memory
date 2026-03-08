@@ -491,6 +491,8 @@ class DreamState:
             except Exception as exc:
                 logger.warning("Failed to inspect bundle %s: %s", item_kref, exc)
 
+        return bundles
+
     # ------------------------------------------------------------------
     # LLM assessment
     # ------------------------------------------------------------------
