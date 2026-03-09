@@ -345,17 +345,78 @@ class DreamState:
         return self._cursor_item_kref  # type: ignore[return-value]
 
     def _load_last_run_at(self, sdk: Any, cursor_kref: str) -> Optional[str]:
-        """Read the last-saved run timestamp (ISO format)."""
+        """Read the last-saved run timestamp (ISO format).
+
+        Tries the gRPC attribute first, then falls back to the local
+        cursor file written by ``_save_cursor_local``.
+        """
         try:
-            return sdk.get_attribute(cursor_kref, "last_run_at")
+            value = sdk.get_attribute(cursor_kref, "last_run_at")
+            if value:
+                return value
         except Exception:
-            return None
+            pass
+
+        # Fall back to local cursor file
+        return self._load_cursor_local()
+
+    # ------------------------------------------------------------------
+    # Local cursor file (fallback when gRPC is unavailable)
+    # ------------------------------------------------------------------
+
+    @property
+    def _cursor_file(self) -> Path:
+        return (
+            Path(self.artifact_root)
+            / self.project
+            / self.cursor_item_name
+            / "cursor.json"
+        )
+
+    def _save_cursor_local(self, run_at: str) -> None:
+        """Write the cursor timestamp to a local JSON file."""
+        try:
+            self._cursor_file.parent.mkdir(parents=True, exist_ok=True)
+            self._cursor_file.write_text(
+                json.dumps({"last_run_at": run_at}), encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.warning("Failed to write local cursor file: %s", exc)
+
+    def _load_cursor_local(self) -> Optional[str]:
+        """Read the cursor timestamp from the local JSON file."""
+        try:
+            if self._cursor_file.exists():
+                data = json.loads(
+                    self._cursor_file.read_text(encoding="utf-8")
+                )
+                return data.get("last_run_at")
+        except Exception:
+            pass
+        return None
 
     def _save_last_run_at(
         self, sdk: Any, cursor_kref: str, run_at: str
     ) -> None:
-        """Persist the run timestamp."""
-        sdk.set_attribute(cursor_kref, "last_run_at", run_at)
+        """Persist the run timestamp.
+
+        The kumiho SDK client includes a ``_TransientRetryInterceptor``
+        that automatically retries on UNAVAILABLE / DEADLINE_EXCEEDED
+        with exponential backoff.  If the call still fails after SDK
+        retries, we fall back to a local cursor file so the next run
+        can pick up where this one left off.
+        """
+        try:
+            sdk.set_attribute(cursor_kref, "last_run_at", run_at)
+            # Also persist locally as a safety net
+            self._save_cursor_local(run_at)
+        except Exception as exc:
+            logger.error(
+                "Failed to save last_run_at via gRPC: %s. "
+                "Falling back to local cursor file.",
+                exc,
+            )
+            self._save_cursor_local(run_at)
 
     # ------------------------------------------------------------------
     # Revision collection (replaces event stream)

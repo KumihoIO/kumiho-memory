@@ -295,6 +295,17 @@ def tool_memory_dream_state(args: Dict[str, Any]) -> Dict[str, Any]:
     model = args.get("model")
     api_key = args.get("api_key")
     if provider or model or api_key:
+        # If provider/model were specified but no api_key, inherit the key
+        # from the shared manager's summarizer (which resolved it from env
+        # vars at startup).  This avoids requiring a separate LLM key config
+        # for Dream State — it reuses whatever the MCP server already has.
+        if not api_key:
+            try:
+                shared = _get_manager()
+                api_key = getattr(shared.summarizer, "api_key", None)
+            except Exception:
+                pass
+
         summarizer = MemorySummarizer(
             provider=provider,
             model=model,
