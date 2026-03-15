@@ -488,11 +488,23 @@ class UniversalMemoryManager:
         summary_result = _summary_or_exc
         summarization_error = str(summary_result.get("error", "") or "").strip()
         if summarization_error:
+            debug_info = summary_result.get("debug", {})
             logger.warning(
                 "summarize_conversation failed for %s: %s",
                 session_id,
                 summarization_error,
             )
+            if isinstance(debug_info, dict) and debug_info:
+                logger.warning(
+                    "summarize_conversation diagnostics for %s: provider=%s model=%s base_url=%s json_mode=%s raw_len=%s raw_preview=%r",
+                    session_id,
+                    debug_info.get("provider", ""),
+                    debug_info.get("model", ""),
+                    debug_info.get("base_url", ""),
+                    debug_info.get("json_mode", ""),
+                    debug_info.get("raw_response_len", 0),
+                    debug_info.get("raw_response_preview", ""),
+                )
             return {
                 "success": False,
                 "error": f"Conversation summarization failed: {summarization_error}",

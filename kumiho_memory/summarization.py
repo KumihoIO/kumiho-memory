@@ -500,6 +500,7 @@ class MemorySummarizer:
             self.light_model = light_model or model or "default"
             self.api_key = api_key
             self._client = None
+            self._base_url = base_url
             return
 
         # --- Resolve configuration (lightweight, no SDK init) ---
@@ -575,6 +576,8 @@ class MemorySummarizer:
         system_prompt = self._system_prompt()
         conversation_text = self._format_messages(messages)
         user_prompt = self._user_prompt(conversation_text, context=context)
+        json_mode = build_summary_schema_mode()
+        raw = ""
 
         try:
             raw = await self.adapter.chat(
@@ -582,13 +585,23 @@ class MemorySummarizer:
                 model=self.model,
                 system=system_prompt,
                 max_tokens=2560,
-                json_mode=build_summary_schema_mode(),
+                json_mode=json_mode,
             )
             result = self._parse_json(raw)
         except Exception as exc:
+            diagnostics = self._build_diagnostics(
+                model=self.model,
+                json_mode=json_mode,
+                raw_response=raw,
+            )
+            self._log_llm_failure(
+                "summarize_conversation",
+                error=exc,
+                diagnostics=diagnostics,
+            )
             if strict:
                 raise
-            return self._fallback_summary(messages, error=str(exc))
+            return self._fallback_summary(messages, error=str(exc), debug=diagnostics)
 
         return self._normalize_summary(result, fallback_messages=messages)
 
@@ -634,15 +647,17 @@ class MemorySummarizer:
             "JSON array:"
         )
 
+        raw = ""
+        json_mode = build_string_array_wrapper_schema(
+            "kumiho_implications_response",
+            "implications",
+        )
         try:
             raw = await self.adapter.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.light_model,
                 max_tokens=512,
-                json_mode=build_string_array_wrapper_schema(
-                    "kumiho_implications_response",
-                    "implications",
-                ),
+                json_mode=json_mode,
             )
             parsed = self._parse_json(raw)
             if isinstance(parsed, dict):
@@ -653,7 +668,15 @@ class MemorySummarizer:
                     if isinstance(val, list):
                         return [str(item).strip() for item in val if item][:5]
         except Exception as exc:
-            logger.warning("generate_implications failed: %s", exc)
+            self._log_llm_failure(
+                "generate_implications",
+                error=exc,
+                diagnostics=self._build_diagnostics(
+                    model=self.light_model,
+                    json_mode=json_mode,
+                    raw_response=raw,
+                ),
+            )
 
         return []
 
@@ -756,6 +779,61 @@ class MemorySummarizer:
             "Extract structured knowledge in JSON format."
         )
 
+    def _build_diagnostics(
+        self,
+        *,
+        model: str,
+        json_mode: JsonMode,
+        raw_response: str = "",
+    ) -> Dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "model": model,
+            "base_url": self._base_url or "",
+            "json_mode": self._describe_json_mode(json_mode),
+            "raw_response_len": len(raw_response or ""),
+            "raw_response_preview": self._preview_text(raw_response),
+        }
+
+    def _log_llm_failure(
+        self,
+        operation: str,
+        *,
+        error: Exception,
+        diagnostics: Dict[str, Any],
+    ) -> None:
+        logger.warning(
+            "%s failed: %s | provider=%s model=%s base_url=%s json_mode=%s raw_len=%s raw_preview=%r",
+            operation,
+            error,
+            diagnostics.get("provider", ""),
+            diagnostics.get("model", ""),
+            diagnostics.get("base_url", ""),
+            diagnostics.get("json_mode", ""),
+            diagnostics.get("raw_response_len", 0),
+            diagnostics.get("raw_response_preview", ""),
+        )
+
+    @staticmethod
+    def _describe_json_mode(json_mode: JsonMode) -> str:
+        if isinstance(json_mode, dict):
+            schema = json_mode.get("schema", {})
+            properties = schema.get("properties", {})
+            property_names = ",".join(sorted(str(key) for key in properties.keys()))
+            return f"schema:{json_mode.get('name', '')}:type={schema.get('type', '')}:props={property_names}"
+        if json_mode == "array":
+            return "array"
+        if json_mode:
+            return "object"
+        return "none"
+
+    @staticmethod
+    def _preview_text(text: str, *, limit: int = 240) -> str:
+        compact = re.sub(r"\s+", " ", text or "").strip()
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3] + "..."
+
     # ------------------------------------------------------------------
     # JSON parsing & fallbacks
     # ------------------------------------------------------------------
@@ -797,9 +875,14 @@ class MemorySummarizer:
         return summary
 
     @staticmethod
-    def _fallback_summary(messages: List[Dict[str, Any]], *, error: str) -> Dict[str, Any]:
+    def _fallback_summary(
+        messages: List[Dict[str, Any]],
+        *,
+        error: str,
+        debug: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         text = MemorySummarizer._fallback_summary_text(messages)
-        return {
+        result = {
             "type": "summary",
             "title": "Conversation summary",
             "summary": text,
@@ -809,6 +892,9 @@ class MemorySummarizer:
             "classification": {"topics": [], "entities": []},
             "error": error,
         }
+        if debug:
+            result["debug"] = debug
+        return result
 
     @staticmethod
     def _fallback_summary_text(messages: List[Dict[str, Any]]) -> str:

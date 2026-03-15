@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import logging
 from unittest.mock import patch
 
 from kumiho_memory.summarization import MemorySummarizer
@@ -120,6 +121,46 @@ def test_generate_implications_accepts_wrapped_array_object():
     )
 
     assert implications == ["future travel planning", "budget pressure"]
+
+
+def test_summarize_conversation_includes_debug_payload_on_invalid_json():
+    summarizer = MemorySummarizer(
+        adapter=StubAdapter("not valid json at all"),
+        provider="openai",
+        model="gpt-5-mini",
+    )
+
+    result = asyncio.run(
+        summarizer.summarize_conversation(
+            [{"role": "user", "content": "Summarize this please."}],
+        )
+    )
+
+    assert result["error"] == "No valid JSON found in summarizer response"
+    assert result["debug"]["provider"] == "openai"
+    assert result["debug"]["model"] == "gpt-5-mini"
+    assert result["debug"]["raw_response_len"] == len("not valid json at all")
+    assert result["debug"]["raw_response_preview"] == "not valid json at all"
+
+
+def test_summarize_conversation_logs_diagnostics_on_invalid_json(caplog):
+    summarizer = MemorySummarizer(
+        adapter=StubAdapter("not valid json at all"),
+        provider="openai",
+        model="gpt-5-mini",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="kumiho_memory.summarization"):
+        asyncio.run(
+            summarizer.summarize_conversation(
+                [{"role": "user", "content": "Summarize this please."}],
+            )
+        )
+
+    assert "summarize_conversation failed: No valid JSON found in summarizer response" in caplog.text
+    assert "provider=openai" in caplog.text
+    assert "model=gpt-5-mini" in caplog.text
+    assert "raw_preview='not valid json at all'" in caplog.text
 
 
 def test_custom_adapter_protocol():
