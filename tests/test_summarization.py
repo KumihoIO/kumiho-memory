@@ -646,6 +646,26 @@ def test_summary_max_tokens_prefers_larger_budget_for_gpt5_models():
     assert summarizer._summary_max_tokens([{"role": "user", "content": "hello"}]) == 4096
 
 
+def test_anthropic_default_light_model_tracks_selected_model_when_nondefault():
+    summarizer = MemorySummarizer(
+        provider="anthropic",
+        api_key="anthropic-key",
+        model="claude-haiku-4-5-20251001",
+    )
+
+    assert summarizer.light_model == "claude-haiku-4-5-20251001"
+
+
+def test_anthropic_provider_defaults_are_current():
+    summarizer = MemorySummarizer(
+        provider="anthropic",
+        api_key="anthropic-key",
+    )
+
+    assert summarizer.model == "claude-sonnet-4-6"
+    assert summarizer.light_model == "claude-haiku-4-5-20251001"
+
+
 def test_fallback_summary_ignores_injected_kumiho_blocks():
     messages = [
         {"role": "user", "content": "I replaced the phone battery last week."},

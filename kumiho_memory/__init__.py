@@ -1,6 +1,6 @@
 """Kumiho Memory - Universal memory provider for AI agents."""
 
-__version__ = "0.3.28"
+__version__ = "0.4.0"
 
 from kumiho_memory.redis_memory import RedisMemoryBuffer, _token_override_var as redis_token_override_var
 from kumiho_memory.memory_manager import (

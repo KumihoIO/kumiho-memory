@@ -767,8 +767,8 @@ PROVIDER_DEFAULTS: Dict[str, Dict[str, str]] = {
         "light_model": "gpt-4o-mini",
     },
     "anthropic": {
-        "model": "claude-sonnet-4-5-20241022",
-        "light_model": "claude-haiku-4-20250414",
+        "model": "claude-sonnet-4-6",
+        "light_model": "claude-haiku-4-5-20251001",
     },
 }
 
@@ -859,9 +859,10 @@ class MemorySummarizer:
             or os.getenv("KUMIHO_LLM_MODEL", "").strip()
             or defaults.get("model", "gpt-5.3-codex-spark" if "codex" in resolved_provider else "gpt-4o")
         )
-        default_light_model = (
-            self.model if "codex" in self.model.lower()
-            else defaults.get("light_model", self.model)
+        default_light_model = self._default_light_model(
+            provider=resolved_provider,
+            model=self.model,
+            defaults=defaults,
         )
         self.light_model = (
             light_model
@@ -873,6 +874,21 @@ class MemorySummarizer:
         self._adapter = None
         self._client = client
         self._base_url = resolved_base_url
+
+    @staticmethod
+    def _default_light_model(
+        *,
+        provider: str,
+        model: str,
+        defaults: Dict[str, str],
+    ) -> str:
+        if "codex" in model.lower():
+            return model
+
+        if provider == "anthropic" and model and model != defaults.get("model", ""):
+            return model
+
+        return defaults.get("light_model", model)
 
     @property
     def adapter(self) -> LLMAdapter:
