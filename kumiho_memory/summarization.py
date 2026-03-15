@@ -112,6 +112,33 @@ class OpenAICompatAdapter:
             full_messages.append({"role": "system", "content": system})
         full_messages.extend(messages)
 
+        if "codex" in model.lower():
+            prompt_parts: List[str] = []
+            for msg in full_messages:
+                role = str(msg.get("role", "user")).strip().capitalize()
+                content = str(msg.get("content", "")).strip()
+                if content:
+                    prompt_parts.append(f"{role}: {content}")
+
+            response = await self._client.responses.create(
+                model=model,
+                input="\n\n".join(prompt_parts),
+                max_output_tokens=max_tokens,
+            )
+
+            output_text = getattr(response, "output_text", "") or ""
+            if output_text:
+                return output_text
+
+            output = getattr(response, "output", None) or []
+            text_parts: List[str] = []
+            for item in output:
+                for content in getattr(item, "content", None) or []:
+                    text = getattr(content, "text", None)
+                    if text:
+                        text_parts.append(str(text))
+            return "\n".join(part for part in text_parts if part).strip()
+
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": full_messages,
@@ -333,12 +360,16 @@ class MemorySummarizer:
         self.model = (
             model
             or os.getenv("KUMIHO_LLM_MODEL", "").strip()
-            or defaults.get("model", "gpt-4o")
+            or defaults.get("model", "gpt-5.3-codex-spark" if "codex" in resolved_provider else "gpt-4o")
+        )
+        default_light_model = (
+            self.model if "codex" in self.model.lower()
+            else defaults.get("light_model", self.model)
         )
         self.light_model = (
             light_model
             or os.getenv("KUMIHO_LLM_LIGHT_MODEL", "").strip()
-            or defaults.get("light_model", self.model)
+            or default_light_model
         )
 
         # --- Defer adapter construction until first use ---
@@ -468,13 +499,20 @@ class MemorySummarizer:
         api_key: Optional[str],
         base_url: Optional[str],
     ) -> LLMAdapter:
-        if provider == "anthropic" and not base_url:
-            key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        resolved_base_url = (
+            base_url
+            or os.getenv("KUMIHO_LLM_BASE_URL", "").strip()
+            or None
+        )
+        resolved_key = api_key or os.getenv("KUMIHO_LLM_API_KEY")
+
+        if provider == "anthropic" and not resolved_base_url:
+            key = resolved_key or os.getenv("ANTHROPIC_API_KEY")
             return AnthropicAdapter.create(api_key=key)
 
         # Default to OpenAI-compatible (covers openai, gemini, ollama, etc.)
-        key = api_key or os.getenv("OPENAI_API_KEY")
-        return OpenAICompatAdapter.create(api_key=key, base_url=base_url)
+        key = resolved_key or os.getenv("OPENAI_API_KEY")
+        return OpenAICompatAdapter.create(api_key=key, base_url=resolved_base_url)
 
     @staticmethod
     def _provider_from_env_keys() -> str:
@@ -569,7 +607,15 @@ class MemorySummarizer:
         summary = dict(result)
         summary.setdefault("type", "summary")
         summary.setdefault("title", "Conversation summary")
-        summary.setdefault("summary", MemorySummarizer._fallback_summary_text(fallback_messages))
+        raw_summary = summary.get("summary")
+        if isinstance(raw_summary, str) and raw_summary.strip():
+            summary["summary"] = raw_summary.strip()
+        else:
+            summary["summary"] = MemorySummarizer._fallback_summary_text(fallback_messages)
+            summary.setdefault(
+                "error",
+                "Summarizer response did not include a non-empty summary",
+            )
         summary.setdefault("knowledge", {})
         summary.setdefault("classification", {})
         summary.setdefault("events", [])
@@ -600,8 +646,27 @@ class MemorySummarizer:
     def _fallback_summary_text(messages: List[Dict[str, Any]]) -> str:
         if not messages:
             return "No conversation content available."
-        last = messages[-1].get("content") or ""
-        snippet = str(last).strip()
-        if len(snippet) > 500:
-            snippet = f"{snippet[:497]}..."
-        return snippet or "Conversation summary unavailable."
+
+        def _strip_injected_blocks(text: str) -> str:
+            cleaned = text
+            for tag in ("kumiho_memory", "kumiho_project", "kumiho_instructions"):
+                cleaned = re.sub(
+                    rf"<{tag}>.*?</{tag}>",
+                    "",
+                    cleaned,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+            return cleaned.strip()
+
+        preferred_roles = {"user", "assistant"}
+        for msg in reversed(messages):
+            role = str(msg.get("role", "")).strip().lower()
+            if role and role not in preferred_roles:
+                continue
+            snippet = _strip_injected_blocks(str(msg.get("content") or ""))
+            if len(snippet) > 500:
+                snippet = f"{snippet[:497]}..."
+            if snippet:
+                return snippet
+
+        return "Conversation summary unavailable."

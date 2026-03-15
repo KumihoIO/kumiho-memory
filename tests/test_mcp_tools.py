@@ -47,6 +47,23 @@ class StubSummarizer:
         return []
 
 
+class ErrorSummarizer:
+    async def summarize_conversation(self, messages, context=None):
+        return {
+            "type": "summary",
+            "title": "Conversation summary",
+            "summary": "I installed 0.4.5 and restarted the setup too.",
+            "events": [],
+            "implications": [],
+            "knowledge": {"facts": [], "decisions": [], "actions": [], "open_questions": []},
+            "classification": {"topics": [], "entities": []},
+            "error": "The api_key client option must be set",
+        }
+
+    async def generate_implications(self, messages, context=None):
+        return []
+
+
 class StubRedactor:
     def anonymize_summary(self, summary):
         return summary
@@ -247,6 +264,46 @@ def test_memory_consolidate():
             assert "summary" in result
         finally:
             _cleanup_manager()
+
+
+def test_memory_consolidate_returns_summary_error_instead_of_storing_fallback():
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+
+    async def store_stub(**kwargs):
+        raise AssertionError("memory_store should not be called on summary failure")
+
+    async def retrieve_stub(**kwargs):
+        return []
+
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=ErrorSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=store_stub,
+        memory_retrieve=retrieve_stub,
+        consolidation_threshold=2,
+        artifact_root=tempfile.mkdtemp(),
+    )
+    mcp_tools_module._manager = manager
+
+    try:
+        ingest = tool_memory_ingest({
+            "user_id": "user-mcp-error",
+            "message": "I installed 0.4.5 and restarted the setup too.",
+        })
+        tool_memory_add_response({
+            "session_id": ingest["session_id"],
+            "response": "Understood.",
+        })
+        result = tool_memory_consolidate({
+            "session_id": ingest["session_id"],
+        })
+        assert result["success"] is False
+        assert "Conversation summarization failed" in result["error"]
+        assert "api_key client option must be set" in result["error"]
+    finally:
+        _cleanup_manager()
 
 
 def test_memory_recall():

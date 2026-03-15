@@ -486,6 +486,17 @@ class UniversalMemoryManager:
         if isinstance(_summary_or_exc, BaseException):
             raise _summary_or_exc
         summary_result = _summary_or_exc
+        summarization_error = str(summary_result.get("error", "") or "").strip()
+        if summarization_error:
+            logger.warning(
+                "summarize_conversation failed for %s: %s",
+                session_id,
+                summarization_error,
+            )
+            return {
+                "success": False,
+                "error": f"Conversation summarization failed: {summarization_error}",
+            }
         # Implications are best-effort — fall back to empty list.
         if isinstance(_impl_or_exc, BaseException):
             logger.warning("generate_implications failed: %s", _impl_or_exc)

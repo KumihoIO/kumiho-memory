@@ -23,6 +23,27 @@ class StubSummarizer:
         return []
 
 
+class ErrorSummarizer:
+    async def summarize_conversation(self, messages, context=None):
+        return {
+            "type": "summary",
+            "title": "Conversation summary",
+            "summary": "I installed 0.4.5 and restarted the setup too.",
+            "events": [],
+            "implications": [],
+            "knowledge": {"facts": [], "decisions": [], "actions": [], "open_questions": []},
+            "classification": {"topics": [], "entities": []},
+            "error": (
+                "The api_key client option must be set either by passing "
+                "api_key to the client or by setting the OPENAI_API_KEY "
+                "environment variable"
+            ),
+        }
+
+    async def generate_implications(self, messages, context=None):
+        return []
+
+
 class StubRedactor:
     def anonymize_summary(self, summary):
         return summary.replace("tea", "[topic]")
@@ -111,6 +132,55 @@ def test_handle_user_message_flags_consolidation():
         assert context["should_consolidate"] is True
 
     asyncio.run(run())
+
+
+def test_consolidation_returns_error_without_storing_raw_fallback_summary():
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    store_calls = 0
+
+    async def store_stub(**kwargs):
+        nonlocal store_calls
+        store_calls += 1
+        return {"item_kref": "kref://memory/item"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = UniversalMemoryManager(
+            redis_buffer=buffer,
+            summarizer=ErrorSummarizer(),
+            pii_redactor=StubRedactor(),
+            memory_store=store_stub,
+            consolidation_threshold=2,
+            artifact_root=tmpdir,
+        )
+
+        async def run():
+            ingest = await manager.ingest_message(
+                user_id="user-error",
+                message="I installed 0.4.5 and restarted the setup too.",
+                context="personal",
+            )
+            session_id = ingest["session_id"]
+            await manager.add_assistant_response(
+                session_id=session_id,
+                response="Understood.",
+            )
+
+            result = await manager.consolidate_session(session_id=session_id)
+
+            assert result["success"] is False
+            assert "Conversation summarization failed" in result["error"]
+            assert "api_key client option must be set" in result["error"]
+            assert store_calls == 0
+
+            working = await buffer.get_messages(
+                project=manager.project,
+                session_id=session_id,
+                limit=10,
+            )
+            assert working["message_count"] == 2
+
+        asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------
