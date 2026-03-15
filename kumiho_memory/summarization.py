@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -299,16 +300,17 @@ class OpenAICompatAdapter:
         if not mode_kind:
             return None
 
+        if isinstance(json_mode, dict):
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": json_mode["name"],
+                    "strict": True,
+                    "schema": json_mode["schema"],
+                },
+            }
+
         if self._is_native_openai():
-            if isinstance(json_mode, dict):
-                return {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": json_mode["name"],
-                        "strict": True,
-                        "schema": json_mode["schema"],
-                    },
-                }
             return {
                 "type": "json_schema",
                 "json_schema": {
@@ -318,10 +320,20 @@ class OpenAICompatAdapter:
                 },
             }
 
-        if isinstance(json_mode, dict) or mode_kind == "object":
+        if mode_kind == "object":
             return {"type": "json_object"}
 
         return None
+
+    @staticmethod
+    def _supports_json_object_fallback(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "response_format" in message
+            or "json_schema" in message
+            or "invalid schema" in message
+            or "unsupported" in message
+        )
 
     @classmethod
     def create(
@@ -342,7 +354,75 @@ class OpenAICompatAdapter:
             kwargs["api_key"] = api_key
         if base_url:
             kwargs["base_url"] = base_url
-        return cls(AsyncOpenAI(**kwargs), base_url=base_url)
+        if cls._needs_explicit_http_client():
+            try:
+                from openai import DefaultAsyncHttpxClient  # type: ignore
+            except ImportError:
+                raise
+            kwargs["http_client"] = DefaultAsyncHttpxClient()
+            return cls(AsyncOpenAI(**kwargs), base_url=base_url)
+        try:
+            return cls(AsyncOpenAI(**kwargs), base_url=base_url)
+        except TypeError as exc:
+            if "unexpected keyword argument 'proxies'" not in str(exc):
+                raise
+            try:
+                from openai import DefaultAsyncHttpxClient  # type: ignore
+            except ImportError:
+                raise
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs["http_client"] = DefaultAsyncHttpxClient()
+            return cls(AsyncOpenAI(**fallback_kwargs), base_url=base_url)
+
+    @staticmethod
+    def _needs_explicit_http_client() -> bool:
+        try:
+            import httpx  # type: ignore
+        except ImportError:
+            return False
+
+        try:
+            params = inspect.signature(httpx.AsyncClient.__init__).parameters
+        except (TypeError, ValueError):
+            return False
+
+        return "proxies" not in params
+
+    @staticmethod
+    def _supports_reasoning_effort_param() -> bool:
+        try:
+            from openai.resources.chat.completions import AsyncCompletions  # type: ignore
+        except ImportError:
+            return False
+
+        try:
+            params = inspect.signature(AsyncCompletions.create).parameters
+        except (TypeError, ValueError):
+            return False
+
+        return "reasoning_effort" in params
+
+    def _gemini_thinking_control(self, model: str) -> Dict[str, Any]:
+        base_url = self._base_url.lower()
+        lowered = model.strip().lower()
+        if "generativelanguage.googleapis.com" not in base_url:
+            return {}
+        if not lowered.startswith("gemini-2.5"):
+            return {}
+        if self._supports_reasoning_effort_param():
+            return {"reasoning_effort": "none"}
+        return {
+            "extra_body": {
+                "extra_body": {
+                    "google": {
+                        "thinking_config": {
+                            "thinking_budget": 0,
+                            "include_thoughts": False,
+                        },
+                    },
+                },
+            },
+        }
 
     async def chat(
         self,
@@ -406,20 +486,42 @@ class OpenAICompatAdapter:
         kwargs[token_param] = max_tokens
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
+        kwargs.update(self._gemini_thinking_control(model))
         response_format = self._response_format(json_mode)
         if response_format:
             kwargs["response_format"] = response_format
 
-        try:
-            response = await self._client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            alt_param = "max_tokens" if token_param == "max_completion_tokens" else "max_completion_tokens"
-            if not self._supports_alternate_token_param(exc, failed_param=token_param):
-                raise
-            retry_kwargs = dict(kwargs)
-            retry_kwargs.pop(token_param, None)
-            retry_kwargs[alt_param] = max_tokens
-            response = await self._client.chat.completions.create(**retry_kwargs)
+        request_kwargs = dict(kwargs)
+        while True:
+            try:
+                response = await self._client.chat.completions.create(**request_kwargs)
+                break
+            except Exception as exc:
+                response_format_type = (
+                    request_kwargs.get("response_format", {}) or {}
+                ).get("type", "")
+                if (
+                    response_format_type == "json_schema"
+                    and self._supports_json_object_fallback(exc)
+                ):
+                    request_kwargs = dict(request_kwargs)
+                    request_kwargs["response_format"] = {"type": "json_object"}
+                    continue
+
+                alt_param = (
+                    "max_tokens"
+                    if token_param == "max_completion_tokens"
+                    else "max_completion_tokens"
+                )
+                if not self._supports_alternate_token_param(
+                    exc,
+                    failed_param=token_param,
+                ):
+                    raise
+                request_kwargs = dict(request_kwargs)
+                request_kwargs.pop(token_param, None)
+                request_kwargs[alt_param] = max_tokens
+                token_param = alt_param
         return self._extract_chat_message_text(
             response=response,
             model=model,

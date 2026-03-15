@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import logging
@@ -41,6 +42,7 @@ class StubChatCompletionsClient:
         self,
         *,
         fail_on_param: str | None = None,
+        fail_on_response_format_type: str | None = None,
         empty_content: bool = False,
         parsed_payload=None,
         refusal=None,
@@ -54,6 +56,7 @@ class StubChatCompletionsClient:
             })()
         })()
         self.fail_on_param = fail_on_param
+        self.fail_on_response_format_type = fail_on_response_format_type
         self.empty_content = empty_content
         self.parsed_payload = parsed_payload
         self.refusal = refusal
@@ -66,6 +69,14 @@ class StubChatCompletionsClient:
                 f"Unsupported parameter: '{self.fail_on_param}' is not supported with this model. "
                 "Use 'max_completion_tokens' instead."
             )
+        response_format_type = kwargs.get("response_format", {}).get("type")
+        if (
+            self.fail_on_response_format_type
+            and response_format_type == self.fail_on_response_format_type
+        ):
+            raise ValueError(
+                "Unsupported response_format: json_schema is not supported."
+            )
         response_format = kwargs.get("response_format", {})
         schema = response_format.get("json_schema", {}).get("schema", {})
         schema_type = schema.get("type")
@@ -74,6 +85,8 @@ class StubChatCompletionsClient:
             content = '{"queries":["one","two"]}'
         elif "implications" in properties:
             content = '{"implications":["one","two"]}'
+        elif response_format_type == "json_object":
+            content = '{"summary":"Structured JSON"}'
         elif schema_type == "array":
             content = '["one","two"]'
         elif schema_type == "object":
@@ -296,7 +309,7 @@ def test_openai_compat_adapter_uses_json_schema_for_array_mode():
     assert schema["properties"]["queries"]["type"] == "array"
 
 
-def test_openai_compat_adapter_uses_json_object_for_non_native_schema_mode():
+def test_openai_compat_adapter_uses_json_schema_for_non_native_schema_mode():
     from kumiho_memory.summarization import OpenAICompatAdapter, build_summary_schema_mode
 
     client = StubChatCompletionsClient()
@@ -305,7 +318,30 @@ def test_openai_compat_adapter_uses_json_object_for_non_native_schema_mode():
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     )
 
-    asyncio.run(
+    with patch.object(OpenAICompatAdapter, "_supports_reasoning_effort_param", return_value=True):
+        asyncio.run(
+            adapter.chat(
+                messages=[{"role": "user", "content": "Summarize this"}],
+                model="gemini-2.5-flash",
+                max_tokens=321,
+                json_mode=build_summary_schema_mode(),
+            )
+        )
+
+    assert client.calls[0]["response_format"]["type"] == "json_schema"
+    assert client.calls[0]["reasoning_effort"] == "none"
+
+
+def test_openai_compat_adapter_falls_back_to_json_object_when_schema_is_rejected():
+    from kumiho_memory.summarization import OpenAICompatAdapter, build_summary_schema_mode
+
+    client = StubChatCompletionsClient(fail_on_response_format_type="json_schema")
+    adapter = OpenAICompatAdapter(
+        client,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
+
+    result = asyncio.run(
         adapter.chat(
             messages=[{"role": "user", "content": "Summarize this"}],
             model="gemini-2.5-flash",
@@ -314,7 +350,32 @@ def test_openai_compat_adapter_uses_json_object_for_non_native_schema_mode():
         )
     )
 
-    assert client.calls[0]["response_format"] == {"type": "json_object"}
+    assert result == '{"summary":"Structured JSON"}'
+    assert client.calls[0]["response_format"]["type"] == "json_schema"
+    assert client.calls[1]["response_format"] == {"type": "json_object"}
+
+
+def test_openai_compat_adapter_uses_gemini_extra_body_when_reasoning_effort_is_unavailable():
+    from kumiho_memory.summarization import OpenAICompatAdapter, build_summary_schema_mode
+
+    client = StubChatCompletionsClient()
+    adapter = OpenAICompatAdapter(
+        client,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
+
+    with patch.object(OpenAICompatAdapter, "_supports_reasoning_effort_param", return_value=False):
+        asyncio.run(
+            adapter.chat(
+                messages=[{"role": "user", "content": "Summarize this"}],
+                model="gemini-2.5-flash",
+                max_tokens=321,
+                json_mode=build_summary_schema_mode(),
+            )
+        )
+
+    assert client.calls[0]["extra_body"]["extra_body"]["google"]["thinking_config"]["thinking_budget"] == 0
+    assert client.calls[0]["extra_body"]["extra_body"]["google"]["thinking_config"]["include_thoughts"] is False
 
 
 def test_summarize_conversation_accepts_fenced_json_object():
@@ -381,6 +442,61 @@ def test_openai_compat_adapter_uses_parsed_payload_when_content_is_empty():
     )
 
     assert result == '{"summary": "Structured JSON via parsed"}'
+
+
+def test_openai_compat_adapter_create_falls_back_to_explicit_http_client_on_proxies_typeerror():
+    from kumiho_memory.summarization import OpenAICompatAdapter
+
+    call_kwargs = []
+    sentinel_http_client = object()
+
+    def fake_async_openai(**kwargs):
+        call_kwargs.append(kwargs)
+        if len(call_kwargs) == 1:
+            raise TypeError(
+                "AsyncClient.__init__() got an unexpected keyword argument 'proxies'"
+            )
+        return "stub-client"
+
+    with patch.object(OpenAICompatAdapter, "_needs_explicit_http_client", return_value=False):
+        with patch("openai.AsyncOpenAI", side_effect=fake_async_openai):
+            with patch("openai.DefaultAsyncHttpxClient", return_value=sentinel_http_client):
+                adapter = OpenAICompatAdapter.create(
+                    api_key="gemini-key",
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                )
+
+    assert call_kwargs[0] == {
+        "api_key": "gemini-key",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    }
+    assert call_kwargs[1]["api_key"] == "gemini-key"
+    assert call_kwargs[1]["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert call_kwargs[1]["http_client"] is sentinel_http_client
+    assert adapter._client == "stub-client"
+
+
+def test_openai_compat_adapter_detects_httpx_without_proxies_support():
+    from kumiho_memory.summarization import OpenAICompatAdapter
+
+    fake_signature = inspect.Signature(parameters=[
+        inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        inspect.Parameter("timeout", inspect.Parameter.KEYWORD_ONLY, default=None),
+    ])
+    with patch("inspect.signature", return_value=fake_signature):
+        assert OpenAICompatAdapter._needs_explicit_http_client() is True
+
+
+def test_openai_compat_adapter_detects_reasoning_effort_support():
+    from kumiho_memory.summarization import OpenAICompatAdapter
+
+    fake_signature = inspect.Signature(parameters=[
+        inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        inspect.Parameter("messages", inspect.Parameter.KEYWORD_ONLY),
+        inspect.Parameter("reasoning_effort", inspect.Parameter.KEYWORD_ONLY, default=None),
+    ])
+    with patch("inspect.signature", return_value=fake_signature):
+        assert OpenAICompatAdapter._supports_reasoning_effort_param() is True
 
 
 def test_memory_summarizer_adapter_uses_late_kumiho_llm_env():
