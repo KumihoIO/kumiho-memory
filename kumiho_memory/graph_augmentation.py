@@ -444,7 +444,7 @@ class GraphAugmentedRecall:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 max_tokens=200,
-                json_mode=True,
+                json_mode="array",
             )
             # Strip markdown code fences if present
             cleaned = raw.strip()

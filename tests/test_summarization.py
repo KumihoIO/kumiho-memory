@@ -55,10 +55,17 @@ class StubChatCompletionsClient:
                 f"Unsupported parameter: '{self.fail_on_param}' is not supported with this model. "
                 "Use 'max_completion_tokens' instead."
             )
-        content = kwargs.get("messages", [{}])[-1].get("content", "")
+        response_format = kwargs.get("response_format", {})
+        schema_type = response_format.get("json_schema", {}).get("schema", {}).get("type")
+        if schema_type == "array":
+            content = '["one","two"]'
+        elif schema_type == "object":
+            content = '{"summary":"Structured JSON"}'
+        else:
+            content = kwargs.get("messages", [{}])[-1].get("content", "")
         return type("StubResponse", (), {
             "choices": [type("StubChoice", (), {
-                "message": type("StubMessage", (), {"content": f"ok:{content}"})()
+                "message": type("StubMessage", (), {"content": f"ok:{content}" if not content.startswith("{") and not content.startswith("[") else content})()
             })()]
         })()
 
@@ -147,12 +154,35 @@ def test_openai_compat_adapter_uses_max_completion_tokens_for_gpt5_chat_models()
             messages=[{"role": "user", "content": "Summarize this"}],
             model="gpt-5.4",
             max_tokens=321,
+            json_mode="object",
         )
     )
 
-    assert result == "ok:Summarize this"
+    assert result == '{"summary":"Structured JSON"}'
     assert client.calls[0]["max_completion_tokens"] == 321
     assert "max_tokens" not in client.calls[0]
+    assert client.calls[0]["response_format"]["type"] == "json_schema"
+    assert client.calls[0]["response_format"]["json_schema"]["schema"]["type"] == "object"
+
+
+def test_openai_compat_adapter_uses_json_schema_for_array_mode():
+    from kumiho_memory.summarization import OpenAICompatAdapter
+
+    client = StubChatCompletionsClient()
+    adapter = OpenAICompatAdapter(client)
+
+    result = asyncio.run(
+        adapter.chat(
+            messages=[{"role": "user", "content": "Return items"}],
+            model="gpt-5-mini",
+            max_tokens=123,
+            json_mode="array",
+        )
+    )
+
+    assert result == '["one","two"]'
+    assert client.calls[0]["response_format"]["type"] == "json_schema"
+    assert client.calls[0]["response_format"]["json_schema"]["schema"]["type"] == "array"
 
 
 def test_openai_compat_adapter_retries_with_max_completion_tokens_when_max_tokens_is_rejected():

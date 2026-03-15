@@ -40,7 +40,7 @@ class LLMAdapter(Protocol):
         model: str,
         system: str = "",
         max_tokens: int = 1024,
-        json_mode: bool = False,
+        json_mode: bool | str = False,
     ) -> str:
         """Send a chat request and return the raw response text."""
         ...
@@ -74,8 +74,9 @@ class OpenAICompatAdapter:
         )
     """
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, *, base_url: Optional[str] = None) -> None:
         self._client = client
+        self._base_url = (base_url or "").rstrip("/")
 
     @staticmethod
     def _prefers_max_completion_tokens(model: str) -> bool:
@@ -89,6 +90,37 @@ class OpenAICompatAdapter:
             "unsupported parameter" in message and
             failed_param in message
         )
+
+    @staticmethod
+    def _json_mode_kind(json_mode: bool | str) -> Optional[str]:
+        if json_mode == "array":
+            return "array"
+        if json_mode:
+            return "object"
+        return None
+
+    def _is_native_openai(self) -> bool:
+        return not self._base_url or "api.openai.com" in self._base_url.lower()
+
+    def _response_format(self, json_mode: bool | str) -> Optional[Dict[str, Any]]:
+        mode_kind = self._json_mode_kind(json_mode)
+        if not mode_kind:
+            return None
+
+        if self._is_native_openai():
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": f"kumiho_{mode_kind}_response",
+                    "strict": True,
+                    "schema": {"type": mode_kind},
+                },
+            }
+
+        if mode_kind == "object":
+            return {"type": "json_object"}
+
+        return None
 
     @classmethod
     def create(
@@ -109,7 +141,7 @@ class OpenAICompatAdapter:
             kwargs["api_key"] = api_key
         if base_url:
             kwargs["base_url"] = base_url
-        return cls(AsyncOpenAI(**kwargs))
+        return cls(AsyncOpenAI(**kwargs), base_url=base_url)
 
     async def chat(
         self,
@@ -118,7 +150,7 @@ class OpenAICompatAdapter:
         model: str,
         system: str = "",
         max_tokens: int = 1024,
-        json_mode: bool = False,
+        json_mode: bool | str = False,
     ) -> str:
         full_messages: List[Dict[str, str]] = []
         if system:
@@ -162,8 +194,9 @@ class OpenAICompatAdapter:
             else "max_tokens"
         )
         kwargs[token_param] = max_tokens
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
+        response_format = self._response_format(json_mode)
+        if response_format:
+            kwargs["response_format"] = response_format
 
         try:
             response = await self._client.chat.completions.create(**kwargs)
@@ -205,7 +238,7 @@ class AnthropicAdapter:
         model: str,
         system: str = "",
         max_tokens: int = 1024,
-        json_mode: bool = False,
+        json_mode: bool | str = False,
     ) -> str:
         kwargs: Dict[str, Any] = {
             "model": model,
@@ -444,7 +477,7 @@ class MemorySummarizer:
                 model=self.model,
                 system=system_prompt,
                 max_tokens=2560,
-                json_mode=True,
+                json_mode="object",
             )
             result = self._parse_json(raw)
         except Exception as exc:
@@ -501,7 +534,7 @@ class MemorySummarizer:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.light_model,
                 max_tokens=512,
-                json_mode=True,
+                json_mode="array",
             )
             parsed = self._parse_json(raw)
             if isinstance(parsed, list):

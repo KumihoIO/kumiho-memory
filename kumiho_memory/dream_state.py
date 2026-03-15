@@ -609,7 +609,7 @@ class DreamState:
                 model=self.summarizer.model,
                 system=_ASSESSMENT_SYSTEM_PROMPT,
                 max_tokens=2048,
-                json_mode=True,
+                json_mode="array",
             )
         except Exception as exc:
             logger.warning("LLM assessment failed: %s", exc)
