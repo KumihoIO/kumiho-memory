@@ -436,10 +436,11 @@ class GraphAugmentedRecall:
             "- What future scenarios might this memory affect?\n"
             "- What emotional states or challenges connect to this topic?\n\n"
             f"Memory:\n{summary[:2000]}\n\n"
-            f"Return ONLY a JSON array of {max_queries} short search queries "
+            f"Return ONLY a JSON object like "
+            f'{{"queries": ["..."]}} with {max_queries} short search queries '
             '(each 3-8 words). No explanation.\n'
-            'Example: ["feeling overwhelmed with commitments", '
-            '"declining social invitations", "work-life balance stress"]'
+            'Example: {"queries": ["feeling overwhelmed with commitments", '
+            '"declining social invitations", "work-life balance stress"]}'
         )
         raw = ""
         try:

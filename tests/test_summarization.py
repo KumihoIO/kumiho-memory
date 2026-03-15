@@ -145,6 +145,24 @@ def test_generate_implications_accepts_wrapped_array_object():
     assert implications == ["future travel planning", "budget pressure"]
 
 
+def test_generate_implications_accepts_fenced_wrapped_object():
+    summarizer = MemorySummarizer(
+        adapter=StubAdapter(
+            '```json\n{"implications":["future travel planning","budget pressure"]}\n```'
+        ),
+        model="stub",
+        light_model="stub-light",
+    )
+
+    implications = asyncio.run(
+        summarizer.generate_implications(
+            [{"role": "user", "content": "I need to save more for trips."}],
+        )
+    )
+
+    assert implications == ["future travel planning", "budget pressure"]
+
+
 def test_summarize_conversation_includes_debug_payload_on_invalid_json():
     summarizer = MemorySummarizer(
         adapter=StubAdapter("not valid json at all"),
@@ -276,6 +294,52 @@ def test_openai_compat_adapter_uses_json_schema_for_array_mode():
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
     assert schema["properties"]["queries"]["type"] == "array"
+
+
+def test_openai_compat_adapter_uses_json_object_for_non_native_schema_mode():
+    from kumiho_memory.summarization import OpenAICompatAdapter, build_summary_schema_mode
+
+    client = StubChatCompletionsClient()
+    adapter = OpenAICompatAdapter(
+        client,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
+
+    asyncio.run(
+        adapter.chat(
+            messages=[{"role": "user", "content": "Summarize this"}],
+            model="gemini-2.5-flash",
+            max_tokens=321,
+            json_mode=build_summary_schema_mode(),
+        )
+    )
+
+    assert client.calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_summarize_conversation_accepts_fenced_json_object():
+    canned = (
+        "```json\n"
+        "{"
+        '"type":"summary",'
+        '"title":"Async preference",'
+        '"summary":"User prefers async communication.",'
+        '"events":[],'
+        '"knowledge":{"facts":[],"decisions":[],"actions":[],"open_questions":[]},'
+        '"classification":{"topics":["communication"],"entities":[]}'
+        "}\n"
+        "```"
+    )
+    summarizer = MemorySummarizer(adapter=StubAdapter(canned), model="stub")
+
+    result = asyncio.run(
+        summarizer.summarize_conversation(
+            [{"role": "user", "content": "I prefer async communication."}],
+        )
+    )
+
+    assert result["type"] == "summary"
+    assert result["summary"] == "User prefers async communication."
 
 
 def test_openai_compat_adapter_retries_with_max_completion_tokens_when_max_tokens_is_rejected():

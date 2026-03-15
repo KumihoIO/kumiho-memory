@@ -248,6 +248,14 @@ class DreamState:
             "KUMIHO_MEMORY_ARTIFACT_ROOT",
             os.path.join(os.path.expanduser("~"), ".kumiho", "artifacts"),
         )
+        self.space_page_size = max(
+            1,
+            int(os.getenv("KUMIHO_DREAM_STATE_SPACE_PAGE_SIZE", "100")),
+        )
+        self.item_page_size = max(
+            1,
+            int(os.getenv("KUMIHO_DREAM_STATE_ITEM_PAGE_SIZE", "100")),
+        )
 
         if summarizer is not None:
             self.summarizer = summarizer
@@ -460,6 +468,91 @@ class DreamState:
     # Revision collection (replaces event stream)
     # ------------------------------------------------------------------
 
+    def _list_project_spaces(self, project: Any) -> List[Any]:
+        """Enumerate project spaces without relying on one recursive RPC."""
+        root_path = f"/{self.project}"
+        discovered: List[Any] = []
+        seen_paths = set()
+        pending_paths = [root_path]
+
+        while pending_paths:
+            parent_path = pending_paths.pop(0)
+            cursor: Optional[str] = None
+
+            while True:
+                try:
+                    page = project.get_spaces(
+                        parent_path=parent_path,
+                        recursive=False,
+                        page_size=self.space_page_size,
+                        cursor=cursor,
+                    )
+                except TypeError:
+                    # Older SDK stubs/tests only support the legacy recursive API.
+                    spaces = list(project.get_spaces(recursive=True))
+                    logger.info(
+                        "Dream State: using legacy recursive space enumeration "
+                        "for project %s",
+                        self.project,
+                    )
+                    return spaces
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Failed to list child spaces under "
+                        f"'{parent_path}' (cursor={cursor or '-'})"
+                    ) from exc
+
+                children = list(page)
+                for space in children:
+                    path = getattr(space, "path", "")
+                    if not path or path in seen_paths:
+                        continue
+                    seen_paths.add(path)
+                    discovered.append(space)
+                    pending_paths.append(path)
+
+                cursor = getattr(page, "next_cursor", None)
+                if not cursor:
+                    break
+
+        return discovered
+
+    def _list_space_items(self, sdk: Any, space_path: str) -> List[Any]:
+        """List items in a space in bounded pages to avoid RPC deadlines."""
+        client = sdk.get_client()
+        kind_arg = self.kind_filter if self.kind_filter else ""
+        collected: List[Any] = []
+        cursor: Optional[str] = None
+
+        while True:
+            try:
+                page = client.get_items(
+                    parent_path=space_path,
+                    kind_filter=kind_arg,
+                    page_size=self.item_page_size,
+                    cursor=cursor,
+                    include_deprecated=False,
+                )
+            except TypeError:
+                page = client.get_items(
+                    parent_path=space_path,
+                    kind_filter=kind_arg,
+                    include_deprecated=False,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to list items in "
+                    f"'{space_path}' (cursor={cursor or '-'})"
+                ) from exc
+
+            collected.extend(list(page))
+
+            cursor = getattr(page, "next_cursor", None)
+            if not cursor:
+                break
+
+        return collected
+
     def _collect_revisions(
         self, sdk: Any, last_run_at: Optional[str]
     ) -> list:
@@ -494,28 +587,32 @@ class DreamState:
                     last_run_at,
                 )
 
-        # Enumerate all spaces recursively
+        # Enumerate spaces breadth-first in small pages so large projects do
+        # not rely on a single recursive GetChildSpaces RPC.
         try:
-            spaces = project.get_spaces(recursive=True)
+            spaces = self._list_project_spaces(project)
         except Exception as exc:
             logger.warning("Failed to enumerate spaces: %s", exc)
             return []
 
         collected: list = []
         cursor_item_kref = self._cursor_item_kref
-
+        space_paths = [f"/{self.project}"]
+        seen_space_paths = {f"/{self.project}"}
         for space in spaces:
+            path = getattr(space, "path", "")
+            if not path or path in seen_space_paths:
+                continue
+            seen_space_paths.add(path)
+            space_paths.append(path)
+
+        for space_path in space_paths:
             try:
-                kind_arg = self.kind_filter if self.kind_filter else ""
-                items = sdk.get_client().get_items(
-                    parent_path=space.path,
-                    kind_filter=kind_arg,
-                    include_deprecated=False,
-                )
+                items = self._list_space_items(sdk, space_path)
             except Exception as exc:
                 logger.warning(
                     "Failed to list items in space '%s': %s",
-                    space.path, exc,
+                    space_path, exc,
                 )
                 continue
 

@@ -318,7 +318,7 @@ class OpenAICompatAdapter:
                 },
             }
 
-        if mode_kind == "object":
+        if isinstance(json_mode, dict) or mode_kind == "object":
             return {"type": "json_object"}
 
         return None
@@ -754,9 +754,9 @@ class MemorySummarizer:
             "- Focus on downstream behavioral changes, anxieties, preferences, "
             "or habits that would result from these events\n"
             "- Each description should be 1 sentence, max 20 words\n"
-            "- Return a JSON array of strings, nothing else\n\n"
+            '- Return ONLY a JSON object like {"implications": ["..."]}\n\n'
             f"Conversation:\n{conversation_text}\n\n"
-            "JSON array:"
+            'JSON object with key "implications":'
         )
 
         raw = ""
@@ -951,14 +951,97 @@ class MemorySummarizer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_json(text: str) -> Dict[str, Any]:
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
+    def _parse_json(text: str) -> Any:
+        candidates = []
+        saw_json_like_input = False
+
+        direct = (text or "").strip()
+        if direct:
+            candidates.append(direct)
+            saw_json_like_input = direct.startswith(("```", "{", "["))
+
+        normalized = MemorySummarizer._strip_markdown_code_fences(direct)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+            saw_json_like_input = saw_json_like_input or normalized.startswith(("{", "["))
+
+        for candidate in list(candidates):
+            extracted = MemorySummarizer._extract_balanced_json(candidate)
+            if extracted and extracted not in candidates:
+                candidates.append(extracted)
+                saw_json_like_input = True
+
+        last_error: Optional[Exception] = None
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+        if saw_json_like_input and last_error is not None:
+            raise last_error
         raise ValueError("No valid JSON found in summarizer response")
+
+    @staticmethod
+    def _strip_markdown_code_fences(text: str) -> str:
+        stripped = (text or "").strip()
+        if not stripped.startswith("```"):
+            return stripped
+
+        stripped = re.sub(r"^```(?:json)?\s*\n?", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\n?```\s*$", "", stripped)
+        return stripped.strip()
+
+    @staticmethod
+    def _extract_balanced_json(text: str) -> str:
+        source = (text or "").strip()
+        if not source:
+            return ""
+
+        start = -1
+        opening = ""
+        closing = ""
+        for idx, ch in enumerate(source):
+            if ch == "{":
+                start = idx
+                opening = "{"
+                closing = "}"
+                break
+            if ch == "[":
+                start = idx
+                opening = "["
+                closing = "]"
+                break
+
+        if start < 0:
+            return ""
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, len(source)):
+            ch = source[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+
+            if ch == opening:
+                depth += 1
+            elif ch == closing:
+                depth -= 1
+                if depth == 0:
+                    return source[start : idx + 1]
+
+        return ""
 
     @staticmethod
     def _normalize_summary(result: Dict[str, Any], *, fallback_messages: List[Dict[str, Any]]) -> Dict[str, Any]:

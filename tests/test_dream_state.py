@@ -81,6 +81,12 @@ class FakeSpace:
         self.path = path
 
 
+class FakePagedList(list):
+    def __init__(self, items, next_cursor=None):
+        super().__init__(items)
+        self.next_cursor = next_cursor
+
+
 class FakeClient:
     """Tracks all mutation calls for assertion."""
 
@@ -274,6 +280,76 @@ def test_run_no_revisions():
     asyncio.run(run())
 
 
+def test_collect_revisions_uses_paginated_space_and_item_listing():
+    """Dream State should avoid one-shot recursive listing in large projects."""
+    cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
+    items = {cursor_item.kref.uri: cursor_item}
+
+    mem_item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/personal/new.conversation",
+        "kref://CognitiveMemory/personal/new.conversation?r=1",
+        {"title": "New memory", "summary": "After pagination"},
+        created_at="2026-03-08T14:00:00+00:00",
+    )
+
+    fake_client = FakeClient()
+    item_calls = []
+
+    def paged_get_items(
+        parent_path="",
+        kind_filter="",
+        page_size=None,
+        cursor=None,
+        include_deprecated=False,
+    ):
+        item_calls.append((parent_path, page_size, cursor))
+        if parent_path == "/CognitiveMemory":
+            return FakePagedList([], next_cursor=None)
+        if cursor is None:
+            return FakePagedList([mem_item], next_cursor="page-2")
+        return FakePagedList([], next_cursor=None)
+
+    fake_client.get_items = paged_get_items
+
+    class FakeProject:
+        def __init__(self):
+            self.space_calls = []
+
+        def get_spaces(
+            self,
+            parent_path=None,
+            recursive=False,
+            page_size=None,
+            cursor=None,
+        ):
+            self.space_calls.append((parent_path, recursive, page_size, cursor))
+            if parent_path == "/CognitiveMemory":
+                return FakePagedList([FakeSpace("/CognitiveMemory/personal")])
+            return FakePagedList([])
+
+    project = FakeProject()
+
+    sdk = types.ModuleType("kumiho")
+    sdk.get_project = lambda name: project
+    sdk.get_client = lambda: fake_client
+    sdk.get_item = lambda kref_uri: items.get(kref_uri)
+    sdk.get_attribute = lambda kref, key: None
+    sdk.set_attribute = lambda kref, key, value: None
+    sdk.get_revision = lambda kref_str: rev
+    sdk.Kref = FakeKref
+
+    ds = _make_dream_state(sdk)
+    ds._cursor_item_kref = cursor_item.kref.uri
+    try:
+        revisions = ds._collect_revisions(sdk, None)
+        assert revisions == [rev]
+        assert project.space_calls[0] == ("/CognitiveMemory", False, 100, None)
+        assert ("/CognitiveMemory/personal", 100, None) in item_calls
+        assert ("/CognitiveMemory/personal", 100, "page-2") in item_calls
+    finally:
+        _cleanup_sdk()
+
+
 def test_run_processes_revisions():
     """Revisions found → assess → apply full pipeline."""
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
@@ -331,12 +407,13 @@ def test_load_last_run_at_first_run():
     items = {cursor_item.kref.uri: cursor_item}
     sdk, _, attrs = _build_fake_sdk(items=items)
 
-    ds = _make_dream_state(sdk)
-    try:
-        result = ds._load_last_run_at(sdk, cursor_item.kref.uri)
-        assert result is None
-    finally:
-        _cleanup_sdk()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds = _make_dream_state(sdk, artifact_root=tmpdir)
+        try:
+            result = ds._load_last_run_at(sdk, cursor_item.kref.uri)
+            assert result is None
+        finally:
+            _cleanup_sdk()
 
 
 def test_save_and_load_last_run_at():
@@ -345,15 +422,20 @@ def test_save_and_load_last_run_at():
     items = {cursor_item.kref.uri: cursor_item}
     sdk, _, attrs = _build_fake_sdk(items=items)
 
-    ds = _make_dream_state(sdk)
-    try:
-        assert ds._load_last_run_at(sdk, cursor_item.kref.uri) is None
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds = _make_dream_state(sdk, artifact_root=tmpdir)
+        try:
+            assert ds._load_last_run_at(sdk, cursor_item.kref.uri) is None
 
-        ds._save_last_run_at(sdk, cursor_item.kref.uri, "2026-03-08T10:00:00+00:00")
-        loaded = ds._load_last_run_at(sdk, cursor_item.kref.uri)
-        assert loaded == "2026-03-08T10:00:00+00:00"
-    finally:
-        _cleanup_sdk()
+            ds._save_last_run_at(
+                sdk,
+                cursor_item.kref.uri,
+                "2026-03-08T10:00:00+00:00",
+            )
+            loaded = ds._load_last_run_at(sdk, cursor_item.kref.uri)
+            assert loaded == "2026-03-08T10:00:00+00:00"
+        finally:
+            _cleanup_sdk()
 
 
 def test_revision_time_filter():
