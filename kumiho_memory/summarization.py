@@ -6,9 +6,103 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Union, runtime_checkable
 
 logger = logging.getLogger(__name__)
+
+JsonMode = Union[bool, str, Dict[str, Any]]
+
+
+def _strict_object_schema(
+    properties: Dict[str, Any],
+    *,
+    required: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": required or list(properties.keys()),
+    }
+
+
+def _json_schema_mode(name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "schema": schema,
+    }
+
+
+def build_string_array_wrapper_schema(name: str, field_name: str) -> Dict[str, Any]:
+    return _json_schema_mode(
+        name,
+        _strict_object_schema({
+            field_name: {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        }),
+    )
+
+
+def build_summary_schema_mode() -> Dict[str, Any]:
+    return _json_schema_mode(
+        "kumiho_summary_response",
+        _strict_object_schema({
+            "type": {"type": "string"},
+            "title": {"type": "string"},
+            "summary": {"type": "string"},
+            "events": {
+                "type": "array",
+                "items": _strict_object_schema({
+                    "event": {"type": "string"},
+                    "when": {"type": "string"},
+                    "participants": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "consequence": {"type": "string"},
+                }),
+            },
+            "knowledge": _strict_object_schema({
+                "facts": {
+                    "type": "array",
+                    "items": _strict_object_schema({
+                        "claim": {"type": "string"},
+                        "certainty": {"type": "string"},
+                    }),
+                },
+                "decisions": {
+                    "type": "array",
+                    "items": _strict_object_schema({
+                        "decision": {"type": "string"},
+                        "reason": {"type": "string"},
+                    }),
+                },
+                "actions": {
+                    "type": "array",
+                    "items": _strict_object_schema({
+                        "task": {"type": "string"},
+                        "status": {"type": "string"},
+                    }),
+                },
+                "open_questions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            }),
+            "classification": _strict_object_schema({
+                "topics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "entities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            }),
+        }),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +134,7 @@ class LLMAdapter(Protocol):
         model: str,
         system: str = "",
         max_tokens: int = 1024,
-        json_mode: bool | str = False,
+        json_mode: JsonMode = False,
     ) -> str:
         """Send a chat request and return the raw response text."""
         ...
@@ -92,7 +186,9 @@ class OpenAICompatAdapter:
         )
 
     @staticmethod
-    def _json_mode_kind(json_mode: bool | str) -> Optional[str]:
+    def _json_mode_kind(json_mode: JsonMode) -> Optional[str]:
+        if isinstance(json_mode, dict):
+            return "schema"
         if json_mode == "array":
             return "array"
         if json_mode:
@@ -102,12 +198,21 @@ class OpenAICompatAdapter:
     def _is_native_openai(self) -> bool:
         return not self._base_url or "api.openai.com" in self._base_url.lower()
 
-    def _response_format(self, json_mode: bool | str) -> Optional[Dict[str, Any]]:
+    def _response_format(self, json_mode: JsonMode) -> Optional[Dict[str, Any]]:
         mode_kind = self._json_mode_kind(json_mode)
         if not mode_kind:
             return None
 
         if self._is_native_openai():
+            if isinstance(json_mode, dict):
+                return {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": json_mode["name"],
+                        "strict": True,
+                        "schema": json_mode["schema"],
+                    },
+                }
             return {
                 "type": "json_schema",
                 "json_schema": {
@@ -150,7 +255,7 @@ class OpenAICompatAdapter:
         model: str,
         system: str = "",
         max_tokens: int = 1024,
-        json_mode: bool | str = False,
+        json_mode: JsonMode = False,
     ) -> str:
         full_messages: List[Dict[str, str]] = []
         if system:
@@ -238,7 +343,7 @@ class AnthropicAdapter:
         model: str,
         system: str = "",
         max_tokens: int = 1024,
-        json_mode: bool | str = False,
+        json_mode: JsonMode = False,
     ) -> str:
         kwargs: Dict[str, Any] = {
             "model": model,
@@ -477,7 +582,7 @@ class MemorySummarizer:
                 model=self.model,
                 system=system_prompt,
                 max_tokens=2560,
-                json_mode="object",
+                json_mode=build_summary_schema_mode(),
             )
             result = self._parse_json(raw)
         except Exception as exc:
@@ -534,13 +639,16 @@ class MemorySummarizer:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.light_model,
                 max_tokens=512,
-                json_mode="array",
+                json_mode=build_string_array_wrapper_schema(
+                    "kumiho_implications_response",
+                    "implications",
+                ),
             )
             parsed = self._parse_json(raw)
-            if isinstance(parsed, list):
-                return [str(item).strip() for item in parsed if item][:5]
-            # Some models wrap in {"implications": [...]}
             if isinstance(parsed, dict):
+                implications = parsed.get("implications")
+                if isinstance(implications, list):
+                    return [str(item).strip() for item in implications if item][:5]
                 for val in parsed.values():
                     if isinstance(val, list):
                         return [str(item).strip() for item in val if item][:5]

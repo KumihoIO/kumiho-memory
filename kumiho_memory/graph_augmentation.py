@@ -27,7 +27,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 
-from kumiho_memory.summarization import LLMAdapter
+from kumiho_memory.summarization import (
+    LLMAdapter,
+    build_string_array_wrapper_schema,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -444,7 +447,10 @@ class GraphAugmentedRecall:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 max_tokens=200,
-                json_mode="array",
+                json_mode=build_string_array_wrapper_schema(
+                    "kumiho_queries_response",
+                    "queries",
+                ),
             )
             # Strip markdown code fences if present
             cleaned = raw.strip()
@@ -453,6 +459,8 @@ class GraphAugmentedRecall:
                 cleaned = re.sub(r"\n?```\s*$", "", cleaned)
                 cleaned = cleaned.strip()
             queries = json.loads(cleaned)
+            if isinstance(queries, dict):
+                queries = queries.get("queries", queries.get("items", []))
             if isinstance(queries, list):
                 return [str(q).strip() for q in queries if q][:max_queries]
         except Exception as e:

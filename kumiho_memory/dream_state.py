@@ -31,7 +31,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from kumiho_memory.summarization import LLMAdapter, MemorySummarizer
+from kumiho_memory.summarization import (
+    LLMAdapter,
+    MemorySummarizer,
+    _json_schema_mode,
+    _strict_object_schema,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +81,9 @@ class DreamStateStats:
 _ASSESSMENT_SYSTEM_PROMPT = """\
 You are a memory consolidation agent performing "Dream State" processing.
 You will receive an array of memories (each with an index, title, summary,
-type, tags, and metadata).  For **each** memory return a JSON object with
-the following fields:
+type, tags, and metadata). Return a JSON object with a single key
+``assessments`` whose value is an array of assessment objects. For **each**
+memory include the following fields:
 
 1. index (int): The memory's index in the input array.
 2. relevance_score (float 0.0-1.0): How useful is this memory for future
@@ -85,13 +91,14 @@ the following fields:
 3. should_deprecate (bool): True if the memory should be deprecated.
 4. deprecation_reason (str): Why (empty string if keeping).
 5. suggested_tags (List[str]): Additional tags for better retrieval.
-6. metadata_updates (Dict[str, str]): Metadata key/value corrections or
-   enrichments.  Return ``{}`` if none.
+6. metadata_updates (List[{"key": str, "value": str}]): Metadata key/value
+   corrections or enrichments. Return ``[]`` if none.
 7. related_indices (List[int]): Indices of related memories in THIS batch.
 8. relationship_type (str): Edge type for related memories — one of
    DERIVED_FROM, REFERENCED, DEPENDS_ON, SUPERSEDES.  Empty string if none.
 
-Return ONLY a JSON array of objects (one per memory).
+Return ONLY a JSON object like:
+{"assessments": [ ... ]}.
 
 Guidelines:
 - Be conservative: when in doubt, KEEP the memory.
@@ -103,6 +110,37 @@ Guidelines:
 - Suggest relationships for memories that reference the same topic,
   project, or decision chain.
 """
+
+_ASSESSMENT_SCHEMA_MODE = _json_schema_mode(
+    "kumiho_assessments_response",
+    _strict_object_schema({
+        "assessments": {
+            "type": "array",
+            "items": _strict_object_schema({
+                "index": {"type": "integer"},
+                "relevance_score": {"type": "number"},
+                "should_deprecate": {"type": "boolean"},
+                "deprecation_reason": {"type": "string"},
+                "suggested_tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "metadata_updates": {
+                    "type": "array",
+                    "items": _strict_object_schema({
+                        "key": {"type": "string"},
+                        "value": {"type": "string"},
+                    }),
+                },
+                "related_indices": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                },
+                "relationship_type": {"type": "string"},
+            }),
+        },
+    }),
+)
 
 
 def _parse_assessments(raw: str) -> List[Dict[str, Any]]:
@@ -609,7 +647,7 @@ class DreamState:
                 model=self.summarizer.model,
                 system=_ASSESSMENT_SYSTEM_PROMPT,
                 max_tokens=2048,
-                json_mode="array",
+                json_mode=_ASSESSMENT_SCHEMA_MODE,
             )
         except Exception as exc:
             logger.warning("LLM assessment failed: %s", exc)
@@ -632,6 +670,21 @@ class DreamState:
                 if target and target != rev_kref:
                     related.append((target, rel_type or "REFERENCED"))
 
+            raw_metadata_updates = item.get("metadata_updates", {})
+            metadata_updates: Dict[str, str] = {}
+            if isinstance(raw_metadata_updates, dict):
+                metadata_updates = {
+                    str(key): str(value)
+                    for key, value in raw_metadata_updates.items()
+                    if key and value is not None
+                }
+            elif isinstance(raw_metadata_updates, list):
+                metadata_updates = {
+                    str(entry.get("key")): str(entry.get("value"))
+                    for entry in raw_metadata_updates
+                    if isinstance(entry, dict) and entry.get("key") and entry.get("value") is not None
+                }
+
             assessments.append(
                 MemoryAssessment(
                     revision_kref=rev_kref,
@@ -639,7 +692,7 @@ class DreamState:
                     should_deprecate=bool(item.get("should_deprecate", False)),
                     deprecation_reason=item.get("deprecation_reason", ""),
                     suggested_tags=list(item.get("suggested_tags", [])),
-                    metadata_updates=dict(item.get("metadata_updates", {})),
+                    metadata_updates=metadata_updates,
                     related_memories=related,
                 )
             )

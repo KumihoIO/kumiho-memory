@@ -56,8 +56,14 @@ class StubChatCompletionsClient:
                 "Use 'max_completion_tokens' instead."
             )
         response_format = kwargs.get("response_format", {})
-        schema_type = response_format.get("json_schema", {}).get("schema", {}).get("type")
-        if schema_type == "array":
+        schema = response_format.get("json_schema", {}).get("schema", {})
+        schema_type = schema.get("type")
+        properties = schema.get("properties", {})
+        if "queries" in properties:
+            content = '{"queries":["one","two"]}'
+        elif "implications" in properties:
+            content = '{"implications":["one","two"]}'
+        elif schema_type == "array":
             content = '["one","two"]'
         elif schema_type == "object":
             content = '{"summary":"Structured JSON"}'
@@ -98,6 +104,22 @@ def test_extract_topics_with_stubbed_llm():
 
     topics = asyncio.run(summarizer.extract_topics("Memory systems for agents."))
     assert topics == ["memory", "agents", "redis"]
+
+
+def test_generate_implications_accepts_wrapped_array_object():
+    summarizer = MemorySummarizer(
+        adapter=StubAdapter('{"implications":["future travel planning","budget pressure"]}'),
+        model="stub",
+        light_model="stub-light",
+    )
+
+    implications = asyncio.run(
+        summarizer.generate_implications(
+            [{"role": "user", "content": "I need to save more for trips."}],
+        )
+    )
+
+    assert implications == ["future travel planning", "budget pressure"]
 
 
 def test_custom_adapter_protocol():
@@ -144,7 +166,7 @@ def test_openai_compat_adapter_uses_responses_api_for_codex_models():
 
 
 def test_openai_compat_adapter_uses_max_completion_tokens_for_gpt5_chat_models():
-    from kumiho_memory.summarization import OpenAICompatAdapter
+    from kumiho_memory.summarization import OpenAICompatAdapter, build_summary_schema_mode
 
     client = StubChatCompletionsClient()
     adapter = OpenAICompatAdapter(client)
@@ -154,7 +176,7 @@ def test_openai_compat_adapter_uses_max_completion_tokens_for_gpt5_chat_models()
             messages=[{"role": "user", "content": "Summarize this"}],
             model="gpt-5.4",
             max_tokens=321,
-            json_mode="object",
+            json_mode=build_summary_schema_mode(),
         )
     )
 
@@ -162,11 +184,14 @@ def test_openai_compat_adapter_uses_max_completion_tokens_for_gpt5_chat_models()
     assert client.calls[0]["max_completion_tokens"] == 321
     assert "max_tokens" not in client.calls[0]
     assert client.calls[0]["response_format"]["type"] == "json_schema"
-    assert client.calls[0]["response_format"]["json_schema"]["schema"]["type"] == "object"
+    schema = client.calls[0]["response_format"]["json_schema"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert "summary" in schema["properties"]
 
 
 def test_openai_compat_adapter_uses_json_schema_for_array_mode():
-    from kumiho_memory.summarization import OpenAICompatAdapter
+    from kumiho_memory.summarization import OpenAICompatAdapter, build_string_array_wrapper_schema
 
     client = StubChatCompletionsClient()
     adapter = OpenAICompatAdapter(client)
@@ -176,13 +201,16 @@ def test_openai_compat_adapter_uses_json_schema_for_array_mode():
             messages=[{"role": "user", "content": "Return items"}],
             model="gpt-5-mini",
             max_tokens=123,
-            json_mode="array",
+            json_mode=build_string_array_wrapper_schema("kumiho_queries_response", "queries"),
         )
     )
 
-    assert result == '["one","two"]'
+    assert result == '{"queries":["one","two"]}'
     assert client.calls[0]["response_format"]["type"] == "json_schema"
-    assert client.calls[0]["response_format"]["json_schema"]["schema"]["type"] == "array"
+    schema = client.calls[0]["response_format"]["json_schema"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["queries"]["type"] == "array"
 
 
 def test_openai_compat_adapter_retries_with_max_completion_tokens_when_max_tokens_is_rejected():

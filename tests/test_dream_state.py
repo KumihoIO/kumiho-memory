@@ -918,6 +918,16 @@ def test_parse_assessments_markdown_fenced():
     assert len(result) == 1
 
 
+def test_parse_assessments_wrapped_object():
+    """Strict-schema OpenAI responses may wrap the array in an object."""
+    raw = json.dumps({
+        "assessments": [{"index": 0, "relevance_score": 0.9}],
+    })
+    result = _parse_assessments(raw)
+    assert len(result) == 1
+    assert result[0]["index"] == 0
+
+
 def test_parse_assessments_invalid_returns_empty():
     """Unparseable text should return an empty list."""
     result = _parse_assessments("This is not JSON at all.")
