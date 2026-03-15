@@ -265,14 +265,19 @@ def test_openai_compat_adapter_uses_max_completion_tokens_for_gpt5_chat_models()
     client = StubChatCompletionsClient()
     adapter = OpenAICompatAdapter(client)
 
-    result = asyncio.run(
-        adapter.chat(
-            messages=[{"role": "user", "content": "Summarize this"}],
-            model="gpt-5.4",
-            max_tokens=321,
-            json_mode=build_summary_schema_mode(),
+    with patch.object(
+        OpenAICompatAdapter,
+        "_supports_request_param",
+        side_effect=lambda name: name in {"max_completion_tokens", "reasoning_effort"},
+    ):
+        result = asyncio.run(
+            adapter.chat(
+                messages=[{"role": "user", "content": "Summarize this"}],
+                model="gpt-5.4",
+                max_tokens=321,
+                json_mode=build_summary_schema_mode(),
+            )
         )
-    )
 
     assert result == '{"summary":"Structured JSON"}'
     assert client.calls[0]["max_completion_tokens"] == 321
@@ -285,20 +290,52 @@ def test_openai_compat_adapter_uses_max_completion_tokens_for_gpt5_chat_models()
     assert "summary" in schema["properties"]
 
 
+def test_openai_compat_adapter_uses_extra_body_when_max_completion_tokens_param_is_unavailable():
+    from kumiho_memory.summarization import OpenAICompatAdapter, build_summary_schema_mode
+
+    client = StubChatCompletionsClient()
+    adapter = OpenAICompatAdapter(client)
+
+    with patch.object(
+        OpenAICompatAdapter,
+        "_supports_request_param",
+        side_effect=lambda name: name == "max_tokens",
+    ):
+        result = asyncio.run(
+            adapter.chat(
+                messages=[{"role": "user", "content": "Summarize this"}],
+                model="gpt-5-mini",
+                max_tokens=321,
+                json_mode=build_summary_schema_mode(),
+            )
+        )
+
+    assert result == '{"summary":"Structured JSON"}'
+    assert "max_completion_tokens" not in client.calls[0]
+    assert "max_tokens" not in client.calls[0]
+    assert client.calls[0]["extra_body"]["max_completion_tokens"] == 321
+    assert client.calls[0]["extra_body"]["reasoning_effort"] == "minimal"
+
+
 def test_openai_compat_adapter_uses_json_schema_for_array_mode():
     from kumiho_memory.summarization import OpenAICompatAdapter, build_string_array_wrapper_schema
 
     client = StubChatCompletionsClient()
     adapter = OpenAICompatAdapter(client)
 
-    result = asyncio.run(
-        adapter.chat(
-            messages=[{"role": "user", "content": "Return items"}],
-            model="gpt-5-mini",
-            max_tokens=123,
-            json_mode=build_string_array_wrapper_schema("kumiho_queries_response", "queries"),
+    with patch.object(
+        OpenAICompatAdapter,
+        "_supports_request_param",
+        side_effect=lambda name: name in {"max_completion_tokens", "reasoning_effort"},
+    ):
+        result = asyncio.run(
+            adapter.chat(
+                messages=[{"role": "user", "content": "Return items"}],
+                model="gpt-5-mini",
+                max_tokens=123,
+                json_mode=build_string_array_wrapper_schema("kumiho_queries_response", "queries"),
+            )
         )
-    )
 
     assert result == '{"queries":["one","two"]}'
     assert client.calls[0]["response_format"]["type"] == "json_schema"
@@ -409,13 +446,18 @@ def test_openai_compat_adapter_retries_with_max_completion_tokens_when_max_token
     client = StubChatCompletionsClient(fail_on_param="max_tokens")
     adapter = OpenAICompatAdapter(client)
 
-    result = asyncio.run(
-        adapter.chat(
-            messages=[{"role": "user", "content": "Summarize this"}],
-            model="gpt-4o",
-            max_tokens=222,
+    with patch.object(
+        OpenAICompatAdapter,
+        "_supports_request_param",
+        side_effect=lambda name: name == "max_completion_tokens",
+    ):
+        result = asyncio.run(
+            adapter.chat(
+                messages=[{"role": "user", "content": "Summarize this"}],
+                model="gpt-4o",
+                max_tokens=222,
+            )
         )
-    )
 
     assert result == "ok:Summarize this"
     assert len(client.calls) == 2
@@ -442,6 +484,72 @@ def test_openai_compat_adapter_uses_parsed_payload_when_content_is_empty():
     )
 
     assert result == '{"summary": "Structured JSON via parsed"}'
+
+
+def test_openai_compat_adapter_retries_with_larger_budget_after_empty_length_response():
+    from kumiho_memory.summarization import OpenAICompatAdapter, build_summary_schema_mode
+
+    class LengthRetryClient:
+        def __init__(self) -> None:
+            self.calls = []
+            self.responses = type("ResponsesNamespace", (), {
+                "create": self._unexpected_responses_call,
+            })()
+            self.chat = type("ChatNamespace", (), {
+                "completions": type("CompletionNamespace", (), {
+                    "create": self._create_chat_completion,
+                })()
+            })()
+
+        async def _create_chat_completion(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return type("StubResponse", (), {
+                    "choices": [type("StubChoice", (), {
+                        "message": type("StubMessage", (), {
+                            "content": None,
+                            "parsed": None,
+                            "refusal": None,
+                            "tool_calls": [],
+                        })(),
+                        "finish_reason": "length",
+                    })()]
+                })()
+            return type("StubResponse", (), {
+                "choices": [type("StubChoice", (), {
+                    "message": type("StubMessage", (), {
+                        "content": '{"summary":"Structured JSON"}',
+                        "parsed": None,
+                        "refusal": None,
+                        "tool_calls": [],
+                    })(),
+                    "finish_reason": "stop",
+                })()]
+            })()
+
+        async def _unexpected_responses_call(self, **kwargs):
+            raise AssertionError(f"responses.create should not be called: {kwargs}")
+
+    client = LengthRetryClient()
+    adapter = OpenAICompatAdapter(client)
+
+    with patch.object(
+        OpenAICompatAdapter,
+        "_supports_request_param",
+        side_effect=lambda name: name == "max_tokens",
+    ):
+        result = asyncio.run(
+            adapter.chat(
+                messages=[{"role": "user", "content": "Summarize this"}],
+                model="gpt-5-mini",
+                max_tokens=2560,
+                json_mode=build_summary_schema_mode(),
+            )
+        )
+
+    assert result == '{"summary":"Structured JSON"}'
+    assert client.calls[0]["extra_body"]["max_completion_tokens"] == 2560
+    assert client.calls[1]["extra_body"]["max_completion_tokens"] == 4096
 
 
 def test_openai_compat_adapter_create_falls_back_to_explicit_http_client_on_proxies_typeerror():
@@ -530,6 +638,12 @@ def test_normalize_summary_marks_missing_summary_as_error():
 
     assert result["summary"] == "We moved the launch to April 15."
     assert result["error"] == "Summarizer response did not include a non-empty summary"
+
+
+def test_summary_max_tokens_prefers_larger_budget_for_gpt5_models():
+    summarizer = MemorySummarizer(provider="openai", model="gpt-5-mini")
+
+    assert summarizer._summary_max_tokens([{"role": "user", "content": "hello"}]) == 4096
 
 
 def test_fallback_summary_ignores_injected_kumiho_blocks():

@@ -267,8 +267,11 @@ class OpenAICompatAdapter:
     def _supports_alternate_token_param(exc: Exception, *, failed_param: str) -> bool:
         message = str(exc).lower()
         return (
-            "unsupported parameter" in message and
-            failed_param in message
+            failed_param in message and (
+                "unsupported parameter" in message
+                or "unexpected keyword argument" in message
+                or "got an unexpected keyword argument" in message
+            )
         )
 
     @staticmethod
@@ -389,7 +392,7 @@ class OpenAICompatAdapter:
         return "proxies" not in params
 
     @staticmethod
-    def _supports_reasoning_effort_param() -> bool:
+    def _supports_request_param(name: str) -> bool:
         try:
             from openai.resources.chat.completions import AsyncCompletions  # type: ignore
         except ImportError:
@@ -400,7 +403,15 @@ class OpenAICompatAdapter:
         except (TypeError, ValueError):
             return False
 
-        return "reasoning_effort" in params
+        return name in params
+
+    @classmethod
+    def _supports_reasoning_effort_param(cls) -> bool:
+        return cls._supports_request_param("reasoning_effort")
+
+    @classmethod
+    def _supports_max_completion_tokens_param(cls) -> bool:
+        return cls._supports_request_param("max_completion_tokens")
 
     def _gemini_thinking_control(self, model: str) -> Dict[str, Any]:
         base_url = self._base_url.lower()
@@ -423,6 +434,64 @@ class OpenAICompatAdapter:
                 },
             },
         }
+
+    @staticmethod
+    def _merge_extra_body(
+        current: Optional[Dict[str, Any]],
+        update: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        merged = dict(current or {})
+        for key, value in (update or {}).items():
+            if isinstance(merged.get(key), dict) and isinstance(value, dict):
+                merged[key] = {**merged[key], **value}
+            else:
+                merged[key] = value
+        return merged
+
+    @classmethod
+    def _set_token_budget(
+        cls,
+        kwargs: Dict[str, Any],
+        *,
+        model: str,
+        max_tokens: int,
+    ) -> str:
+        extra_body = dict(kwargs.get("extra_body") or {})
+        kwargs.pop("max_tokens", None)
+        kwargs.pop("max_completion_tokens", None)
+
+        if cls._prefers_max_completion_tokens(model):
+            if cls._supports_max_completion_tokens_param():
+                kwargs["max_completion_tokens"] = max_tokens
+            else:
+                extra_body["max_completion_tokens"] = max_tokens
+            token_param = "max_completion_tokens"
+        else:
+            kwargs["max_tokens"] = max_tokens
+            token_param = "max_tokens"
+
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        else:
+            kwargs.pop("extra_body", None)
+        return token_param
+
+    @staticmethod
+    def _retry_budget_for_empty_length(
+        *,
+        model: str,
+        json_mode: JsonMode,
+        current_max_tokens: int,
+    ) -> Optional[int]:
+        if not json_mode:
+            return None
+        lowered = model.strip().lower()
+        if lowered.startswith("gpt-5"):
+            if current_max_tokens < 4096:
+                return 4096
+            if current_max_tokens < 6144:
+                return 6144
+        return None
 
     async def chat(
         self,
@@ -477,24 +546,63 @@ class OpenAICompatAdapter:
             "model": model,
             "messages": full_messages,
         }
-        reasoning_effort = self._default_reasoning_effort(model, json_mode)
-        token_param = (
-            "max_completion_tokens"
-            if self._prefers_max_completion_tokens(model)
-            else "max_tokens"
+        gemini_control = self._gemini_thinking_control(model)
+        if gemini_control.get("extra_body"):
+            kwargs["extra_body"] = self._merge_extra_body(
+                kwargs.get("extra_body"),
+                gemini_control["extra_body"],
+            )
+        reasoning_effort = (
+            gemini_control.get("reasoning_effort")
+            or self._default_reasoning_effort(model, json_mode)
         )
-        kwargs[token_param] = max_tokens
+        token_param = self._set_token_budget(
+            kwargs,
+            model=model,
+            max_tokens=max_tokens,
+        )
         if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
-        kwargs.update(self._gemini_thinking_control(model))
+            if self._supports_reasoning_effort_param():
+                kwargs["reasoning_effort"] = reasoning_effort
+            else:
+                kwargs["extra_body"] = self._merge_extra_body(
+                    kwargs.get("extra_body"),
+                    {"reasoning_effort": reasoning_effort},
+                )
         response_format = self._response_format(json_mode)
         if response_format:
             kwargs["response_format"] = response_format
 
         request_kwargs = dict(kwargs)
+        current_max_tokens = max_tokens
         while True:
             try:
                 response = await self._client.chat.completions.create(**request_kwargs)
+                choices = getattr(response, "choices", None) or []
+                if choices:
+                    choice = choices[0]
+                    message = getattr(choice, "message", None)
+                    content = self._coerce_message_content(getattr(message, "content", None))
+                    parsed = getattr(message, "parsed", None)
+                    if (
+                        not content
+                        and parsed is None
+                        and getattr(choice, "finish_reason", "") == "length"
+                    ):
+                        retry_budget = self._retry_budget_for_empty_length(
+                            model=model,
+                            json_mode=json_mode,
+                            current_max_tokens=current_max_tokens,
+                        )
+                        if retry_budget and retry_budget != current_max_tokens:
+                            request_kwargs = dict(request_kwargs)
+                            current_max_tokens = retry_budget
+                            token_param = self._set_token_budget(
+                                request_kwargs,
+                                model=model,
+                                max_tokens=current_max_tokens,
+                            )
+                            continue
                 break
             except Exception as exc:
                 response_format_type = (
@@ -520,7 +628,16 @@ class OpenAICompatAdapter:
                     raise
                 request_kwargs = dict(request_kwargs)
                 request_kwargs.pop(token_param, None)
-                request_kwargs[alt_param] = max_tokens
+                extra_body = dict(request_kwargs.get("extra_body") or {})
+                extra_body.pop(token_param, None)
+                if alt_param == "max_completion_tokens" and not self._supports_max_completion_tokens_param():
+                    extra_body[alt_param] = current_max_tokens
+                else:
+                    request_kwargs[alt_param] = current_max_tokens
+                if extra_body:
+                    request_kwargs["extra_body"] = extra_body
+                else:
+                    request_kwargs.pop("extra_body", None)
                 token_param = alt_param
         return self._extract_chat_message_text(
             response=response,
@@ -792,13 +909,14 @@ class MemorySummarizer:
         user_prompt = self._user_prompt(conversation_text, context=context)
         json_mode = build_summary_schema_mode()
         raw = ""
+        max_tokens = self._summary_max_tokens(messages)
 
         try:
             raw = await self.adapter.chat(
                 messages=[{"role": "user", "content": user_prompt}],
                 model=self.model,
                 system=system_prompt,
-                max_tokens=2560,
+                max_tokens=max_tokens,
                 json_mode=json_mode,
             )
             result = self._parse_json(raw)
@@ -807,6 +925,7 @@ class MemorySummarizer:
                 model=self.model,
                 json_mode=json_mode,
                 raw_response=raw,
+                max_tokens=max_tokens,
             )
             self._log_llm_failure(
                 "summarize_conversation",
@@ -889,10 +1008,17 @@ class MemorySummarizer:
                     model=self.light_model,
                     json_mode=json_mode,
                     raw_response=raw,
+                    max_tokens=512,
                 ),
             )
 
         return []
+
+    def _summary_max_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        lowered = self.model.strip().lower()
+        if lowered.startswith("gpt-5"):
+            return 4096
+        return 2560
 
     # ------------------------------------------------------------------
     # Adapter construction
@@ -999,12 +1125,14 @@ class MemorySummarizer:
         model: str,
         json_mode: JsonMode,
         raw_response: str = "",
+        max_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         return {
             "provider": self.provider,
             "model": model,
             "base_url": self._base_url or "",
             "json_mode": self._describe_json_mode(json_mode),
+            "max_tokens": max_tokens,
             "raw_response_len": len(raw_response or ""),
             "raw_response_preview": self._preview_text(raw_response),
         }
@@ -1017,13 +1145,14 @@ class MemorySummarizer:
         diagnostics: Dict[str, Any],
     ) -> None:
         logger.warning(
-            "%s failed: %s | provider=%s model=%s base_url=%s json_mode=%s raw_len=%s raw_preview=%r",
+            "%s failed: %s | provider=%s model=%s base_url=%s json_mode=%s max_tokens=%s raw_len=%s raw_preview=%r",
             operation,
             error,
             diagnostics.get("provider", ""),
             diagnostics.get("model", ""),
             diagnostics.get("base_url", ""),
             diagnostics.get("json_mode", ""),
+            diagnostics.get("max_tokens", ""),
             diagnostics.get("raw_response_len", 0),
             diagnostics.get("raw_response_preview", ""),
         )
