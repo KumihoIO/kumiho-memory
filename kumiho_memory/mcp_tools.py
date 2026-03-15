@@ -294,15 +294,19 @@ def tool_memory_dream_state(args: Dict[str, Any]) -> Dict[str, Any]:
     provider = args.get("provider")
     model = args.get("model")
     api_key = args.get("api_key")
-    if provider or model or api_key:
+    base_url = args.get("base_url")
+    if provider or model or api_key or base_url:
         # If provider/model were specified but no api_key, inherit the key
         # from the shared manager's summarizer (which resolved it from env
         # vars at startup).  This avoids requiring a separate LLM key config
         # for Dream State — it reuses whatever the MCP server already has.
-        if not api_key:
+        if not api_key or not base_url:
             try:
                 shared = _get_manager()
-                api_key = getattr(shared.summarizer, "api_key", None)
+                if not api_key:
+                    api_key = getattr(shared.summarizer, "api_key", None)
+                if not base_url:
+                    base_url = getattr(shared.summarizer, "_base_url", None)
             except Exception:
                 pass
 
@@ -310,6 +314,7 @@ def tool_memory_dream_state(args: Dict[str, Any]) -> Dict[str, Any]:
             provider=provider,
             model=model,
             api_key=api_key,
+            base_url=base_url,
         )
 
     ds = DreamState(
@@ -728,7 +733,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                 },
                 "provider": {
                     "type": "string",
-                    "enum": ["openai", "anthropic"],
+                    "enum": ["openai", "anthropic", "gemini"],
                     "description": "LLM provider for assessment. Falls back to KUMIHO_LLM_PROVIDER env var if not set.",
                 },
                 "model": {
@@ -738,6 +743,10 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                 "api_key": {
                     "type": "string",
                     "description": "LLM API key. Falls back to KUMIHO_LLM_API_KEY env var if not set.",
+                },
+                "base_url": {
+                    "type": "string",
+                    "description": "OpenAI-compatible base URL. Falls back to KUMIHO_LLM_BASE_URL env var if not set.",
                 },
             },
         },

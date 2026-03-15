@@ -42,13 +42,21 @@ def _load_preferences() -> dict:
 def _configure_llm_from_prefs(prefs: dict, section: str = "dreamState") -> None:
     """Set KUMIHO_LLM_* env vars from preferences.json if not already set.
 
-    The setup wizard stores model config like::
+    The setup wizard stores shared direct-provider config plus per-feature models::
 
-        { "dreamState": { "model": { "provider": "anthropic", "model": "..." } } }
+        {
+            "llm": { "provider": "gemini", "apiKey": "...", "baseUrl": "..." },
+            "dreamState": { "model": { "provider": "gemini", "model": "..." } }
+        }
 
-    We translate that to the env vars that MemorySummarizer reads.
+    We merge the shared ``llm`` block first, then let the section-specific
+    model config override it before translating to the env vars that
+    MemorySummarizer reads.
     """
-    model_cfg = prefs.get(section, {}).get("model", {})
+    model_cfg = {
+        **prefs.get("llm", {}),
+        **prefs.get(section, {}).get("model", {}),
+    }
     if not model_cfg:
         return
 

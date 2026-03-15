@@ -77,6 +77,19 @@ class OpenAICompatAdapter:
     def __init__(self, client: Any) -> None:
         self._client = client
 
+    @staticmethod
+    def _prefers_max_completion_tokens(model: str) -> bool:
+        lowered = model.strip().lower()
+        return bool(re.match(r"^(gpt-5|o\d)", lowered))
+
+    @staticmethod
+    def _supports_alternate_token_param(exc: Exception, *, failed_param: str) -> bool:
+        message = str(exc).lower()
+        return (
+            "unsupported parameter" in message and
+            failed_param in message
+        )
+
     @classmethod
     def create(
         cls,
@@ -142,12 +155,26 @@ class OpenAICompatAdapter:
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": full_messages,
-            "max_tokens": max_tokens,
         }
+        token_param = (
+            "max_completion_tokens"
+            if self._prefers_max_completion_tokens(model)
+            else "max_tokens"
+        )
+        kwargs[token_param] = max_tokens
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
-        response = await self._client.chat.completions.create(**kwargs)
+        try:
+            response = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            alt_param = "max_tokens" if token_param == "max_completion_tokens" else "max_completion_tokens"
+            if not self._supports_alternate_token_param(exc, failed_param=token_param):
+                raise
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop(token_param, None)
+            retry_kwargs[alt_param] = max_tokens
+            response = await self._client.chat.completions.create(**retry_kwargs)
         return response.choices[0].message.content or ""
 
 

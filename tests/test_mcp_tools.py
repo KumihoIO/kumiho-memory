@@ -461,3 +461,59 @@ def test_memory_dream_state_dry_run():
         assert result["events_processed"] == 0
     finally:
         sys.modules.pop("kumiho", None)
+
+
+def test_memory_dream_state_accepts_gemini_and_base_url():
+    """Dream State should accept gemini plus an OpenAI-compatible base_url."""
+    import sys
+    import types
+
+    fake_sdk = types.ModuleType("kumiho")
+
+    class FakeKref:
+        def __init__(self, uri):
+            self.uri = uri
+
+    class FakeItem:
+        def __init__(self, kref_uri):
+            self.kref = FakeKref(kref_uri)
+
+    fake_sdk.get_item = lambda kref: FakeItem(kref)
+    fake_sdk.get_project = lambda name: types.SimpleNamespace(
+        get_space=lambda n: None,
+        create_space=lambda n: types.SimpleNamespace(
+            create_item=lambda item_name, kind: FakeItem(f"kref://{item_name}/{n}.{kind}")
+        ),
+    )
+    fake_sdk.event_stream = lambda **kw: iter([])
+    fake_sdk.get_attribute = lambda kref, key: None
+    fake_sdk.set_attribute = lambda kref, key, val: None
+    fake_sdk.batch_get_revisions = lambda **kw: ([], [])
+    fake_sdk.get_client = lambda: None
+    fake_sdk.Kref = FakeKref
+
+    sys.modules["kumiho"] = fake_sdk
+    try:
+        with patch("kumiho_memory.summarization.MemorySummarizer", return_value=StubSummarizer()) as mock_summarizer:
+            result = tool_memory_dream_state({
+                "project": "CognitiveMemory",
+                "dry_run": True,
+                "provider": "gemini",
+                "model": "gemini-2.5-flash",
+                "api_key": "gemini-direct-key",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            })
+        assert result["success"] is True
+        mock_summarizer.assert_called_once_with(
+            provider="gemini",
+            model="gemini-2.5-flash",
+            api_key="gemini-direct-key",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+
+        dream_tool = next(tool for tool in MEMORY_TOOLS if tool["name"] == "kumiho_memory_dream_state")
+        provider_schema = dream_tool["inputSchema"]["properties"]["provider"]
+        assert "gemini" in provider_schema["enum"]
+        assert "base_url" in dream_tool["inputSchema"]["properties"]
+    finally:
+        sys.modules.pop("kumiho", None)

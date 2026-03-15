@@ -35,6 +35,37 @@ class StubResponsesClient:
         raise AssertionError(f"chat.completions.create should not be called: {kwargs}")
 
 
+class StubChatCompletionsClient:
+    def __init__(self, *, fail_on_param: str | None = None) -> None:
+        self.responses = type("ResponsesNamespace", (), {
+            "create": self._unexpected_responses_call,
+        })()
+        self.chat = type("ChatNamespace", (), {
+            "completions": type("CompletionNamespace", (), {
+                "create": self._create_chat_completion,
+            })()
+        })()
+        self.fail_on_param = fail_on_param
+        self.calls = []
+
+    async def _create_chat_completion(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail_on_param and self.fail_on_param in kwargs:
+            raise ValueError(
+                f"Unsupported parameter: '{self.fail_on_param}' is not supported with this model. "
+                "Use 'max_completion_tokens' instead."
+            )
+        content = kwargs.get("messages", [{}])[-1].get("content", "")
+        return type("StubResponse", (), {
+            "choices": [type("StubChoice", (), {
+                "message": type("StubMessage", (), {"content": f"ok:{content}"})()
+            })()]
+        })()
+
+    async def _unexpected_responses_call(self, **kwargs):
+        raise AssertionError(f"responses.create should not be called: {kwargs}")
+
+
 def test_summarize_conversation_with_stubbed_llm():
     canned = json.dumps({
         "type": "summary",
@@ -103,6 +134,45 @@ def test_openai_compat_adapter_uses_responses_api_for_codex_models():
     assert client.last_kwargs["model"] == "gpt-5-codex"
     assert "System: Return JSON" in client.last_kwargs["input"]
     assert "User: Summarize this" in client.last_kwargs["input"]
+
+
+def test_openai_compat_adapter_uses_max_completion_tokens_for_gpt5_chat_models():
+    from kumiho_memory.summarization import OpenAICompatAdapter
+
+    client = StubChatCompletionsClient()
+    adapter = OpenAICompatAdapter(client)
+
+    result = asyncio.run(
+        adapter.chat(
+            messages=[{"role": "user", "content": "Summarize this"}],
+            model="gpt-5.4",
+            max_tokens=321,
+        )
+    )
+
+    assert result == "ok:Summarize this"
+    assert client.calls[0]["max_completion_tokens"] == 321
+    assert "max_tokens" not in client.calls[0]
+
+
+def test_openai_compat_adapter_retries_with_max_completion_tokens_when_max_tokens_is_rejected():
+    from kumiho_memory.summarization import OpenAICompatAdapter
+
+    client = StubChatCompletionsClient(fail_on_param="max_tokens")
+    adapter = OpenAICompatAdapter(client)
+
+    result = asyncio.run(
+        adapter.chat(
+            messages=[{"role": "user", "content": "Summarize this"}],
+            model="gpt-4o",
+            max_tokens=222,
+        )
+    )
+
+    assert result == "ok:Summarize this"
+    assert len(client.calls) == 2
+    assert client.calls[0]["max_tokens"] == 222
+    assert client.calls[1]["max_completion_tokens"] == 222
 
 
 def test_memory_summarizer_adapter_uses_late_kumiho_llm_env():
