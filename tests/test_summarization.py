@@ -37,7 +37,14 @@ class StubResponsesClient:
 
 
 class StubChatCompletionsClient:
-    def __init__(self, *, fail_on_param: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_on_param: str | None = None,
+        empty_content: bool = False,
+        parsed_payload=None,
+        refusal=None,
+    ) -> None:
         self.responses = type("ResponsesNamespace", (), {
             "create": self._unexpected_responses_call,
         })()
@@ -47,6 +54,9 @@ class StubChatCompletionsClient:
             })()
         })()
         self.fail_on_param = fail_on_param
+        self.empty_content = empty_content
+        self.parsed_payload = parsed_payload
+        self.refusal = refusal
         self.calls = []
 
     async def _create_chat_completion(self, **kwargs):
@@ -70,9 +80,21 @@ class StubChatCompletionsClient:
             content = '{"summary":"Structured JSON"}'
         else:
             content = kwargs.get("messages", [{}])[-1].get("content", "")
+        if self.empty_content:
+            content = None
         return type("StubResponse", (), {
             "choices": [type("StubChoice", (), {
-                "message": type("StubMessage", (), {"content": f"ok:{content}" if not content.startswith("{") and not content.startswith("[") else content})()
+                "message": type("StubMessage", (), {
+                    "content": (
+                        f"ok:{content}"
+                        if isinstance(content, str) and not content.startswith("{") and not content.startswith("[")
+                        else content
+                    ),
+                    "parsed": self.parsed_payload,
+                    "refusal": self.refusal,
+                    "tool_calls": [],
+                })(),
+                "finish_reason": "stop",
             })()]
         })()
 
@@ -272,6 +294,27 @@ def test_openai_compat_adapter_retries_with_max_completion_tokens_when_max_token
     assert len(client.calls) == 2
     assert client.calls[0]["max_tokens"] == 222
     assert client.calls[1]["max_completion_tokens"] == 222
+
+
+def test_openai_compat_adapter_uses_parsed_payload_when_content_is_empty():
+    from kumiho_memory.summarization import OpenAICompatAdapter, build_summary_schema_mode
+
+    client = StubChatCompletionsClient(
+        empty_content=True,
+        parsed_payload={"summary": "Structured JSON via parsed"},
+    )
+    adapter = OpenAICompatAdapter(client)
+
+    result = asyncio.run(
+        adapter.chat(
+            messages=[{"role": "user", "content": "Summarize this"}],
+            model="gpt-5-mini",
+            max_tokens=111,
+            json_mode=build_summary_schema_mode(),
+        )
+    )
+
+    assert result == '{"summary": "Structured JSON via parsed"}'
 
 
 def test_memory_summarizer_adapter_uses_late_kumiho_llm_env():

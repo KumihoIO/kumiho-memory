@@ -173,6 +173,88 @@ class OpenAICompatAdapter:
         self._base_url = (base_url or "").rstrip("/")
 
     @staticmethod
+    def _json_preview(value: Any, *, limit: int = 240) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, default=str)
+            except Exception:
+                text = repr(value)
+        compact = re.sub(r"\s+", " ", text).strip()
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3] + "..."
+
+    @classmethod
+    def _coerce_message_content(cls, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    text_parts.append(item)
+                    continue
+                text = getattr(item, "text", None)
+                if isinstance(text, str) and text:
+                    text_parts.append(text)
+                    continue
+                if isinstance(item, dict):
+                    maybe_text = item.get("text")
+                    if isinstance(maybe_text, str) and maybe_text:
+                        text_parts.append(maybe_text)
+            return "\n".join(part for part in text_parts if part).strip()
+        return ""
+
+    def _extract_chat_message_text(
+        self,
+        *,
+        response: Any,
+        model: str,
+        json_mode: JsonMode,
+    ) -> str:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            logger.warning(
+                "chat.completions returned no choices | model=%s base_url=%s json_mode=%s",
+                model,
+                self._base_url or "",
+                MemorySummarizer._describe_json_mode(json_mode),
+            )
+            return ""
+
+        choice = choices[0]
+        message = getattr(choice, "message", None)
+        content = self._coerce_message_content(getattr(message, "content", None))
+        if content:
+            return content
+
+        parsed = getattr(message, "parsed", None)
+        if parsed is not None:
+            try:
+                return json.dumps(parsed, default=str)
+            except Exception:
+                pass
+
+        logger.warning(
+            "chat.completions returned empty message content | model=%s base_url=%s json_mode=%s finish_reason=%s refusal=%r parsed_type=%s parsed_preview=%r content_type=%s content_preview=%r tool_calls=%s",
+            model,
+            self._base_url or "",
+            MemorySummarizer._describe_json_mode(json_mode),
+            getattr(choice, "finish_reason", ""),
+            getattr(message, "refusal", None),
+            type(parsed).__name__ if parsed is not None else "",
+            self._json_preview(parsed),
+            type(getattr(message, "content", None)).__name__,
+            self._json_preview(getattr(message, "content", None)),
+            len(getattr(message, "tool_calls", None) or []),
+        )
+        return ""
+
+    @staticmethod
     def _prefers_max_completion_tokens(model: str) -> bool:
         lowered = model.strip().lower()
         return bool(re.match(r"^(gpt-5|o\d)", lowered))
@@ -287,7 +369,15 @@ class OpenAICompatAdapter:
                     text = getattr(content, "text", None)
                     if text:
                         text_parts.append(str(text))
-            return "\n".join(part for part in text_parts if part).strip()
+            joined = "\n".join(part for part in text_parts if part).strip()
+            if not joined:
+                logger.warning(
+                    "responses.create returned no output text | model=%s base_url=%s output_items=%s",
+                    model,
+                    self._base_url or "",
+                    len(output),
+                )
+            return joined
 
         kwargs: Dict[str, Any] = {
             "model": model,
@@ -313,7 +403,11 @@ class OpenAICompatAdapter:
             retry_kwargs.pop(token_param, None)
             retry_kwargs[alt_param] = max_tokens
             response = await self._client.chat.completions.create(**retry_kwargs)
-        return response.choices[0].message.content or ""
+        return self._extract_chat_message_text(
+            response=response,
+            model=model,
+            json_mode=json_mode,
+        )
 
 
 class AnthropicAdapter:
