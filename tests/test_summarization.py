@@ -245,6 +245,7 @@ def test_openai_compat_adapter_uses_max_completion_tokens_for_gpt5_chat_models()
 
     assert result == '{"summary":"Structured JSON"}'
     assert client.calls[0]["max_completion_tokens"] == 321
+    assert client.calls[0]["reasoning_effort"] == "none"
     assert "max_tokens" not in client.calls[0]
     assert client.calls[0]["response_format"]["type"] == "json_schema"
     schema = client.calls[0]["response_format"]["json_schema"]["schema"]
@@ -270,6 +271,7 @@ def test_openai_compat_adapter_uses_json_schema_for_array_mode():
 
     assert result == '{"queries":["one","two"]}'
     assert client.calls[0]["response_format"]["type"] == "json_schema"
+    assert client.calls[0]["reasoning_effort"] == "minimal"
     schema = client.calls[0]["response_format"]["json_schema"]["schema"]
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False

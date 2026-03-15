@@ -215,14 +215,16 @@ class OpenAICompatAdapter:
         response: Any,
         model: str,
         json_mode: JsonMode,
+        reasoning_effort: Optional[str] = None,
     ) -> str:
         choices = getattr(response, "choices", None) or []
         if not choices:
             logger.warning(
-                "chat.completions returned no choices | model=%s base_url=%s json_mode=%s",
+                "chat.completions returned no choices | model=%s base_url=%s json_mode=%s reasoning_effort=%s",
                 model,
                 self._base_url or "",
                 MemorySummarizer._describe_json_mode(json_mode),
+                reasoning_effort or "",
             )
             return ""
 
@@ -240,10 +242,11 @@ class OpenAICompatAdapter:
                 pass
 
         logger.warning(
-            "chat.completions returned empty message content | model=%s base_url=%s json_mode=%s finish_reason=%s refusal=%r parsed_type=%s parsed_preview=%r content_type=%s content_preview=%r tool_calls=%s",
+            "chat.completions returned empty message content | model=%s base_url=%s json_mode=%s reasoning_effort=%s finish_reason=%s refusal=%r parsed_type=%s parsed_preview=%r content_type=%s content_preview=%r tool_calls=%s",
             model,
             self._base_url or "",
             MemorySummarizer._describe_json_mode(json_mode),
+            reasoning_effort or "",
             getattr(choice, "finish_reason", ""),
             getattr(message, "refusal", None),
             type(parsed).__name__ if parsed is not None else "",
@@ -266,6 +269,17 @@ class OpenAICompatAdapter:
             "unsupported parameter" in message and
             failed_param in message
         )
+
+    @staticmethod
+    def _default_reasoning_effort(model: str, json_mode: JsonMode) -> Optional[str]:
+        if not json_mode:
+            return None
+        lowered = model.strip().lower()
+        if lowered.startswith(("gpt-5.1", "gpt-5.2", "gpt-5.4")):
+            return "none"
+        if lowered.startswith("gpt-5"):
+            return "minimal"
+        return None
 
     @staticmethod
     def _json_mode_kind(json_mode: JsonMode) -> Optional[str]:
@@ -383,12 +397,15 @@ class OpenAICompatAdapter:
             "model": model,
             "messages": full_messages,
         }
+        reasoning_effort = self._default_reasoning_effort(model, json_mode)
         token_param = (
             "max_completion_tokens"
             if self._prefers_max_completion_tokens(model)
             else "max_tokens"
         )
         kwargs[token_param] = max_tokens
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         response_format = self._response_format(json_mode)
         if response_format:
             kwargs["response_format"] = response_format
@@ -407,6 +424,7 @@ class OpenAICompatAdapter:
             response=response,
             model=model,
             json_mode=json_mode,
+            reasoning_effort=reasoning_effort,
         )
 
 
