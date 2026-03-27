@@ -11,8 +11,20 @@ Usage::
     # Custom project and batch size
     python -m kumiho_memory dream --project MyProject --batch-size 10
 
+    # Ingest a SKILL.md into the graph
+    python -m kumiho_memory ingest-skill path/to/SKILL.md --list
+    python -m kumiho_memory ingest-skill path/to/SKILL.md --dry-run
+    python -m kumiho_memory ingest-skill path/to/SKILL.md
+
+    # Ingest a standalone reference doc
+    python -m kumiho_memory ingest-skill path/to/creative-memory.md --item-name creative-memory
+
+    # Batch ingest a directory of reference docs
+    python -m kumiho_memory ingest-skill path/to/references/ --batch
+
     # Via the installed console script
     kumiho-memory dream
+    kumiho-memory ingest-skill path/to/SKILL.md
 """
 
 from __future__ import annotations
@@ -72,6 +84,87 @@ def _configure_llm_from_prefs(prefs: dict, section: str = "dreamState") -> None:
             os.environ[env_var] = val
 
 
+def cmd_ingest_skill(args: argparse.Namespace) -> int:
+    """Ingest a SKILL.md or reference doc(s) into the Kumiho graph."""
+    from kumiho_memory.skill_ingest import (
+        ingest_batch,
+        ingest_file,
+        ingest_skill,
+        parse_skill,
+    )
+
+    target = Path(args.path)
+
+    # --batch: ingest all .md files in a directory
+    if args.batch:
+        if not target.is_dir():
+            print(f"ERROR: --batch requires a directory, got: {target}", file=sys.stderr)
+            return 1
+        results = ingest_batch(
+            target,
+            project=args.project,
+            space_name=args.space,
+            tags=args.tags,
+            dry_run=args.dry_run,
+        )
+        for r in results:
+            tag = "[NEW]" if r.created_new_item else "[REV]"
+            print(f"  {tag} {r.item_name} → {r.revision_kref}")
+        print(f"\nIngested {len(results)} files from {target}")
+        return 0
+
+    # --item-name: ingest a standalone file as a single skill item
+    if args.item_name:
+        if not target.is_file():
+            print(f"ERROR: file not found: {target}", file=sys.stderr)
+            return 1
+        result = ingest_file(
+            target,
+            item_name=args.item_name,
+            project=args.project,
+            space_name=args.space,
+            tags=args.tags,
+            dry_run=args.dry_run,
+        )
+        tag = "[NEW]" if result.created_new_item else "[REV]"
+        print(f"  {tag} {result.item_name} → {result.revision_kref}")
+        return 0
+
+    # Default: parse a SKILL.md and ingest sections
+    if not target.is_file():
+        print(f"ERROR: file not found: {target}", file=sys.stderr)
+        return 1
+
+    # --list: show sections without ingesting
+    if args.list:
+        parsed = parse_skill(target)
+        print(f"Skill: {parsed.name}")
+        print(f"Description: {parsed.description}")
+        print(f"Tags: {parsed.tags}")
+        print(f"\nSections ({len(parsed.sections)}):\n")
+        for s in parsed.sections:
+            marker = "[inline]" if s.inline else "[graph] "
+            print(f"  {marker} {s.name}: {s.title} ({len(s.content)} chars, line {s.line_start})")
+        graph_count = sum(1 for s in parsed.sections if not s.inline)
+        inline_count = sum(1 for s in parsed.sections if s.inline)
+        print(f"\n{graph_count} discoverable, {inline_count} inline")
+        return 0
+
+    results = ingest_skill(
+        target,
+        project=args.project,
+        space_name=args.space,
+        section_filter=args.section,
+        dry_run=args.dry_run,
+    )
+    for r in results:
+        tag = "[NEW]" if r.created_new_item else "[REV]"
+        print(f"  {tag} {r.item_name} → {r.revision_kref}")
+    action = "Would ingest" if args.dry_run else "Ingested"
+    print(f"\n{action} {len(results)} sections into {args.project}/{args.space}")
+    return 0
+
+
 def cmd_dream(args: argparse.Namespace) -> int:
     """Run a Dream State consolidation cycle."""
     from kumiho_memory import DreamState
@@ -107,6 +200,60 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     sub = parser.add_subparsers(dest="command")
+
+    # -- ingest-skill subcommand --
+    ingest = sub.add_parser(
+        "ingest-skill",
+        help="Ingest a SKILL.md or reference docs into the Kumiho graph",
+        description="Parse a SKILL.md file and ingest non-inline sections as "
+        "versioned skill items in CognitiveMemory/Skills. Also supports "
+        "standalone reference docs and batch directory ingestion.",
+    )
+    ingest.add_argument(
+        "path",
+        help="Path to SKILL.md file, standalone .md file, or directory (with --batch)",
+    )
+    ingest.add_argument(
+        "--project",
+        default="CognitiveMemory",
+        help="Kumiho project name (default: CognitiveMemory)",
+    )
+    ingest.add_argument(
+        "--space",
+        default="Skills",
+        help="Space within the project (default: Skills)",
+    )
+    ingest.add_argument(
+        "--section",
+        default=None,
+        help="Only ingest the section with this slug name",
+    )
+    ingest.add_argument(
+        "--item-name",
+        default=None,
+        help="Ingest as a standalone file with this item name (skips section parsing)",
+    )
+    ingest.add_argument(
+        "--batch",
+        action="store_true",
+        help="Ingest all .md files in the given directory",
+    )
+    ingest.add_argument(
+        "--tags",
+        nargs="+",
+        default=None,
+        help="Additional tags for ingested items",
+    )
+    ingest.add_argument(
+        "--list",
+        action="store_true",
+        help="List sections without ingesting",
+    )
+    ingest.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview ingestion without making changes",
+    )
 
     # -- dream subcommand --
     dream = sub.add_parser(
@@ -152,7 +299,9 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
 
-    if parsed.command == "dream":
+    if parsed.command == "ingest-skill":
+        return cmd_ingest_skill(parsed)
+    elif parsed.command == "dream":
         return cmd_dream(parsed)
 
     parser.print_help()

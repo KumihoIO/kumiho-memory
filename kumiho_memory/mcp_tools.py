@@ -346,6 +346,130 @@ def tool_memory_discover_edges(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Composite tools — engage / reflect
+# ---------------------------------------------------------------------------
+
+
+def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Check memory before responding — combines recall + context building.
+
+    Returns pre-built context, raw results, and source krefs for linking.
+    Shares the recall deduplication guard with ``tool_memory_recall``.
+    """
+    global _recall_cache_time
+
+    with _recall_lock:
+        now = time.monotonic()
+        if now - _recall_cache_time < _RECALL_DEDUP_WINDOW_SECS:
+            return {
+                "context": "",
+                "results": [],
+                "source_krefs": [],
+                "count": 0,
+                "deduplicated": True,
+                "note": (
+                    "Duplicate recall within dedup window. "
+                    "Results already returned this turn."
+                ),
+            }
+
+        manager = _get_manager()
+        recall_mode = args.get("recall_mode", manager.recall_mode)
+        results = asyncio.run(
+            manager.recall_memories(
+                args["query"],
+                limit=args.get("limit", 5),
+                space_paths=args.get("space_paths"),
+                memory_types=args.get("memory_types"),
+                graph_augmented=args.get("graph_augmented", False),
+            )
+        )
+        context = manager.build_recalled_context(
+            results, args["query"], recall_mode
+        )
+        source_krefs = [m["kref"] for m in results if m.get("kref")]
+
+        _recall_cache_time = time.monotonic()
+        return {
+            "context": context,
+            "results": results,
+            "source_krefs": source_krefs,
+            "count": len(results),
+            "recall_mode": recall_mode,
+        }
+
+
+def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Capture what matters after responding — buffers response + stores facts.
+
+    Combines ``add_assistant_response`` + N stores + optional edge discovery
+    into a single call.  The agent provides structured captures — no external
+    LLM is needed for fact extraction.
+    """
+    manager = _get_manager()
+    session_id = args["session_id"]
+    response = args["response"]
+
+    # 1. Buffer response
+    buf_result = asyncio.run(
+        manager.add_assistant_response(session_id=session_id, response=response)
+    )
+    buffered = buf_result.get("success", True)
+
+    # 2. Store captures
+    captures = args.get("captures") or []
+    source_krefs = args.get("source_krefs") or []
+    space_path = args.get("space_path", "")
+    do_edges = args.get("discover_edges", True)
+    stored_krefs: List[str] = []
+    edges_total = 0
+
+    if captures:
+        from kumiho.mcp_server import tool_memory_store
+
+        for cap in captures:
+            cap_space = cap.get("space_hint", "") or space_path
+            store_result = tool_memory_store(
+                project=manager.project,
+                space_path=cap_space,
+                memory_type=cap.get("type", "summary"),
+                title=cap.get("title", ""),
+                summary=cap.get("content", ""),
+                assistant_text=cap.get("content", ""),
+                source_revision_krefs=source_krefs if source_krefs else None,
+                edge_type="DERIVED_FROM",
+                tags=cap.get("tags"),
+                stack_revisions=True,
+            )
+            rev_kref = store_result.get("revision_kref", "")
+            if rev_kref:
+                stored_krefs.append(rev_kref)
+
+            # 3. Edge discovery (best-effort, skipped if no server-side LLM)
+            if do_edges and rev_kref and cap.get("type") in (
+                "decision", "architecture", "implementation",
+                "synthesis", "reflection",
+            ):
+                try:
+                    edges = asyncio.run(
+                        manager.discover_edges_post_consolidation(
+                            revision_kref=rev_kref,
+                            summary=cap.get("content", ""),
+                        )
+                    )
+                    edges_total += len(edges)
+                except Exception:
+                    pass  # graceful — edge discovery is supplementary
+
+    return {
+        "buffered": buffered,
+        "captures_stored": len(stored_krefs),
+        "edges_discovered": edges_total,
+        "stored_krefs": stored_krefs,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool definitions (JSON Schema)
 # ---------------------------------------------------------------------------
 
@@ -692,6 +816,160 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
             "required": ["task"],
         },
     },
+    # ── Composite (engage / reflect) ─────────────────────────
+    {
+        "name": "kumiho_memory_engage",
+        "description": (
+            "Check memory before responding. Combines recall + context "
+            "building into one call. Returns pre-built context string, "
+            "raw results, and source_krefs for passing to reflect. "
+            "Shares the recall deduplication guard — at most one engage "
+            "or recall per response."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Natural-language search query derived from the "
+                        "user's current message."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "Max results to return.",
+                },
+                "space_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Restrict search to these space paths "
+                        "(e.g. ['CognitiveMemory/personal'])."
+                    ),
+                },
+                "memory_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Filter by memory type "
+                        "(e.g. ['decision', 'preference'])."
+                    ),
+                },
+                "graph_augmented": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Enable graph-augmented recall for indirect or "
+                        "chain-of-decision questions."
+                    ),
+                },
+                "recall_mode": {
+                    "type": "string",
+                    "enum": ["full", "summarized"],
+                    "default": "full",
+                    "description": (
+                        "Context mode: 'full' includes artifact content, "
+                        "'summarized' returns title + summary only."
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "kumiho_memory_reflect",
+        "description": (
+            "Capture what matters after responding. Buffers the assistant "
+            "response and stores structured captures (decisions, preferences, "
+            "facts) with provenance links — all in one call. The agent's own "
+            "LLM identifies what to remember; no external API key needed. "
+            "Pass source_krefs from engage to create DERIVED_FROM edges."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Session identifier.",
+                },
+                "response": {
+                    "type": "string",
+                    "description": "The assistant response text to buffer.",
+                },
+                "captures": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "description": (
+                                    "Memory type: decision, preference, fact, "
+                                    "correction, architecture, implementation, "
+                                    "synthesis, reflection, summary, skill."
+                                ),
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": (
+                                    "Short title with absolute dates "
+                                    "(e.g. 'Chose gRPC on Mar 27')."
+                                ),
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Content to store.",
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Classification tags.",
+                            },
+                            "space_hint": {
+                                "type": "string",
+                                "description": (
+                                    "Space path hint for this capture. "
+                                    "Overrides top-level space_path."
+                                ),
+                            },
+                        },
+                        "required": ["type", "title", "content"],
+                    },
+                    "description": (
+                        "Structured facts to store. Each capture becomes a "
+                        "graph memory with provenance links. Skip for trivial "
+                        "exchanges."
+                    ),
+                },
+                "source_krefs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Krefs from engage results — creates DERIVED_FROM "
+                        "edges to source memories."
+                    ),
+                },
+                "space_path": {
+                    "type": "string",
+                    "description": (
+                        "Default space path for captures without a "
+                        "space_hint."
+                    ),
+                },
+                "discover_edges": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Run edge discovery on stored captures. "
+                        "Gracefully skipped if no server-side LLM."
+                    ),
+                },
+            },
+            "required": ["session_id", "response"],
+        },
+    },
     # ── Maintenance ───────────────────────────────────────────
     {
         "name": "kumiho_memory_dream_state",
@@ -767,6 +1045,8 @@ MEMORY_TOOL_HANDLERS: Dict[str, Any] = {
     "kumiho_memory_consolidate": tool_memory_consolidate,
     "kumiho_memory_recall": tool_memory_recall,
     "kumiho_memory_discover_edges": tool_memory_discover_edges,
+    "kumiho_memory_engage": tool_memory_engage,
+    "kumiho_memory_reflect": tool_memory_reflect,
     "kumiho_memory_store_execution": tool_memory_store_execution,
     "kumiho_memory_dream_state": tool_memory_dream_state,
 }

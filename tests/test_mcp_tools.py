@@ -16,6 +16,8 @@ from kumiho_memory.mcp_tools import (
     tool_memory_add_response,
     tool_memory_consolidate,
     tool_memory_recall,
+    tool_memory_engage,
+    tool_memory_reflect,
     tool_memory_store_execution,
     tool_memory_dream_state,
     _get_manager,
@@ -116,13 +118,13 @@ def _cleanup_manager():
 
 
 def test_memory_tools_count():
-    """Should have 10 tools registered."""
-    assert len(MEMORY_TOOLS) == 10
+    """Should have 12 tools registered (10 base + engage + reflect)."""
+    assert len(MEMORY_TOOLS) == 12
 
 
 def test_memory_tool_handlers_count():
-    """Should have 10 handlers registered."""
-    assert len(MEMORY_TOOL_HANDLERS) == 10
+    """Should have 12 handlers registered."""
+    assert len(MEMORY_TOOL_HANDLERS) == 12
 
 
 def test_all_tools_have_handlers():
@@ -368,6 +370,119 @@ def test_memory_recall_dedup_expires():
         # Should be a fresh call, not the cached object
         assert result2 is not result1
         assert result2["count"] == 1
+    finally:
+        _cleanup_manager()
+
+
+# ---------------------------------------------------------------------------
+# Tests — composite tools (engage / reflect)
+# ---------------------------------------------------------------------------
+
+
+def test_memory_engage_returns_context_and_krefs():
+    """kumiho_memory_engage should return context, results, and source_krefs."""
+    try:
+        _install_test_manager()
+        result = tool_memory_engage({
+            "query": "user preferences",
+            "limit": 3,
+        })
+        assert "context" in result
+        assert "results" in result
+        assert "source_krefs" in result
+        assert result["count"] == 1
+        assert result["source_krefs"] == ["kref://memory/test/rev/1"]
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_engage_deduplication():
+    """Engage shares the recall dedup guard — second call returns empty."""
+    try:
+        _install_test_manager()
+        result1 = tool_memory_engage({"query": "first"})
+        assert result1["count"] == 1
+
+        result2 = tool_memory_engage({"query": "second"})
+        assert result2["count"] == 0
+        assert result2["deduplicated"] is True
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_engage_and_recall_share_dedup():
+    """Engage and recall share the same dedup window."""
+    try:
+        _install_test_manager()
+        result1 = tool_memory_engage({"query": "engage first"})
+        assert result1["count"] == 1
+
+        # Recall after engage should be deduped
+        result2 = tool_memory_recall({"query": "recall second"})
+        assert result2["count"] == 0
+        assert result2["deduplicated"] is True
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_reflect_buffers_response():
+    """kumiho_memory_reflect without captures should buffer response only."""
+    try:
+        _install_test_manager()
+        ingest = tool_memory_ingest({
+            "user_id": "user-reflect-1",
+            "message": "Test question",
+        })
+        result = tool_memory_reflect({
+            "session_id": ingest["session_id"],
+            "response": "Here is my answer.",
+        })
+        assert result["buffered"] is True
+        assert result["captures_stored"] == 0
+        assert result["stored_krefs"] == []
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_reflect_with_captures():
+    """kumiho_memory_reflect with captures should store them."""
+    try:
+        _install_test_manager()
+        ingest = tool_memory_ingest({
+            "user_id": "user-reflect-2",
+            "message": "I prefer dark mode",
+        })
+
+        # Mock tool_memory_store to avoid needing the full kumiho SDK
+        store_calls = []
+
+        def fake_store(**kwargs):
+            store_calls.append(kwargs)
+            return {
+                "revision_kref": f"kref://memory/cap/{len(store_calls)}",
+                "item_kref": "kref://memory/item/1",
+            }
+
+        with patch("kumiho_memory.mcp_tools.tool_memory_reflect.__module__", "kumiho_memory.mcp_tools"):
+            with patch("kumiho.mcp_server.tool_memory_store", fake_store):
+                result = tool_memory_reflect({
+                    "session_id": ingest["session_id"],
+                    "response": "Noted, dark mode it is.",
+                    "captures": [
+                        {
+                            "type": "preference",
+                            "title": "Prefers dark mode on Mar 27",
+                            "content": "User prefers dark mode for all interfaces.",
+                        },
+                    ],
+                    "source_krefs": ["kref://memory/test/rev/1"],
+                })
+        assert result["buffered"] is True
+        assert result["captures_stored"] == 1
+        assert len(result["stored_krefs"]) == 1
+        assert len(store_calls) == 1
+        assert store_calls[0]["memory_type"] == "preference"
+        assert store_calls[0]["source_revision_krefs"] == ["kref://memory/test/rev/1"]
     finally:
         _cleanup_manager()
 
