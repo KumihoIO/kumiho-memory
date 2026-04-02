@@ -1279,24 +1279,27 @@ class UniversalMemoryManager:
             elif summary:
                 texts.append(f"{title}: {summary}" if title else summary)
 
-            # Unfold sibling revisions — optionally filtered by relevance.
-            siblings = mem.get("sibling_revisions", [])
-            if siblings and query and threshold > 0 and self.embedding_adapter is not None:
-                siblings = self._filter_siblings_by_embedding(
-                    siblings, query, threshold,
-                )
-
-            for sib in siblings:
-                sib_title = sib.get("title", "")
-                sib_summary = sib.get("summary", "")
-                sib_content = sib.get("content", "")
-
-                if mode == "full" and sib_content:
-                    texts.append(sib_content[:4000])
-                elif sib_summary:
-                    texts.append(
-                        f"{sib_title}: {sib_summary}" if sib_title else sib_summary
+            # Unfold sibling revisions only in full mode.  In summarized
+            # mode the primary title+summary is enough — unrolling siblings
+            # can balloon context by 10-30x for stacked items.
+            if mode == "full":
+                siblings = mem.get("sibling_revisions", [])
+                if siblings and query and threshold > 0 and self.embedding_adapter is not None:
+                    siblings = self._filter_siblings_by_embedding(
+                        siblings, query, threshold,
                     )
+
+                for sib in siblings:
+                    sib_content = sib.get("content", "")
+                    if sib_content:
+                        texts.append(sib_content[:4000])
+                    else:
+                        sib_title = sib.get("title", "")
+                        sib_summary = sib.get("summary", "")
+                        if sib_summary:
+                            texts.append(
+                                f"{sib_title}: {sib_summary}" if sib_title else sib_summary
+                            )
 
         return "\n\n".join(texts) if texts else ""
 
