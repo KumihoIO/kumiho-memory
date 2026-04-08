@@ -685,7 +685,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                 "recall_mode": {
                     "type": "string",
                     "enum": ["full", "summarized"],
-                    "default": "full",
+                    "default": "summarized",
                     "description": (
                         "Context mode: 'full' includes artifact content "
                         "(raw conversation text), 'summarized' returns only "
@@ -868,7 +868,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                 "recall_mode": {
                     "type": "string",
                     "enum": ["full", "summarized"],
-                    "default": "full",
+                    "default": "summarized",
                     "description": (
                         "Context mode: 'full' includes artifact content, "
                         "'summarized' returns title + summary only."

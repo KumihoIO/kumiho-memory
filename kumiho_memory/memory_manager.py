@@ -155,7 +155,7 @@ class UniversalMemoryManager:
         retry_queue: Optional[RetryQueue] = None,
         store_max_retries: int = 3,
         graph_augmentation: Optional[Any] = None,
-        recall_mode: str = "full",
+        recall_mode: str = "summarized",
         sibling_strong_score: float = _SIBLING_STRONG_SCORE,
         sibling_char_budget: int = _SIBLING_CHAR_BUDGET,
         sibling_similarity_threshold: float = 0.0,
