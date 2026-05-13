@@ -1,5 +1,22 @@
 # Release Notes — kumiho-memory
 
+## v0.5.3
+
+**Release Date:** 2026-05-13
+
+`v0.5.3` is a patch release adding relevance-threshold filtering to
+memory recall tools.
+
+- Added `min_score` to `kumiho_memory_recall` and
+  `kumiho_memory_engage`.
+- Supports `CONSTRUCT_MEMORY_MIN_RELEVANCE_SCORE` and
+  `KUMIHO_MEMORY_MIN_RELEVANCE_SCORE` as default thresholds when
+  `min_score` is not passed by the caller.
+- Filters low-scoring memories before `count`, `source_krefs`, and
+  engage context are built.
+
+---
+
 ## v0.3.1
 
 **Release Date:** 2026-02-24

@@ -396,6 +396,65 @@ def test_memory_engage_returns_context_and_krefs():
         _cleanup_manager()
 
 
+def test_memory_engage_filters_by_min_score():
+    """kumiho_memory_engage should drop low-scoring memories before context."""
+    try:
+        manager, _ = _install_test_manager()
+
+        async def recall_stub(*args, **kwargs):
+            return [
+                {
+                    "kref": "kref://memory/test/low",
+                    "summary": "low relevance",
+                    "score": 0.2,
+                },
+                {
+                    "kref": "kref://memory/test/high",
+                    "summary": "high relevance",
+                    "score": 0.9,
+                },
+            ]
+
+        manager.recall_memories = recall_stub
+        result = tool_memory_engage({
+            "query": "user preferences",
+            "limit": 3,
+            "min_score": 0.7,
+        })
+
+        assert result["count"] == 1
+        assert result["source_krefs"] == ["kref://memory/test/high"]
+        assert result["results"][0]["summary"] == "high relevance"
+        assert "high relevance" in result["context"]
+        assert "low relevance" not in result["context"]
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_recall_filters_by_min_score():
+    """kumiho_memory_recall should expose the same min_score filter."""
+    try:
+        manager, _ = _install_test_manager()
+
+        async def recall_stub(*args, **kwargs):
+            return [
+                {"kref": "kref://memory/test/low", "score": 0.2},
+                {"kref": "kref://memory/test/high", "score": 0.9},
+            ]
+
+        manager.recall_memories = recall_stub
+        result = tool_memory_recall({
+            "query": "user preferences",
+            "limit": 3,
+            "min_score": 0.7,
+        })
+
+        assert result["count"] == 1
+        assert result["results"][0]["kref"] == "kref://memory/test/high"
+    finally:
+        _cleanup_manager()
+
+
 def test_memory_engage_deduplication():
     """Engage shares the recall dedup guard — second call returns empty."""
     try:

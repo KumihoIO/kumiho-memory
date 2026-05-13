@@ -129,6 +129,45 @@ def _get_manager():
     return _manager
 
 
+def _min_score_from_args(args: Dict[str, Any]) -> Optional[float]:
+    """Return optional relevance threshold from args or environment."""
+    raw = args.get("min_score")
+    if raw is None:
+        raw = os.environ.get("CONSTRUCT_MEMORY_MIN_RELEVANCE_SCORE")
+    if raw is None:
+        raw = os.environ.get("KUMIHO_MEMORY_MIN_RELEVANCE_SCORE")
+    if raw in (None, ""):
+        return None
+    try:
+        score = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not 0.0 <= score <= 1.0:
+        return None
+    return score
+
+
+def _passes_min_score(memory: Dict[str, Any], min_score: Optional[float]) -> bool:
+    if min_score is None:
+        return True
+    score = memory.get("score")
+    if score is None:
+        return True
+    try:
+        return float(score) >= min_score
+    except (TypeError, ValueError):
+        return True
+
+
+def _filter_by_min_score(
+    memories: List[Dict[str, Any]],
+    min_score: Optional[float],
+) -> List[Dict[str, Any]]:
+    if min_score is None:
+        return memories
+    return [m for m in memories if _passes_min_score(m, min_score)]
+
+
 # ---------------------------------------------------------------------------
 # Tool handlers
 # ---------------------------------------------------------------------------
@@ -259,6 +298,7 @@ def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
                 graph_augmented=args.get("graph_augmented", False),
             )
         )
+        results = _filter_by_min_score(results, _min_score_from_args(args))
         result = {"results": results, "count": len(results), "recall_mode": recall_mode}
 
         _recall_cache_time = time.monotonic()
@@ -384,6 +424,7 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
                 graph_augmented=args.get("graph_augmented", False),
             )
         )
+        results = _filter_by_min_score(results, _min_score_from_args(args))
         context = manager.build_recalled_context(
             results, args["query"], recall_mode
         )
@@ -656,6 +697,16 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "default": 5,
                     "description": "Max results to return.",
                 },
+                "min_score": {
+                    "type": "number",
+                    "default": 0.0,
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": (
+                        "Optional minimum relevance score. Results with a "
+                        "numeric score below this threshold are dropped."
+                    ),
+                },
                 "space_paths": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -840,6 +891,17 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "type": "integer",
                     "default": 5,
                     "description": "Max results to return.",
+                },
+                "min_score": {
+                    "type": "number",
+                    "default": 0.0,
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": (
+                        "Optional minimum relevance score. Results with a "
+                        "numeric score below this threshold are dropped "
+                        "before context is built."
+                    ),
                 },
                 "space_paths": {
                     "type": "array",
