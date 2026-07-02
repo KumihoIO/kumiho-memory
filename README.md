@@ -264,7 +264,7 @@ deterministic delta per grade (no extra LLM calls, O(k)):
 weighted order is `statement (0.65), rumor (0.50)`.
 
 Applied in both plain recall and graph-augmented recall (before each
-result cap, idempotently — the original score is kept in `_base_score`).
+result cap, idempotently — the original score is kept in the documented `base_score` result field).
 **Default ON**, with a strict no-op guarantee: when no retrieved memory
 carries a grade, results are byte-identical to previous behavior.
 Kill switch: `KUMIHO_EVIDENCE_RERANK=0`. Library use:
@@ -280,7 +280,7 @@ surfaces as the `evidence_level` field instead of a text badge.
 Note: `min_score` filtering (`KUMIHO_MEMORY_MIN_RELEVANCE_SCORE`)
 applies to the **adjusted** score — an `unverified` memory sitting just
 above the threshold can drop below it. That is the intended screening
-behavior; use `_base_score` if you need the raw retrieval score.
+behavior; use the `base_score` result field if you need the raw retrieval score.
 
 #### Space profiles (per-collection extraction strategy)
 

@@ -38,7 +38,7 @@ def test_official_outranks_higher_relevance_rumor():
     out = apply_evidence_weights(memories, EvidenceRankConfig())
     assert [m["kref"] for m in out] == ["kref://official", "kref://rumor"]
     assert out[0]["score"] == 0.65
-    assert out[0]["_base_score"] == 0.50
+    assert out[0]["base_score"] == 0.50
     assert out[1]["score"] == 0.50
 
 
@@ -49,7 +49,7 @@ def test_strict_noop_when_no_evidence():
     out = apply_evidence_weights(memories, EvidenceRankConfig())
     assert out is memories
     assert out == snapshot
-    assert "_base_score" not in out[0]
+    assert "base_score" not in out[0]
 
 
 def test_disabled_is_noop():
@@ -293,5 +293,159 @@ def test_graph_recall_unweighted_order_unchanged():
         results = await gr.recall("query", limit=2)
         assert [m["kref"] for m in results] == ["kref://a", "kref://b"]
         assert results[0]["score"] == 0.9
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Review-hardening tests (adversarial review round 1)
+# ---------------------------------------------------------------------------
+
+
+def test_scoreless_memories_never_get_fabricated_scores():
+    """min_score deliberately passes score-less memories — weighting must
+    not invent score=0.0 for them just because a batch-mate is graded."""
+    scoreless_graded = {"kref": "kref://g", "title": "g", "summary": "s",
+                        "evidence_level": "official"}
+    scoreless_plain = {"kref": "kref://p", "title": "p", "summary": "s"}
+    scored = _mem("kref://s", 0.5, "corroborated")
+
+    out = apply_evidence_weights(
+        [scoreless_graded, scoreless_plain, scored], EvidenceRankConfig(),
+    )
+    assert "score" not in scoreless_graded
+    assert "base_score" not in scoreless_graded
+    assert "score" not in scoreless_plain
+    # scored memories sort first; score-less keep relative order after
+    assert [m["kref"] for m in out] == ["kref://s", "kref://g", "kref://p"]
+
+
+def test_non_numeric_scores_left_untouched():
+    """A string score from a JSON backend must not be coerced to 0.0."""
+    stringly = {"kref": "kref://str", "score": "0.85"}
+    graded = _mem("kref://g", 0.5, "official")
+    out = apply_evidence_weights([stringly, graded], EvidenceRankConfig())
+    assert stringly["score"] == "0.85"
+    assert "base_score" not in stringly
+    assert out[0]["kref"] == "kref://g"
+
+
+def test_all_scoreless_batch_keeps_order():
+    memories = [
+        {"kref": "kref://a", "evidence_level": "official"},
+        {"kref": "kref://b"},
+    ]
+    out = apply_evidence_weights(memories, EvidenceRankConfig())
+    assert [m["kref"] for m in out] == ["kref://a", "kref://b"]
+    assert all("score" not in m for m in out)
+
+
+def test_manager_accepts_falsy_evidence_rank():
+    """evidence_rank=False reads as 'disable' — must not crash recall."""
+    async def retrieve_stub(**kwargs):
+        return [
+            _mem("kref://rumor", 0.60, "unverified"),
+            _mem("kref://official", 0.50, "official"),
+        ]
+
+    manager = _make_manager(retrieve_stub, evidence_rank=False)
+
+    async def run():
+        results = await manager.recall_memories("query")
+        # disabled -> retrieval order preserved
+        assert [m["kref"] for m in results] == ["kref://rumor", "kref://official"]
+
+    asyncio.run(run())
+    ctx = manager.build_recalled_context(
+        [_mem("kref://official", 0.5, "official")], recall_mode="summarized",
+    )
+    assert "[official]" not in ctx
+
+
+def test_graph_traversal_entries_not_mixed_into_weighted_sort():
+    """Traversal placeholder scores (0.0 = 'unmeasured') must not compete
+    with adjusted base scores: an unverified direct hit stays ahead of
+    traversal noise, and the cap trims traversal entries first."""
+    from kumiho_memory.graph_augmentation import (
+        GraphAugmentationConfig,
+        GraphAugmentedRecall,
+    )
+
+    base_results = [
+        _mem("kref://b1", 0.42),
+        _mem("kref://b2", 0.30),
+        _mem("kref://b3", 0.08, "unverified"),  # adjusts to -0.02
+    ]
+
+    async def recall_fn(query, *, limit, space_paths=None, memory_types=None):
+        return [dict(m) for m in base_results]
+
+    rank_cfg = EvidenceRankConfig()
+    gr = GraphAugmentedRecall(
+        recall_fn=recall_fn,
+        config=GraphAugmentationConfig(
+            reformulate_queries=False, max_total=4, max_hops=1,
+        ),
+        evidence_rerank_fn=lambda mems: apply_evidence_weights(mems, rank_cfg),
+    )
+
+    async def fake_traverse(memories, seen_krefs, augmented):
+        for kref in ("kref://trav1", "kref://trav2"):
+            augmented.append({
+                "kref": kref, "title": "t", "summary": "s",
+                "score": 0.0, "graph_augmented": True,
+                "edge_type": "REFERENCED", "from_kref": "kref://b1",
+            })
+        return 2
+
+    gr._traverse_edges = fake_traverse
+
+    async def run():
+        results = await gr.recall("query", limit=2)
+        krefs = [m["kref"] for m in results]
+        # cap=4: all three base hits survive (incl. the -0.02 unverified
+        # DIRECT hit); exactly one traversal entry is trimmed — noise is
+        # cut first, never a measured hit.
+        assert krefs[:3] == ["kref://b1", "kref://b2", "kref://b3"]
+        assert krefs[3] == "kref://trav1"
+        assert len(results) == 4
+
+    asyncio.run(run())
+
+
+def test_graded_traversal_entry_does_not_outrank_base_hits():
+    """An official-graded traversal entry (placeholder 0.0) must not be
+    presented above genuinely relevant direct hits."""
+    from kumiho_memory.graph_augmentation import (
+        GraphAugmentationConfig,
+        GraphAugmentedRecall,
+    )
+
+    async def recall_fn(query, *, limit, space_paths=None, memory_types=None):
+        return [dict(_mem("kref://b1", 0.14)), dict(_mem("kref://b2", 0.12, "single_source"))]
+
+    rank_cfg = EvidenceRankConfig()
+    gr = GraphAugmentedRecall(
+        recall_fn=recall_fn,
+        config=GraphAugmentationConfig(reformulate_queries=False, max_hops=1),
+        evidence_rerank_fn=lambda mems: apply_evidence_weights(mems, rank_cfg),
+    )
+
+    async def fake_traverse(memories, seen_krefs, augmented):
+        augmented.append({
+            "kref": "kref://trav-official", "title": "t", "summary": "s",
+            "score": 0.0, "graph_augmented": True,
+            "evidence_level": "official",
+            "edge_type": "SUPPORTS", "from_kref": "kref://b1",
+        })
+        return 1
+
+    gr._traverse_edges = fake_traverse
+
+    async def run():
+        results = await gr.recall("query", limit=2)
+        krefs = [m["kref"] for m in results]
+        assert krefs[0] == "kref://b1"
+        assert krefs[-1] == "kref://trav-official"
 
     asyncio.run(run())
