@@ -283,7 +283,13 @@ class EvidencePolicy:
     official_tags:
         Tags that mark a recalled memory as pinned — a claim contradicting
         such a memory is stored as ``unverified`` with the conflict noted,
-        and the pinned belief stands.
+        and the pinned belief stands.  Default: ``evidence:official`` only.
+        The bare ``published`` tag is deliberately NOT included — this
+        codebase stamps ``published`` on virtually every stored revision
+        as its currency tag, so pinning on it would fire for ordinary
+        memories.  Deployments that use ``published`` as a curated marker
+        can add it: ``official_tags=frozenset({"evidence:official",
+        "published"})``.
     create_supports_edges:
         When ``True``, corroborating revision krefs are returned on the
         assess result so the manager creates ``SUPPORTS`` edges after the
@@ -296,7 +302,7 @@ class EvidencePolicy:
     """
 
     min_corroboration: int = 2
-    official_tags: FrozenSet[str] = frozenset({"evidence:official", "published"})
+    official_tags: FrozenSet[str] = frozenset({"evidence:official"})
     create_supports_edges: bool = False
     storage_policy: str = DEFAULT_STORAGE_POLICY
     duplicate_score_threshold: float = _DUPLICATE_SCORE_THRESHOLD
@@ -317,10 +323,10 @@ def grade_evidence(
     Rules, in order:
 
     1. **Official pinning** — the claim contradicts a memory carrying an
-       official/published tag → grade ``unverified``, conflict recorded,
-       pinned belief untouched.
-    2. **Corroboration** — ≥ ``min_corroboration`` agreeing memories with
-       distinct non-empty sources and zero contradictions →
+       ``official``-grade tag (``policy.official_tags``) → grade
+       ``unverified``, conflict recorded, pinned belief untouched.
+    2. **Corroboration** — ≥ ``max(1, min_corroboration)`` agreeing
+       memories with distinct non-empty sources and zero contradictions →
        ``corroborated`` (``memory_type`` forced to ``"fact"``).
     3. **Single source** — an agreeing memory or claim source is
        identified, no corroboration — resolved by the caller from the
@@ -336,7 +342,14 @@ def grade_evidence(
             return []
         out: List[int] = []
         for i in indices:
-            if isinstance(i, int) and 1 <= i <= len(recalled) and i not in out:
+            # bool is an int subclass — a JSON `true` must not silently
+            # become index 1.
+            if (
+                isinstance(i, int)
+                and not isinstance(i, bool)
+                and 1 <= i <= len(recalled)
+                and i not in out
+            ):
                 out.append(i)
         return out
 
@@ -371,7 +384,9 @@ def grade_evidence(
             for i in agrees
             if str(_mem(i).get("source", "")).strip()
         }
-        if len(distinct_sources) >= policy.min_corroboration:
+        # Clamp: promotion always needs at least one identified source —
+        # min_corroboration=0 must not mint "corroborated" from nothing.
+        if len(distinct_sources) >= max(1, policy.min_corroboration):
             return {
                 "evidence_level": CORROBORATED,
                 "memory_type": "fact",
@@ -494,8 +509,11 @@ def create_evidence_assessor(
             f"RECENT CONVERSATION:\n{window_text}"
         )
 
+        # Pre-bind so the JSONDecodeError handler below can safely log it
+        # even when adapter.chat() itself raises JSONDecodeError.
+        raw: str = ""
         try:
-            raw: str = await adapter.chat(
+            raw = await adapter.chat(
                 messages=[{"role": "user", "content": user_msg}],
                 model=model,
                 system=system_prompt,

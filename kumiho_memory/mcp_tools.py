@@ -130,9 +130,9 @@ def _get_manager():
             _model = getattr(_tmp_summarizer, "light_model", "")
             if _adapter is not None:
                 try:
-                    min_corroboration = int(
+                    min_corroboration = max(1, int(
                         os.environ.get("KUMIHO_EVIDENCE_MIN_CORROBORATION", "2")
-                    )
+                    ))
                 except ValueError:
                     min_corroboration = 2
                 policy_kwargs: Dict[str, Any] = {
