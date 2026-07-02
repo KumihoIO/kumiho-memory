@@ -223,15 +223,20 @@ class GraphAugmentedRecall:
                 len(memories), len(augmented) - len(memories), len(augmented),
             )
 
-        # Evidence weighting BEFORE the final cap.  Idempotent (recomputes
-        # from _base_score), so double application with the merge-slice
-        # pass cannot accumulate deltas.  NOTE: when weighting applies,
-        # the list is re-sorted by adjusted score — graph-traversal
-        # results (score 0.0) may interleave with weighted base results;
-        # without evidence data the historical append-order is preserved.
+        # Evidence weighting BEFORE the final cap, applied to the BASE
+        # results only.  Traversal entries carry a placeholder score 0.0
+        # meaning "relevance never measured", not "zero relevance" —
+        # mixing them into one score axis would let graph noise evict
+        # genuinely relevant (e.g. unverified-adjusted) direct hits.  The
+        # historical partition [base hits][traversal appended] is kept,
+        # so the cap still trims traversal noise first.  Idempotent
+        # (recomputes from base_score) with the merge-slice pass.
         if self.evidence_rerank_fn is not None:
             try:
-                augmented = self.evidence_rerank_fn(augmented)
+                base_part = [m for m in augmented if not m.get("graph_augmented")]
+                graph_part = [m for m in augmented if m.get("graph_augmented")]
+                base_part = self.evidence_rerank_fn(base_part)
+                augmented = list(base_part) + graph_part
             except Exception as exc:
                 logger.debug("evidence_rerank_fn failed at final cap: %s", exc)
 

@@ -225,10 +225,15 @@ class UniversalMemoryManager:
         self.embedding_adapter = embedding_adapter
         self.sibling_score_fields = sibling_score_fields
         # Evidence-weighted recall reranking (deterministic, default on;
-        # strict no-op when no memory carries an evidence grade).
+        # strict no-op when no memory carries an evidence grade).  Falsy
+        # non-None values (False/0) read naturally as "disable" — honor
+        # that instead of crashing on attribute access.
         if evidence_rank is None:
             from kumiho_memory.evidence_rank import EvidenceRankConfig
             evidence_rank = EvidenceRankConfig()
+        elif not evidence_rank:
+            from kumiho_memory.evidence_rank import EvidenceRankConfig
+            evidence_rank = EvidenceRankConfig(enabled=False, badges=False)
         self.evidence_rank_config = evidence_rank
         # Background memory assessor (model-agnostic, optional)
         self.auto_assess_fn: Optional[AutoAssessFn] = auto_assess_fn
