@@ -1210,3 +1210,65 @@ def test_report_markdown_quotes_policy():
         DreamStateStats(), [], "2026-07-02T00:00:00+00:00",
     )
     assert "Deployment policy active:" not in md_without
+
+
+# ---------------------------------------------------------------------------
+# Policy injection — review-hardening tests (adversarial review round 1)
+# ---------------------------------------------------------------------------
+
+
+def test_whitespace_policy_normalizes_to_none(monkeypatch):
+    """Whitespace-only policy must not be recorded as active while the
+    LLM prompt contains no policy section (audit consistency)."""
+    from kumiho_memory.dream_state import _ASSESSMENT_SYSTEM_PROMPT
+
+    ds = DreamState(summarizer=StubSummarizer(), extra_instructions="   ")
+    assert ds.extra_instructions is None
+    assert ds._system_prompt == _ASSESSMENT_SYSTEM_PROMPT
+
+    monkeypatch.setenv("KUMIHO_DREAM_EXTRA_INSTRUCTIONS", "  \n ")
+    ds = DreamState(summarizer=StubSummarizer())
+    assert ds.extra_instructions is None
+
+    md = DreamState._build_report_markdown(
+        DreamStateStats(), [], "2026-07-02T00:00:00+00:00",
+        extra_instructions=ds.extra_instructions,
+    )
+    assert "Deployment policy active:" not in md
+
+
+def test_system_prompt_tracks_post_init_policy_change():
+    """_system_prompt is derived on access — a post-init policy change
+    can never diverge from what the audit record claims."""
+    ds = DreamState(summarizer=StubSummarizer(), extra_instructions="old policy")
+    assert "old policy" in ds._system_prompt
+    ds.extra_instructions = "new policy"
+    assert "new policy" in ds._system_prompt
+    assert "old policy" not in ds._system_prompt
+
+
+def test_safe_policy_tags_prefers_cached_snapshot():
+    """_safe_policy_tags must read the construction-time snapshot, never
+    the auto-refreshing ``tags`` property (blocking RPC per revision)."""
+    from kumiho_memory.dream_state import _safe_policy_tags
+
+    class _RefreshingRevision:
+        _cached_tags = ["published", "evidence:official", "summarized"]
+
+        @property
+        def tags(self):
+            raise AssertionError("tags property must not be accessed")
+
+    assert _safe_policy_tags(_RefreshingRevision()) == [
+        "published", "evidence:official",
+    ]
+
+    class _NoTags:
+        pass
+
+    assert _safe_policy_tags(_NoTags()) == []
+
+    class _TagsAttrOnly:
+        tags = ["evidence:corroborated"]
+
+    assert _safe_policy_tags(_TagsAttrOnly()) == ["evidence:corroborated"]

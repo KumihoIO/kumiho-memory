@@ -138,9 +138,20 @@ def _compose_system_prompt(extra_instructions: Optional[str]) -> str:
 
 def _safe_policy_tags(rev: Any) -> List[str]:
     """Policy-relevant graph tags of a revision (``published`` and
-    ``evidence:*``), tolerating fakes and RPC failures."""
+    ``evidence:*``), tolerating fakes and RPC failures.
+
+    Reads the construction-time snapshot (``_cached_tags``) when present:
+    the SDK's ``Revision.tags`` property auto-refreshes via a *blocking*
+    gRPC call once >5s stale, which would otherwise fire once per
+    revision per batch directly on the event loop.  The snapshot is from
+    collection time within the same run — fresh enough for policy
+    decisions.
+    """
     try:
-        tags = list(getattr(rev, "tags", []) or [])
+        tags = getattr(rev, "_cached_tags", None)
+        if tags is None:
+            tags = getattr(rev, "tags", []) or []
+        tags = list(tags or [])
     except Exception:
         return []
     return [
@@ -250,11 +261,12 @@ class DreamState:
         Deployment policy text appended to the assessment system prompt
         under a ``## DEPLOYMENT POLICY`` section (e.g. "Never propose
         deprecation for memories tagged evidence:official").  Precedence:
-        explicit argument > ``KUMIHO_DREAM_EXTRA_INSTRUCTIONS`` env var.
-        Pass ``""`` to explicitly disable the env-var policy.  Cannot
-        weaken the hard guardrails — the deprecation cap, published
-        protection, and conservative-KEEP rule are enforced in code after
-        the LLM's suggestions.
+        explicit argument > ``KUMIHO_DREAM_EXTRA_INSTRUCTIONS`` env var
+        (the env var is read once, at construction time).  Pass ``""``
+        to explicitly disable the env-var policy; whitespace-only text
+        normalizes to no-policy.  Cannot weaken the hard guardrails —
+        the deprecation cap, published protection, and conservative-KEEP
+        rule are enforced in code after the LLM's suggestions.
     """
 
     def __init__(
@@ -305,11 +317,14 @@ class DreamState:
         )
 
         # Deployment policy: explicit arg wins; None falls back to the env
-        # var; explicit "" disables the env policy.
+        # var (read once, at construction time); explicit "" disables the
+        # env policy.  Whitespace-only text normalizes to None so the
+        # audit trail never claims a policy the LLM did not see.
         if extra_instructions is None:
             extra_instructions = os.getenv("KUMIHO_DREAM_EXTRA_INSTRUCTIONS") or None
-        self.extra_instructions: Optional[str] = extra_instructions or None
-        self._system_prompt = _compose_system_prompt(self.extra_instructions)
+        self.extra_instructions: Optional[str] = (
+            extra_instructions.strip() if extra_instructions else None
+        ) or None
 
         if summarizer is not None:
             self.summarizer = summarizer
@@ -320,6 +335,16 @@ class DreamState:
 
         # Will be resolved lazily on first run.
         self._cursor_item_kref: Optional[str] = None
+
+    @property
+    def _system_prompt(self) -> str:
+        """Assessment prompt with the active deployment policy composed in.
+
+        Derived from ``self.extra_instructions`` on access (one string
+        concat) so a post-init change to the policy can never make the
+        audit record diverge from the prompt actually sent.
+        """
+        return _compose_system_prompt(self.extra_instructions)
 
     # ------------------------------------------------------------------
     # Public API

@@ -11,6 +11,8 @@ import mimetypes
 import os
 import re
 import shutil
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -463,13 +465,21 @@ class UniversalMemoryManager:
             logger.debug("_background_assess error for session %s: %s", session_id, exc)
 
     async def _create_support_edges(
-        self, revision_kref: str, supporting_krefs: List[str],
+        self,
+        revision_kref: str,
+        supporting_krefs: List[str],
+        timeout: float = 60.0,
     ) -> int:
         """Create ``SUPPORTS`` edges from a new memory to its corroborators.
 
         Best-effort: each edge failure is logged at debug level and skipped —
         evidence chains are an enrichment, never a store blocker.  Returns
         the number of edges created.
+
+        The synchronous gRPC calls can hang indefinitely on Windows (see
+        graph_augmentation.py edge creation), so they run in a daemon
+        thread polled against a deadline instead of ``asyncio.to_thread``
+        — a hung RPC must not strand a shared executor thread.
         """
         def _sync_create() -> int:
             import kumiho
@@ -492,18 +502,39 @@ class UniversalMemoryManager:
                     )
             return created
 
-        try:
-            created = await asyncio.to_thread(_sync_create)
-            if created:
+        result: List[int] = []
+        done_event = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result.append(_sync_create())
+            except Exception as exc:
                 logger.debug(
-                    "Created %d SUPPORTS edge(s) from %s", created, revision_kref,
+                    "SUPPORTS edge creation failed for %s: %s",
+                    revision_kref, exc,
                 )
-            return created
-        except Exception as exc:
+            finally:
+                done_event.set()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        deadline = time.monotonic() + timeout
+        while not done_event.is_set():
+            if time.monotonic() >= deadline:
+                logger.debug(
+                    "SUPPORTS edge creation timed out after %.0fs for %s",
+                    timeout, revision_kref,
+                )
+                return 0
+            await asyncio.sleep(0.05)
+
+        created = result[0] if result else 0
+        if created:
             logger.debug(
-                "SUPPORTS edge creation failed for %s: %s", revision_kref, exc,
+                "Created %d SUPPORTS edge(s) from %s", created, revision_kref,
             )
-            return 0
+        return created
 
     async def handle_user_message(
         self,

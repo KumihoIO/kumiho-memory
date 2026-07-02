@@ -345,3 +345,78 @@ def test_background_assess_queued_store_skips_edges(monkeypatch):
     )
     assert stored["metadata"]["evidence_level"] == "corroborated"
     assert revisions == {}  # no edge creation attempted
+
+
+# ---------------------------------------------------------------------------
+# Review-hardening tests (adversarial review round 1)
+# ---------------------------------------------------------------------------
+
+
+def test_grade_published_only_memory_does_not_pin():
+    """The bare 'published' tag is the storage currency tag stamped on
+    nearly every revision — contradicting such a memory must NOT trigger
+    official pinning (only evidence:official does by default)."""
+    grade = grade_evidence(_memories(), agrees_with=[], contradicts=[4],
+                           policy=EvidencePolicy())
+    assert grade["pinned"] is False
+
+    ordinary = [{
+        "kref": "kref://m/plain", "title": "Consolidated chat",
+        "summary": "project uses Postgres",
+        "tags": ["summarized", "published"], "score": 0.5,
+    }]
+    grade = grade_evidence(ordinary, agrees_with=[], contradicts=[1],
+                           policy=EvidencePolicy())
+    assert grade["pinned"] is False
+    assert grade["evidence_level"] is None  # falls through to rules 3/4
+    assert grade["conflicting_krefs"] == ["kref://m/plain"]
+
+
+def test_grade_published_pinning_opt_in():
+    """Deployments can opt back in to published-pinning via the policy."""
+    ordinary = [{
+        "kref": "kref://m/plain", "tags": ["published"], "score": 0.5,
+    }]
+    policy = EvidencePolicy(
+        official_tags=frozenset({"evidence:official", "published"}),
+    )
+    grade = grade_evidence(ordinary, agrees_with=[], contradicts=[1],
+                           policy=policy)
+    assert grade["pinned"] is True
+
+
+def test_grade_boolean_indices_are_dropped():
+    """JSON true/false must not be treated as indices (bool is int)."""
+    grade = grade_evidence(_memories(), agrees_with=[True, 3],
+                           contradicts=[False], policy=EvidencePolicy())
+    # True must not map to memory #1; only index 3 survives -> 1 source
+    assert grade["evidence_level"] is None
+    assert grade["supporting_krefs"] == []
+    assert grade["conflicting_krefs"] == []
+
+
+def test_grade_min_corroboration_zero_cannot_mint_corroborated():
+    """min_corroboration <= 0 is clamped — promotion always requires at
+    least one distinctly-sourced agreeing memory."""
+    grade = grade_evidence(_memories(), agrees_with=[4], contradicts=[],
+                           policy=EvidencePolicy(min_corroboration=0))
+    assert grade["evidence_level"] is None  # m/4 has no source
+
+    grade = grade_evidence(_memories(), agrees_with=[2], contradicts=[],
+                           policy=EvidencePolicy(min_corroboration=0))
+    assert grade["evidence_level"] == "corroborated"  # clamped to 1
+
+
+def test_assessor_contradiction_blocks_promotion_end_to_end():
+    """Fake-adapter path: a non-official contradiction blocks promotion
+    even with two distinctly-sourced agreements."""
+    result, _ = _assess(
+        {"should_store": True, "content": "Disputed claim",
+         "memory_type": "summary", "reason": "",
+         "agrees_with": [2, 3], "contradicts": [4],
+         "source": "news:bbc"},
+        _memories(),
+    )
+    assert result.evidence_level == "single_source"  # not corroborated
+    assert result.memory_type == "summary"  # no fact promotion
+    assert result.conflicting_krefs == ["kref://m/4"]
