@@ -164,6 +164,18 @@ def _get_manager():
         except Exception as exc:
             logger.warning("Evidence assessor setup failed: %s", exc)
 
+    # Evidence-weighted recall reranking — DEFAULT ON (strict no-op when
+    # no memory carries an evidence grade).  KUMIHO_EVIDENCE_RERANK acts
+    # as a kill switch: "0"/"false" disables.
+    evidence_rank = None
+    if os.environ.get("KUMIHO_EVIDENCE_RERANK", "").strip().lower() in ("0", "false"):
+        try:
+            from kumiho_memory.evidence_rank import EvidenceRankConfig
+            evidence_rank = EvidenceRankConfig(enabled=False, badges=False)
+            logger.info("Evidence-weighted recall reranking disabled via env")
+        except Exception as exc:
+            logger.warning("Evidence rerank config failed: %s", exc)
+
     summarizer = MemorySummarizer()
     buffer = RedisMemoryBuffer()
     _manager = UniversalMemoryManager(
@@ -174,6 +186,7 @@ def _get_manager():
         sibling_similarity_threshold=sibling_threshold,
         embedding_adapter=embedding_adapter,
         auto_assess_fn=auto_assess_fn,
+        evidence_rank=evidence_rank,
     )
     return _manager
 

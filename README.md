@@ -240,6 +240,42 @@ the conservative-KEEP rule (the core prompt states it takes precedence
 over deployment policy). Run results and the Markdown report record the
 active policy text for auditability.
 
+#### Evidence-weighted recall (reranking + badges)
+
+Server-side hybrid search ranks by relevance only — a rumor can outrank
+an official statement. `kumiho-memory` adjusts scores client-side with a
+deterministic delta per grade (no extra LLM calls, O(k)):
+
+| grade | default delta |
+|---|---|
+| `official` | **+0.15** |
+| `corroborated` | +0.08 |
+| `single_source` | 0.0 |
+| `unverified` | **−0.10** |
+
+**Before/after example** — query returns `rumor (0.60, unverified)` and
+`statement (0.50, official)`: unweighted order is `rumor, statement`;
+weighted order is `statement (0.65), rumor (0.50)`.
+
+Applied in both plain recall and graph-augmented recall (before each
+result cap, idempotently — the original score is kept in `_base_score`).
+**Default ON**, with a strict no-op guarantee: when no retrieved memory
+carries a grade, results are byte-identical to previous behavior.
+Kill switch: `KUMIHO_EVIDENCE_RERANK=0`. Library use:
+`UniversalMemoryManager(evidence_rank=EvidenceRankConfig(...))`.
+
+**Context badges** — `build_recalled_context` (used by
+`kumiho_memory_engage`) prefixes graded memories so the answering model
+can weigh sources: `[official] Acme Q2: record earnings...`,
+`[unverified] Forum post: ...`. `single_source`/ungraded memories get no
+badge. `kumiho_memory_recall` returns raw dicts — there the grade
+surfaces as the `evidence_level` field instead of a text badge.
+
+Note: `min_score` filtering (`KUMIHO_MEMORY_MIN_RELEVANCE_SCORE`)
+applies to the **adjusted** score — an `unverified` memory sitting just
+above the threshold can drop below it. That is the intended screening
+behavior; use `_base_score` if you need the raw retrieval score.
+
 ---
 
 ### Roadmap

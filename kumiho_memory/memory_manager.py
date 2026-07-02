@@ -186,6 +186,7 @@ class UniversalMemoryManager:
         auto_assess_fn: Optional[AutoAssessFn] = None,
         auto_assess_min_messages: int = 3,
         auto_assess_window: int = 6,
+        evidence_rank: Optional[Any] = None,
     ) -> None:
         self.project = project
         self.consolidation_threshold = consolidation_threshold
@@ -221,6 +222,12 @@ class UniversalMemoryManager:
         self.sibling_top_k = sibling_top_k
         self.embedding_adapter = embedding_adapter
         self.sibling_score_fields = sibling_score_fields
+        # Evidence-weighted recall reranking (deterministic, default on;
+        # strict no-op when no memory carries an evidence grade).
+        if evidence_rank is None:
+            from kumiho_memory.evidence_rank import EvidenceRankConfig
+            evidence_rank = EvidenceRankConfig()
+        self.evidence_rank_config = evidence_rank
         # Background memory assessor (model-agnostic, optional)
         self.auto_assess_fn: Optional[AutoAssessFn] = auto_assess_fn
         self.auto_assess_min_messages = auto_assess_min_messages
@@ -1356,6 +1363,10 @@ class UniversalMemoryManager:
             query, limit=limit, space_paths=space_paths,
             memory_types=memory_types,
         )
+        # Evidence weighting on the plain path.  The graph path applies it
+        # inside GraphAugmentedRecall (before its caps) — never both.
+        from kumiho_memory.evidence_rank import apply_evidence_weights
+        memories = apply_evidence_weights(memories, self.evidence_rank_config)
         return await self._enrich_with_siblings(memories, query)
 
     def _get_graph_recall(self) -> Optional[Any]:
@@ -1383,11 +1394,16 @@ class UniversalMemoryManager:
                     "multi-query reformulation."
                 )
 
+            from kumiho_memory.evidence_rank import apply_evidence_weights
+
             self._graph_recall = GraphAugmentedRecall(
                 adapter=adapter,
                 model=model,
                 recall_fn=self._lightweight_recall,
                 config=self.graph_augmentation_config,
+                evidence_rerank_fn=lambda mems: apply_evidence_weights(
+                    mems, self.evidence_rank_config,
+                ),
             )
             return self._graph_recall
         except Exception as e:
@@ -1436,6 +1452,8 @@ class UniversalMemoryManager:
             title + summary — lossy but cheaper.  Falls back to the
             instance's ``self.recall_mode`` when ``None``.
         """
+        from kumiho_memory.evidence_rank import evidence_badge
+
         mode = recall_mode or self.recall_mode
         threshold = self.sibling_similarity_threshold
 
@@ -1444,11 +1462,14 @@ class UniversalMemoryManager:
             title = mem.get("title", "")
             summary = mem.get("summary", "")
             content = mem.get("content", "")
+            badge = evidence_badge(mem, self.evidence_rank_config)
 
             if mode == "full" and content:
-                texts.append(content[:4000])
+                texts.append(badge + content[:4000])
             elif summary:
-                texts.append(f"{title}: {summary}" if title else summary)
+                texts.append(
+                    f"{badge}{title}: {summary}" if title else badge + summary
+                )
 
             # Unfold sibling revisions only in full mode.  In summarized
             # mode the primary title+summary is enough — unrolling siblings
@@ -1461,15 +1482,18 @@ class UniversalMemoryManager:
                     )
 
                 for sib in siblings:
+                    sib_badge = evidence_badge(sib, self.evidence_rank_config)
                     sib_content = sib.get("content", "")
                     if sib_content:
-                        texts.append(sib_content[:4000])
+                        texts.append(sib_badge + sib_content[:4000])
                     else:
                         sib_title = sib.get("title", "")
                         sib_summary = sib.get("summary", "")
                         if sib_summary:
                             texts.append(
-                                f"{sib_title}: {sib_summary}" if sib_title else sib_summary
+                                f"{sib_badge}{sib_title}: {sib_summary}"
+                                if sib_title
+                                else sib_badge + sib_summary
                             )
 
         return "\n\n".join(texts) if texts else ""
@@ -1804,6 +1828,10 @@ class UniversalMemoryManager:
                         val = meta.get(field, "")
                         if val:
                             sib_entry[field] = val
+                    # Evidence grade so sibling badges have data
+                    # (per-revision — stacked siblings may differ).
+                    if meta.get("evidence_level"):
+                        sib_entry["evidence_level"] = meta["evidence_level"]
                     siblings.append(sib_entry)
 
             if not siblings:

@@ -92,12 +92,19 @@ class GraphAugmentedRecall:
         model: str = "",
         recall_fn: Optional[RecallFn] = None,
         config: Optional[GraphAugmentationConfig] = None,
+        evidence_rerank_fn: Optional[
+            Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         self.adapter = adapter
         self.model = model
         self.recall_fn = recall_fn  # type: ignore[assignment]
         self.config = config or GraphAugmentationConfig()
         self._has_llm = adapter is not None
+        # Deterministic score adjustment (e.g. evidence weighting) applied
+        # before each result cap.  Must be idempotent — it runs at both
+        # the multi-query merge slice and the final cap.
+        self.evidence_rerank_fn = evidence_rerank_fn
 
     # ------------------------------------------------------------------
     # Public API — recall
@@ -148,8 +155,16 @@ class GraphAugmentedRecall:
                 if existing is None or mem.get("score", 0) > existing.get("score", 0):
                     best_by_kref[kref] = mem
 
+        # Evidence weighting BEFORE the merge slice — an official-grade
+        # memory just past the unweighted boundary must survive the cut.
+        merged = list(best_by_kref.values())
+        if self.evidence_rerank_fn is not None:
+            try:
+                merged = self.evidence_rerank_fn(merged)
+            except Exception as exc:
+                logger.debug("evidence_rerank_fn failed at merge slice: %s", exc)
         memories = sorted(
-            best_by_kref.values(),
+            merged,
             key=lambda m: m.get("score", 0),
             reverse=True,
         )[: base_limit * 2]
@@ -207,6 +222,18 @@ class GraphAugmentedRecall:
                 "Graph augmentation: %d base + %d augmented = %d total",
                 len(memories), len(augmented) - len(memories), len(augmented),
             )
+
+        # Evidence weighting BEFORE the final cap.  Idempotent (recomputes
+        # from _base_score), so double application with the merge-slice
+        # pass cannot accumulate deltas.  NOTE: when weighting applies,
+        # the list is re-sorted by adjusted score — graph-traversal
+        # results (score 0.0) may interleave with weighted base results;
+        # without evidence data the historical append-order is preserved.
+        if self.evidence_rerank_fn is not None:
+            try:
+                augmented = self.evidence_rerank_fn(augmented)
+            except Exception as exc:
+                logger.debug("evidence_rerank_fn failed at final cap: %s", exc)
 
         # Cap to prevent context noise
         cap = self.config.max_total or (base_limit * 3)
@@ -524,7 +551,7 @@ class GraphAugmentedRecall:
                         seen_krefs.add(connected_uri)
                         try:
                             connected_rev = kumiho.get_revision(connected_uri)
-                            graph_augmented_results.append({
+                            entry = {
                                 "kref": connected_uri,
                                 "title": connected_rev.metadata.get("title", ""),
                                 "summary": connected_rev.metadata.get("summary", ""),
@@ -533,7 +560,17 @@ class GraphAugmentedRecall:
                                 "graph_augmented": True,
                                 "edge_type": edge.edge_type,
                                 "from_kref": kref_str,
-                            })
+                            }
+                            # Evidence grade so traversal results are
+                            # weightable/badgeable rather than always
+                            # default-weight.
+                            ev = connected_rev.metadata.get("evidence_level", "")
+                            if ev:
+                                entry["evidence_level"] = ev
+                            src = connected_rev.metadata.get("source", "")
+                            if src:
+                                entry["source"] = src
+                            graph_augmented_results.append(entry)
                             found += 1
                         except Exception as e:
                             logger.debug(

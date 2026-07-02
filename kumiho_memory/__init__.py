@@ -39,6 +39,11 @@ from kumiho_memory.evidence import (
     evidence_tag,
     parse_evidence,
 )
+from kumiho_memory.evidence_rank import (
+    EvidenceRankConfig,
+    apply_evidence_weights,
+    evidence_badge,
+)
 
 __all__ = [
     "__version__",
@@ -75,4 +80,7 @@ __all__ = [
     "DEFAULT_EVIDENCE_LEVEL",
     "evidence_tag",
     "parse_evidence",
+    "EvidenceRankConfig",
+    "apply_evidence_weights",
+    "evidence_badge",
 ]
