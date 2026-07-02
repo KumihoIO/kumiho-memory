@@ -23,7 +23,10 @@ from kumiho_memory.dream_state import DreamState, MemoryAssessment, DreamStateSt
 from kumiho_memory.graph_augmentation import GraphAugmentedRecall, GraphAugmentationConfig
 from kumiho_memory.assessors import (
     DEFAULT_STORAGE_POLICY,
+    EvidencePolicy,
+    create_evidence_assessor,
     create_llm_assessor,
+    grade_evidence,
     heuristic_prefilter,
 )
 from kumiho_memory.evidence import (
@@ -59,7 +62,10 @@ __all__ = [
     "GraphAugmentedRecall",
     "GraphAugmentationConfig",
     "DEFAULT_STORAGE_POLICY",
+    "EvidencePolicy",
+    "create_evidence_assessor",
     "create_llm_assessor",
+    "grade_evidence",
     "heuristic_prefilter",
     "OFFICIAL",
     "CORROBORATED",

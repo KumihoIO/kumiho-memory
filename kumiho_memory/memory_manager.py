@@ -55,6 +55,26 @@ class MemoryAssessResult:
     tags: List[str] = field(default_factory=list)
     """Extra tags to attach (``"auto-memorized"`` is always appended)."""
 
+    evidence_level: str = ""
+    """Optional evidence grade (see :mod:`kumiho_memory.evidence`).
+
+    When set, the manager stamps it as revision metadata plus the mirrored
+    ``evidence:<level>`` tag.  Assessors must never emit ``official`` —
+    that grade is reserved for explicit operator/ingest flags.
+    """
+
+    source: str = ""
+    """Optional source identifier for the claim (e.g. ``"news:reuters"``)."""
+
+    supporting_krefs: List[str] = field(default_factory=list)
+    """Revision krefs of corroborating memories — the manager creates
+    ``SUPPORTS`` edges from the new memory to each after storing."""
+
+    conflicting_krefs: List[str] = field(default_factory=list)
+    """Revision krefs of contradicted memories — recorded in metadata as
+    ``conflicts_with`` so the disagreement stays visible (the contradicted
+    belief itself is never revised at write time)."""
+
 
 # Callable protocol: async (messages, recalled_memories) → MemoryAssessResult.
 # ``messages`` = recent working-memory dicts (role/content/timestamp).
@@ -397,14 +417,86 @@ class UniversalMemoryManager:
             if source_krefs:
                 store_payload["source_revision_krefs"] = source_krefs
 
-            await self._store_with_retry(**store_payload)
+            # Evidence grade from the assessor (never "official" — that
+            # grade is operator-only; sanitized rather than raised because
+            # LLM output must not crash the background task).
+            if assess_result.evidence_level:
+                level = assess_result.evidence_level
+                if level in EVIDENCE_LEVELS and level != "official":
+                    store_payload["metadata"]["evidence_level"] = level
+                    store_payload["tags"].append(evidence_tag(level))
+                else:
+                    logger.warning(
+                        "auto_assess: ignoring assessor evidence_level %r "
+                        "(unknown or operator-only)", level,
+                    )
+            if assess_result.source:
+                store_payload["metadata"]["source"] = assess_result.source
+            if assess_result.conflicting_krefs:
+                store_payload["metadata"]["conflicts_with"] = ",".join(
+                    assess_result.conflicting_krefs
+                )
+
+            store_result = await self._store_with_retry(**store_payload)
             logger.debug(
                 "auto_assess stored memory for session %s: %s",
                 session_id,
                 assess_result.content[:80],
             )
+
+            # SUPPORTS edges to corroborating memories.  Requires the new
+            # revision kref — skipped silently when the store was queued
+            # for retry (no kref exists yet; replay has no edge mechanism).
+            new_kref = (store_result or {}).get("revision_kref", "")
+            if new_kref and assess_result.supporting_krefs:
+                await self._create_support_edges(
+                    new_kref, assess_result.supporting_krefs,
+                )
         except Exception as exc:  # pragma: no cover
             logger.debug("_background_assess error for session %s: %s", session_id, exc)
+
+    async def _create_support_edges(
+        self, revision_kref: str, supporting_krefs: List[str],
+    ) -> int:
+        """Create ``SUPPORTS`` edges from a new memory to its corroborators.
+
+        Best-effort: each edge failure is logged at debug level and skipped —
+        evidence chains are an enrichment, never a store blocker.  Returns
+        the number of edges created.
+        """
+        def _sync_create() -> int:
+            import kumiho
+
+            source_rev = kumiho.get_revision(revision_kref)
+            created = 0
+            for target_kref in supporting_krefs:
+                try:
+                    target_rev = kumiho.get_revision(target_kref)
+                    source_rev.create_edge(
+                        target_rev,
+                        "SUPPORTS",
+                        metadata={"reason": "evidence corroboration"},
+                    )
+                    created += 1
+                except Exception as exc:
+                    logger.debug(
+                        "SUPPORTS edge %s -> %s failed: %s",
+                        revision_kref, target_kref, exc,
+                    )
+            return created
+
+        try:
+            created = await asyncio.to_thread(_sync_create)
+            if created:
+                logger.debug(
+                    "Created %d SUPPORTS edge(s) from %s", created, revision_kref,
+                )
+            return created
+        except Exception as exc:
+            logger.debug(
+                "SUPPORTS edge creation failed for %s: %s", revision_kref, exc,
+            )
+            return 0
 
     async def handle_user_message(
         self,

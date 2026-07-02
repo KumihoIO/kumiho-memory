@@ -115,6 +115,55 @@ def _get_manager():
         except Exception as exc:
             logger.warning("Auto-assess setup failed: %s", exc)
 
+    # Evidence-aware assessor (opt-in via KUMIHO_EVIDENCE_ASSESSOR=1).
+    # Takes precedence over KUMIHO_AUTO_ASSESS when both are set — it is
+    # a strict superset (same pipeline + evidence grading).
+    if os.environ.get("KUMIHO_EVIDENCE_ASSESSOR", "").strip() in ("1", "true"):
+        try:
+            from kumiho_memory.assessors import (
+                EvidencePolicy,
+                create_evidence_assessor,
+            )
+
+            _tmp_summarizer = MemorySummarizer()
+            _adapter = getattr(_tmp_summarizer, "adapter", None)
+            _model = getattr(_tmp_summarizer, "light_model", "")
+            if _adapter is not None:
+                try:
+                    min_corroboration = int(
+                        os.environ.get("KUMIHO_EVIDENCE_MIN_CORROBORATION", "2")
+                    )
+                except ValueError:
+                    min_corroboration = 2
+                policy_kwargs: Dict[str, Any] = {
+                    "min_corroboration": min_corroboration,
+                    "create_supports_edges": os.environ.get(
+                        "KUMIHO_EVIDENCE_SUPPORTS_EDGES", "",
+                    ).strip() in ("1", "true"),
+                }
+                storage_policy = os.environ.get("KUMIHO_AUTO_ASSESS_POLICY", "").strip()
+                if storage_policy:
+                    policy_kwargs["storage_policy"] = storage_policy
+                if auto_assess_fn is not None:
+                    logger.info(
+                        "KUMIHO_EVIDENCE_ASSESSOR overrides KUMIHO_AUTO_ASSESS "
+                        "(both were set)"
+                    )
+                auto_assess_fn = create_evidence_assessor(
+                    _adapter, model=_model, policy=EvidencePolicy(**policy_kwargs),
+                )
+                logger.info(
+                    "Evidence assessor enabled (model=%s, min_corroboration=%d)",
+                    _model or "<default>", min_corroboration,
+                )
+            else:
+                logger.warning(
+                    "KUMIHO_EVIDENCE_ASSESSOR=1 but no LLM adapter detected — "
+                    "set ANTHROPIC_API_KEY or OPENAI_API_KEY to enable."
+                )
+        except Exception as exc:
+            logger.warning("Evidence assessor setup failed: %s", exc)
+
     summarizer = MemorySummarizer()
     buffer = RedisMemoryBuffer()
     _manager = UniversalMemoryManager(

@@ -177,6 +177,39 @@ evidence level keep their existing metadata and tag set unchanged, and
 `parse_evidence` returns `None` for them (callers may treat that as
 `unverified` via `DEFAULT_EVIDENCE_LEVEL`).
 
+#### Evidence assessor (automatic grading)
+
+`create_evidence_assessor` plugs into the write-time screening seat
+(`UniversalMemoryManager(auto_assess_fn=...)`) and grades incoming
+claims automatically:
+
+| rule | condition | outcome |
+|---|---|---|
+| official pinning | claim contradicts a memory tagged `evidence:official` / `published` | stored `unverified`, conflict recorded in `conflicts_with`; the pinned belief is never revised |
+| corroboration | ≥ N agreeing memories with **distinct** `source`s, none contradicting | `corroborated`, `memory_type` forced to `fact`, optional `SUPPORTS` edges to corroborators |
+| single source | claim has an identified source, no corroboration | `single_source` |
+| default | — | `unverified` |
+
+The assessor **never emits `official`** — that grade stays operator-only.
+Corroboration counting needs `source` metadata on the recalled memories,
+so it only fires once sources are being written (see the schema section).
+
+```python
+from kumiho_memory import EvidencePolicy, create_evidence_assessor
+
+assessor = create_evidence_assessor(
+    adapter,
+    policy=EvidencePolicy(min_corroboration=2, create_supports_edges=True),
+)
+manager = UniversalMemoryManager(auto_assess_fn=assessor)
+```
+
+MCP env wiring: `KUMIHO_EVIDENCE_ASSESSOR=1` (takes precedence over
+`KUMIHO_AUTO_ASSESS` when both are set), `KUMIHO_EVIDENCE_MIN_CORROBORATION`
+(default 2), `KUMIHO_EVIDENCE_SUPPORTS_EDGES=1` for evidence-chain edges.
+`SUPPORTS` edges are followed by graph-augmented recall (included in the
+default `GraphAugmentationConfig.edge_types`).
+
 ---
 
 ### Roadmap
