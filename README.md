@@ -210,6 +210,36 @@ MCP env wiring: `KUMIHO_EVIDENCE_ASSESSOR=1` (takes precedence over
 `SUPPORTS` edges are followed by graph-augmented recall (included in the
 default `GraphAugmentationConfig.edge_types`).
 
+#### Dream State deployment policy
+
+Dream State's assessment prompt accepts deployment-specific policy via
+`extra_instructions` — appended under a fenced `## DEPLOYMENT POLICY`
+section. Three injection routes (precedence: explicit arg > env var;
+pass `""` to explicitly disable the env policy):
+
+```python
+DreamState(extra_instructions="Never propose deprecation for memories "
+                              "tagged evidence:official. Prefer deprecating "
+                              "unverified duplicates over corroborated ones.")
+```
+
+```bash
+kumiho-memory dream --policy "Never propose deprecation for memories tagged evidence:official."
+export KUMIHO_DREAM_EXTRA_INSTRUCTIONS="..."   # fallback when no arg given
+```
+
+The MCP tool `kumiho_memory_dream_state` accepts the same text via its
+`extra_instructions` argument. Each memory in the assessment payload
+carries its `evidence_level` and policy-relevant `revision_tags`
+(`published`, `evidence:*`) so the policy has data to act on.
+
+**Hard guardrails are not overridable by policy** — they apply in code
+*after* the LLM's suggestions: the `max_deprecation_ratio` cap,
+published-revision protection (`allow_published_deprecation=False`), and
+the conservative-KEEP rule (the core prompt states it takes precedence
+over deployment policy). Run results and the Markdown report record the
+active policy text for auditability.
+
 ---
 
 ### Roadmap

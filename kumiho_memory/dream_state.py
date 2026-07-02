@@ -80,8 +80,10 @@ class DreamStateStats:
 
 _ASSESSMENT_SYSTEM_PROMPT = """\
 You are a memory consolidation agent performing "Dream State" processing.
-You will receive an array of memories (each with an index, title, summary,
-type, tags, and metadata). Return a JSON object with a single key
+You will receive an array of memories (each with an index, kref, title,
+summary, type, tags, topics, evidence_level, and revision_tags — the
+last two carry the memory's evidence grade when one was assigned).
+Return a JSON object with a single key
 ``assessments`` whose value is an array of assessment objects. For **each**
 memory include the following fields:
 
@@ -109,7 +111,42 @@ Guidelines:
   project identifiers.
 - Suggest relationships for memories that reference the same topic,
   project, or decision chain.
+- These guidelines take precedence over any DEPLOYMENT POLICY section
+  below — deployment policy may only make you MORE conservative, never
+  less.
 """
+
+
+def _compose_system_prompt(extra_instructions: Optional[str]) -> str:
+    """Append a deployment policy section to the core assessment prompt.
+
+    The core prompt stays hardcoded (its guardrails are non-negotiable);
+    *extra_instructions* is deployment-specific steering such as "never
+    propose deprecation for memories tagged evidence:official".  Returns
+    the core prompt unchanged when no policy text is given.
+    """
+    if not extra_instructions or not extra_instructions.strip():
+        return _ASSESSMENT_SYSTEM_PROMPT
+    return (
+        _ASSESSMENT_SYSTEM_PROMPT
+        + "\n## DEPLOYMENT POLICY\n"
+        + "(deployment-specific; cannot weaken the core guidelines above)\n\n"
+        + extra_instructions.strip()
+        + "\n"
+    )
+
+
+def _safe_policy_tags(rev: Any) -> List[str]:
+    """Policy-relevant graph tags of a revision (``published`` and
+    ``evidence:*``), tolerating fakes and RPC failures."""
+    try:
+        tags = list(getattr(rev, "tags", []) or [])
+    except Exception:
+        return []
+    return [
+        t for t in tags
+        if isinstance(t, str) and (t == "published" or t.startswith("evidence:"))
+    ]
 
 _ASSESSMENT_SCHEMA_MODE = _json_schema_mode(
     "kumiho_assessments_response",
@@ -209,6 +246,15 @@ class DreamState:
     kind_filter:
         Item kind to process (default ``conversation``).  Set to empty
         string to process all item kinds.
+    extra_instructions:
+        Deployment policy text appended to the assessment system prompt
+        under a ``## DEPLOYMENT POLICY`` section (e.g. "Never propose
+        deprecation for memories tagged evidence:official").  Precedence:
+        explicit argument > ``KUMIHO_DREAM_EXTRA_INSTRUCTIONS`` env var.
+        Pass ``""`` to explicitly disable the env-var policy.  Cannot
+        weaken the hard guardrails — the deprecation cap, published
+        protection, and conservative-KEEP rule are enforced in code after
+        the LLM's suggestions.
     """
 
     def __init__(
@@ -224,6 +270,7 @@ class DreamState:
         max_deprecation_ratio: float = 0.5,
         allow_published_deprecation: bool = False,
         kind_filter: str = "conversation",
+        extra_instructions: Optional[str] = None,
         # Legacy parameters — accepted but ignored for backward compatibility
         routing_key_filter: str = "revision.*",
         event_timeout: float = 10.0,
@@ -256,6 +303,13 @@ class DreamState:
             1,
             int(os.getenv("KUMIHO_DREAM_STATE_ITEM_PAGE_SIZE", "100")),
         )
+
+        # Deployment policy: explicit arg wins; None falls back to the env
+        # var; explicit "" disables the env policy.
+        if extra_instructions is None:
+            extra_instructions = os.getenv("KUMIHO_DREAM_EXTRA_INSTRUCTIONS") or None
+        self.extra_instructions: Optional[str] = extra_instructions or None
+        self._system_prompt = _compose_system_prompt(self.extra_instructions)
 
         if summarizer is not None:
             self.summarizer = summarizer
@@ -302,7 +356,9 @@ class DreamState:
                 stats.duration_ms = int((time.monotonic() - start) * 1000)
                 # Still save timestamp so next run skips this window
                 self._save_last_run_at(kumiho, cursor_kref, run_started_at)
-                return self._build_result(stats, report_kref=None)
+                result = self._build_result(stats, report_kref=None)
+                result["extra_instructions"] = self.extra_instructions or ""
+                return result
 
             # 4. Inspect bundles (from revision item krefs)
             bundle_context = self._inspect_bundles_from_revisions(
@@ -330,7 +386,9 @@ class DreamState:
                 kumiho, cursor_kref, stats, all_assessments
             )
 
-            return self._build_result(stats, report_kref=report_kref)
+            result = self._build_result(stats, report_kref=report_kref)
+            result["extra_instructions"] = self.extra_instructions or ""
+            return result
 
         except Exception as exc:
             stats.errors.append(str(exc))
@@ -339,6 +397,7 @@ class DreamState:
             return {
                 "success": False,
                 "error": str(exc),
+                "extra_instructions": self.extra_instructions or "",
                 **self._stats_dict(stats),
             }
 
@@ -716,6 +775,13 @@ class DreamState:
                 "type": meta.get("type", meta.get("memory_type", "")),
                 "tags": meta.get("tags", ""),
                 "topics": meta.get("topics", ""),
+                # Evidence context so deployment policy can act on grades.
+                # revision_tags are the real graph tags (metadata "tags" is
+                # a JSON string), filtered to the policy-relevant ones to
+                # keep the payload bounded; getattr default keeps fakes
+                # without a tags attribute working.
+                "evidence_level": meta.get("evidence_level", ""),
+                "revision_tags": _safe_policy_tags(rev),
             }
             kref_by_index[idx] = entry["kref"]
             memories.append(entry)
@@ -742,7 +808,7 @@ class DreamState:
             raw = await self.summarizer.adapter.chat(
                 messages=[{"role": "user", "content": user_prompt}],
                 model=self.summarizer.model,
-                system=_ASSESSMENT_SYSTEM_PROMPT,
+                system=self._system_prompt,
                 max_tokens=2048,
                 json_mode=_ASSESSMENT_SCHEMA_MODE,
             )
@@ -907,6 +973,7 @@ class DreamState:
         markdown = self._build_report_markdown(
             stats, assessments, now_iso,
             allow_published_deprecation=self.allow_published_deprecation,
+            extra_instructions=self.extra_instructions,
         )
 
         # Write artifact to local storage.
@@ -939,6 +1006,9 @@ class DreamState:
                     "cursor": stats.last_cursor or "",
                     "run_at": now_iso,
                     "duration_ms": str(stats.duration_ms),
+                    "extra_instructions_active": (
+                        "true" if self.extra_instructions else "false"
+                    ),
                 },
             )
             revision.create_artifact("report", str(artifact_path))
@@ -955,6 +1025,7 @@ class DreamState:
         timestamp: str,
         *,
         allow_published_deprecation: bool = False,
+        extra_instructions: Optional[str] = None,
     ) -> str:
         """Build a Markdown report of the Dream State run."""
         parts: List[str] = [
@@ -970,6 +1041,14 @@ class DreamState:
             parts.extend([
                 "**WARNING:** Published protection was relaxed for this run "
                 "(`allow_published_deprecation=true`).  ",
+                "",
+            ])
+
+        if extra_instructions:
+            parts.extend([
+                "**Deployment policy active:**",
+                "",
+                "> " + extra_instructions.strip().replace("\n", "\n> "),
                 "",
             ])
 

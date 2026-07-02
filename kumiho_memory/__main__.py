@@ -181,6 +181,7 @@ def cmd_dream(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         max_deprecation_ratio=args.max_deprecation_ratio,
         allow_published_deprecation=args.allow_published_deprecation,
+        extra_instructions=args.policy,
     )
 
     result = asyncio.run(ds.run())
@@ -298,6 +299,12 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-published-deprecation",
         action="store_true",
         help="Allow deprecation of published items (use with caution)",
+    )
+    dream.add_argument(
+        "--policy",
+        default=None,
+        help="Deployment policy text appended to the assessment prompt "
+        "(overrides KUMIHO_DREAM_EXTRA_INSTRUCTIONS; pass '' to disable it)",
     )
 
     parsed = parser.parse_args(argv)

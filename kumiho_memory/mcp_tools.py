@@ -418,6 +418,7 @@ def tool_memory_dream_state(args: Dict[str, Any]) -> Dict[str, Any]:
         dry_run=args.get("dry_run", False),
         max_deprecation_ratio=args.get("max_deprecation_ratio", 0.5),
         allow_published_deprecation=args.get("allow_published_deprecation", False),
+        extra_instructions=args.get("extra_instructions"),
         summarizer=summarizer,
     )
     return asyncio.run(ds.run())
@@ -1159,6 +1160,18 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "type": "boolean",
                     "default": False,
                     "description": "Allow deprecation of published items (use with caution).",
+                },
+                "extra_instructions": {
+                    "type": "string",
+                    "description": (
+                        "Deployment policy appended to the assessment system "
+                        "prompt under a DEPLOYMENT POLICY section (e.g. "
+                        "'Never propose deprecation for memories tagged "
+                        "evidence:official'). Falls back to the "
+                        "KUMIHO_DREAM_EXTRA_INSTRUCTIONS env var when omitted. "
+                        "Cannot weaken hard guardrails (deprecation cap, "
+                        "published protection, conservative-KEEP rule)."
+                    ),
                 },
                 "provider": {
                     "type": "string",
