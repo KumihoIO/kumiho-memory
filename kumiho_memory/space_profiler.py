@@ -109,7 +109,7 @@ class SpaceProfile:
     """Signals-derived label, kept even when a pin overrides ``label`` —
     pinned spaces report pin/observation disagreement as drift."""
     empty: bool = False
-    """True when the space had zero live observations — the profile is
+    """True when the space had zero observed revisions — the profile is
     not persisted (no data is not the same as observed-moderate-churn)."""
 
 
@@ -168,13 +168,17 @@ def classify(signals: SpaceSignals) -> Tuple[Dict[str, float], str]:
         "stability": round(stability, 4),
     }
 
+    # Thresholds compare the ROUNDED scores — the persisted values must
+    # never contradict the documented label decision (float epsilon at
+    # the 0.3 boundary would otherwise label 0.2999... as working while
+    # persisting evidence=0.3).
     if (
-        stability >= 0.6
-        and churn <= 0.4
-        and (graded_count == 0 or evidence >= 0.3)
+        scores["stability"] >= 0.6
+        and scores["churn"] <= 0.4
+        and (graded_count == 0 or scores["evidence"] >= 0.3)
     ):
         label = CANONICAL
-    elif churn >= 0.6 and stability <= 0.4:
+    elif scores["churn"] >= 0.6 and scores["stability"] <= 0.4:
         label = CORRESPONDENCE
     else:
         label = WORKING
@@ -471,7 +475,8 @@ class SpaceProfiler:
                 continue
 
             signals.items_count += 1
-            if getattr(item, "deprecated", False):
+            item_deprecated = bool(getattr(item, "deprecated", False))
+            if item_deprecated:
                 signals.deprecated_items += 1
 
             try:
@@ -485,7 +490,13 @@ class SpaceProfiler:
 
             signals.revisions_count += len(revisions)
             for rev in revisions:
-                deprecated = bool(getattr(rev, "deprecated", False))
+                # Item-level deprecation does NOT cascade to revision
+                # flags on the server, but a deprecated item's revisions
+                # are dead knowledge (search excludes them) — treat them
+                # as deprecated for the live partition.
+                deprecated = item_deprecated or bool(
+                    getattr(rev, "deprecated", False)
+                )
                 if deprecated:
                     signals.deprecated_revisions += 1
 

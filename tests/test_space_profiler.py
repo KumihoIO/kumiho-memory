@@ -296,9 +296,11 @@ def test_collect_signals_counts_and_histogram():
     deprecated_item = FakeItem(
         "kref://CognitiveMemory/facts/dead.conversation", deprecated=True,
     )
+    # Server-realistic: item-level SetDeprecated does NOT cascade to the
+    # revision flags — the revision still reads deprecated=False.
     deprecated_item._revisions.append(FakeRevision(
         "kref://CognitiveMemory/facts/dead.conversation?r=1",
-        created_at=_iso_days_ago(5), deprecated=True, number=1, latest=True,
+        created_at=_iso_days_ago(5), deprecated=False, number=1, latest=True,
     ))
     items.append(deprecated_item)
 
@@ -366,6 +368,40 @@ def test_deprecated_revisions_do_not_inflate_stability():
     signals = SpaceProfiler(dry_run=True).collect_signals(sdk, space_path)
     assert signals.published_share == 0.0  # the only live revision is unpublished
     assert signals.median_revision_age_days < 1
+    _, label = classify(signals)
+    assert label != CANONICAL
+
+
+def test_item_deprecation_kills_revisions_for_stability():
+    """Item-level deprecation does not cascade to revision flags on the
+    real server — but a deprecated item's revisions are dead knowledge
+    and must not inflate stability/evidence for the live content."""
+    space_path = "/CognitiveMemory/facts"
+    items = []
+    for i in range(8):
+        dead = _stable_item(
+            f"kref://CognitiveMemory/facts/old{i}.conversation",
+        )
+        dead.deprecated = True  # revisions stay published/official/live-flagged
+        items.append(dead)
+    for i in range(2):
+        fresh = FakeItem(f"kref://CognitiveMemory/facts/new{i}.conversation")
+        fresh._revisions.append(FakeRevision(
+            f"kref://CognitiveMemory/facts/new{i}.conversation?r=1",
+            created_at=_iso_days_ago(0.5), published=False,
+            number=1, latest=True,
+        ))
+        items.append(fresh)
+
+    sdk, _ = _build_fake_sdk(
+        items_by_space={space_path: items},
+        spaces=[FakeSpace(space_path)],
+    )
+    signals = SpaceProfiler(dry_run=True).collect_signals(sdk, space_path)
+    assert signals.live_revisions_count == 2
+    assert signals.published_share == 0.0
+    assert signals.evidence_histogram == {}
+    assert signals.deprecated_revisions == 8
     _, label = classify(signals)
     assert label != CANONICAL
 
