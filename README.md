@@ -299,14 +299,20 @@ from existing SDK queries (pure aggregation, **no LLM**):
 
 | label | meaning | thresholds |
 |---|---|---|
-| `canonical` | established concepts | stability ≥ 0.6 and churn ≤ 0.4 |
+| `canonical` | established concepts | stability ≥ 0.6, churn ≤ 0.4, and evidence ≥ 0.3 when any revision carries a grade (ungraded corpora are not penalized) |
 | `correspondence` | claims / requests / responses | churn ≥ 0.6 and stability ≤ 0.4 |
 | `working` | active projects/notes | everything else |
+
+Stability and evidence describe the **live** (non-deprecated) revisions
+only; churn counts historical stacking. Empty spaces are not classified
+or persisted — "no data" is not a label.
 
 The profile persists as a `kind="space-profile"` Item — one per Space,
 one revision per run, with `SUPERSEDES` edges linking runs so profile
 drift is itself a versioned chain. A Space owner pins the label with the
-`space_class` Space attribute; the profiler then reports drift only.
+`space_class` Space attribute; the profiler then never relabels, and
+instead reports pin/observation disagreement as drift (the observed
+label is persisted alongside the pin as `observed_label`).
 
 ```bash
 kumiho-memory profile --dry-run          # classify without persisting

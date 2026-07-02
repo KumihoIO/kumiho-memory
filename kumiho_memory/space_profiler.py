@@ -46,6 +46,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from kumiho_memory import _graph_walk as _walk
+from kumiho_memory.evidence import parse_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +68,19 @@ _EVIDENCE_QUALITY = {
 
 @dataclass
 class SpaceSignals:
-    """Raw per-Space statistics computed from existing SDK queries."""
+    """Raw per-Space statistics computed from existing SDK queries.
+
+    Stability-family signals (``published_share``,
+    ``median_revision_age_days``, ``evidence_histogram``) describe the
+    **live** (non-deprecated) revisions only — dead history must not
+    make a churned space look established.  Churn-family counts include
+    deprecated revisions because historical stacking is exactly what
+    churn measures.
+    """
 
     items_count: int = 0
     revisions_count: int = 0
+    live_revisions_count: int = 0
     revisions_per_item_mean: float = 0.0
     revision_rate_per_day: float = 0.0
     supersedes_edge_count: int = 0
@@ -95,28 +105,36 @@ class SpaceProfile:
     label: str
     pinned: bool = False
     previous_label: Optional[str] = None
+    observed_label: Optional[str] = None
+    """Signals-derived label, kept even when a pin overrides ``label`` —
+    pinned spaces report pin/observation disagreement as drift."""
+    empty: bool = False
+    """True when the space had zero live observations — the profile is
+    not persisted (no data is not the same as observed-moderate-churn)."""
 
 
-def classify(
-    signals: SpaceSignals,
-    override: Optional[str] = None,
-) -> Tuple[Dict[str, float], str, bool]:
+def classify(signals: SpaceSignals) -> Tuple[Dict[str, float], str]:
     """Score and label a Space from its signals (pure, no I/O).
 
-    Returns ``(scores, label, pinned)``.  When *override* is a valid
-    label the profiler respects the pin and only computes scores.
+    Returns ``(scores, observed_label)``.  Override/pin handling lives
+    in the profiler so the observed label is always computed.
 
     Scores (each 0..1):
 
     - ``churn`` — revision stacking depth, revision rate in the window,
       and SUPERSEDES chain depth
-    - ``evidence`` — quality-weighted share of graded revisions
+    - ``evidence`` — quality-weighted share of graded live revisions
       (ungraded revisions count as 0, i.e. unverified-equivalent)
-    - ``stability`` — published share and median revision age
+    - ``stability`` — published share and median revision age of live
+      revisions
 
     Label thresholds (documented, deliberately coarse):
 
-    - ``canonical`` — stability >= 0.6 and churn <= 0.4
+    - ``canonical`` — stability >= 0.6, churn <= 0.4, and (when any
+      revision carries a grade) evidence >= 0.3 — a stable but
+      low-evidence graded corpus is ``working``, per the issue's
+      "low churn, high evidence" definition; ungraded corpora are not
+      penalized for predating the evidence schema
     - ``correspondence`` — churn >= 0.6 and stability <= 0.4
     - ``working`` — everything else
     """
@@ -127,13 +145,14 @@ def classify(
         + 0.2 * min(1.0, signals.supersedes_max_depth / 5.0),
     )
 
+    graded_count = sum(signals.evidence_histogram.values())
     graded_quality = sum(
         _EVIDENCE_QUALITY.get(level, 0.0) * count
         for level, count in signals.evidence_histogram.items()
     )
     evidence = (
-        graded_quality / signals.revisions_count
-        if signals.revisions_count
+        graded_quality / signals.live_revisions_count
+        if signals.live_revisions_count
         else 0.0
     )
 
@@ -149,16 +168,17 @@ def classify(
         "stability": round(stability, 4),
     }
 
-    if override in SPACE_CLASSES:
-        return scores, override, True
-
-    if stability >= 0.6 and churn <= 0.4:
+    if (
+        stability >= 0.6
+        and churn <= 0.4
+        and (graded_count == 0 or evidence >= 0.3)
+    ):
         label = CANONICAL
     elif churn >= 0.6 and stability <= 0.4:
         label = CORRESPONDENCE
     else:
         label = WORKING
-    return scores, label, False
+    return scores, label
 
 
 def _parse_created_at(value: Any) -> Optional[datetime]:
@@ -185,6 +205,45 @@ def _item_name_and_kind(item: Any) -> Tuple[str, str]:
         name, kind = last.split(".", 1)
         return name, kind
     return last, ""
+
+
+def _snapshot_tags(rev: Any) -> List[str]:
+    """A revision's tags without triggering the SDK's auto-refresh RPC.
+
+    ``Revision.tags`` is a property that refreshes over gRPC once >5s
+    stale; the construction-time ``_cached_tags`` snapshot is fresh
+    enough for signal aggregation (same posture as Dream State).
+    """
+    try:
+        tags = getattr(rev, "_cached_tags", None)
+        if tags is None:
+            tags = getattr(rev, "tags", None)
+        return [t for t in (tags or []) if isinstance(t, str)]
+    except Exception:
+        return []
+
+
+def _pick_latest_revision(revisions: List[Any]) -> Optional[Any]:
+    """The item's newest revision, robust to server ordering.
+
+    The real server returns revisions newest-FIRST (``ORDER BY number
+    DESC``) — naively taking the last element walks SUPERSEDES chains
+    from the oldest revision, which has no outgoing edges.  Prefer the
+    ``latest`` flag, then the highest ``number``, then the last element.
+    """
+    if not revisions:
+        return None
+    for rev in revisions:
+        if getattr(rev, "latest", False) is True:
+            return rev
+    numbered = [
+        rev for rev in revisions
+        if isinstance(getattr(rev, "number", None), int)
+        and not isinstance(getattr(rev, "number", None), bool)
+    ]
+    if numbered:
+        return max(numbered, key=lambda rev: rev.number)
+    return revisions[-1]
 
 
 class SpaceProfiler:
@@ -272,18 +331,23 @@ class SpaceProfiler:
                 _walk.list_project_spaces,
                 project, self.project, self.space_page_size,
             )
+            # Keep the Space handles: attribute reads (space_class pin)
+            # must go through Space.get_attribute — bare paths fail the
+            # module-level Kref validation.  The project root has no
+            # Space handle (None).
+            space_handles: Dict[str, Any] = {f"/{self.project}": None}
             space_paths = [f"/{self.project}"]
-            seen = {f"/{self.project}"}
             for space in spaces:
                 path = getattr(space, "path", "")
-                if path and path not in seen:
-                    seen.add(path)
+                if path and path not in space_handles:
+                    space_handles[path] = space
                     space_paths.append(path)
 
             for space_path in space_paths:
                 try:
                     profile = await asyncio.to_thread(
-                        self._profile_space, kumiho, space_path,
+                        self._profile_space,
+                        kumiho, space_path, space_handles.get(space_path),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -294,15 +358,34 @@ class SpaceProfiler:
                     continue
 
                 result["spaces_profiled"] += 1
+                result["profiles"][space_path] = {
+                    "label": profile.label,
+                    "observed_label": profile.observed_label,
+                    "pinned": profile.pinned,
+                    "empty": profile.empty,
+                    "scores": profile.scores,
+                }
+                if profile.empty:
+                    # No live observations — nothing persisted, no label
+                    # tallied ("no data" is not a classification).
+                    continue
                 result["labels"][profile.label] = (
                     result["labels"].get(profile.label, 0) + 1
                 )
-                result["profiles"][space_path] = {
-                    "label": profile.label,
-                    "pinned": profile.pinned,
-                    "scores": profile.scores,
-                }
-                if (
+                if profile.pinned:
+                    # Pinned spaces relabel nothing — they report
+                    # pin/observation disagreement as drift instead.
+                    if (
+                        profile.observed_label
+                        and profile.observed_label != profile.label
+                    ):
+                        result["drift"].append({
+                            "space_path": space_path,
+                            "from": profile.label,
+                            "to": profile.observed_label,
+                            "pinned": True,
+                        })
+                elif (
                     profile.previous_label
                     and profile.previous_label != profile.label
                 ):
@@ -310,7 +393,7 @@ class SpaceProfiler:
                         "space_path": space_path,
                         "from": profile.previous_label,
                         "to": profile.label,
-                        "pinned": profile.pinned,
+                        "pinned": False,
                     })
 
         except Exception as exc:
@@ -325,12 +408,19 @@ class SpaceProfiler:
     # Signal collection
     # ------------------------------------------------------------------
 
-    def _profile_space(self, sdk: Any, space_path: str) -> SpaceProfile:
+    def _profile_space(
+        self,
+        sdk: Any,
+        space_path: str,
+        space_handle: Optional[Any] = None,
+    ) -> SpaceProfile:
         """Collect signals, classify, and (unless dry_run) persist."""
         signals = self.collect_signals(sdk, space_path)
-        override = self._read_override(sdk, space_path)
+        override = self._read_override(sdk, space_path, space_handle)
         previous_label = self._read_previous_label(sdk, space_path)
-        scores, label, pinned = classify(signals, override)
+        scores, observed_label = classify(signals)
+        pinned = override is not None
+        label = override if pinned else observed_label
 
         profile = SpaceProfile(
             space_path=space_path,
@@ -339,9 +429,11 @@ class SpaceProfiler:
             label=label,
             pinned=pinned,
             previous_label=previous_label,
+            observed_label=observed_label,
+            empty=signals.revisions_count == 0,
         )
 
-        if not self.dry_run:
+        if not self.dry_run and not profile.empty:
             self._persist_profile(sdk, space_path, profile)
         return profile
 
@@ -392,29 +484,39 @@ class SpaceProfiler:
                 continue
 
             signals.revisions_count += len(revisions)
-            latest_rev = None
             for rev in revisions:
-                if getattr(rev, "deprecated", False):
+                deprecated = bool(getattr(rev, "deprecated", False))
+                if deprecated:
                     signals.deprecated_revisions += 1
+
+                created = _parse_created_at(getattr(rev, "created_at", None))
+                if created is not None and created.timestamp() >= window_start:
+                    revisions_in_window += 1
+
+                if deprecated:
+                    # Dead history counts toward churn only — it must not
+                    # inflate stability/evidence for the live knowledge.
+                    continue
+
+                signals.live_revisions_count += 1
                 if getattr(rev, "published", False):
                     published_count += 1
 
                 meta = dict(getattr(rev, "metadata", {}) or {})
-                level = str(meta.get("evidence_level", "") or "")
+                level = parse_evidence(meta, _snapshot_tags(rev))
                 if level:
                     signals.evidence_histogram[level] = (
                         signals.evidence_histogram.get(level, 0) + 1
                     )
 
-                created = _parse_created_at(getattr(rev, "created_at", None))
                 if created is not None:
                     ages_days.append(
                         max(0.0, (now - created).total_seconds() / 86400.0)
                     )
-                    if created.timestamp() >= window_start:
-                        revisions_in_window += 1
-                latest_rev = rev
 
+            # The server returns revisions newest-first — never assume
+            # list position encodes recency.
+            latest_rev = _pick_latest_revision(revisions)
             if latest_rev is not None and self.max_supersedes_depth > 0:
                 depth = self._supersedes_depth(sdk, latest_rev)
                 if depth > 0:
@@ -431,7 +533,10 @@ class SpaceProfiler:
             signals.deprecation_ratio = (
                 signals.deprecated_revisions / signals.revisions_count
             )
-            signals.published_share = published_count / signals.revisions_count
+        if signals.live_revisions_count:
+            signals.published_share = (
+                published_count / signals.live_revisions_count
+            )
         signals.revision_rate_per_day = revisions_in_window / self.window_days
         if ages_days:
             signals.median_revision_age_days = round(
@@ -451,7 +556,8 @@ class SpaceProfiler:
                 break  # cycle guard
             seen.add(kref)
             try:
-                edges = current.get_edges(edge_type_filter=["SUPERSEDES"])
+                # SDK signature: get_edges(edge_type_filter: Optional[str])
+                edges = current.get_edges(edge_type_filter="SUPERSEDES")
             except TypeError:
                 try:
                     edges = current.get_edges()
@@ -483,12 +589,35 @@ class SpaceProfiler:
     # Override / previous label / persistence
     # ------------------------------------------------------------------
 
-    def _read_override(self, sdk: Any, space_path: str) -> Optional[str]:
-        """Read the ``space_class`` Space attribute (manual pin)."""
-        try:
-            value = sdk.get_attribute(space_path, "space_class")
-        except Exception:
-            return None
+    def _read_override(
+        self,
+        sdk: Any,
+        space_path: str,
+        space_handle: Optional[Any] = None,
+    ) -> Optional[str]:
+        """Read the ``space_class`` Space attribute (manual pin).
+
+        MUST go through the Space handle when available: the SDK's
+        module-level ``get_attribute`` wraps its argument in ``Kref``,
+        whose validator rejects bare space paths (no ``kref://`` scheme)
+        — ``Space.get_attribute`` deliberately bypasses that validation.
+        The module-level call remains only as a fallback for handle-less
+        paths (project root) and legacy stubs.
+        """
+        value = None
+        if space_handle is not None:
+            try:
+                value = space_handle.get_attribute("space_class")
+            except Exception as exc:
+                logger.debug(
+                    "SpaceProfiler: space_class read via handle failed "
+                    "for %s: %s", space_path, exc,
+                )
+        if value is None:
+            try:
+                value = sdk.get_attribute(space_path, "space_class")
+            except Exception:
+                return None
         return value if value in SPACE_CLASSES else None
 
     def _profile_kref(self, space_path: str) -> str:
@@ -543,6 +672,7 @@ class SpaceProfiler:
                     f"stability={profile.scores.get('stability')}"
                 ),
                 "label": profile.label,
+                "observed_label": profile.observed_label or "",
                 "pinned": "true" if profile.pinned else "false",
                 "previous_label": profile.previous_label or "",
                 "scores": json.dumps(profile.scores),
@@ -615,9 +745,13 @@ def get_space_profile(
     """
     import kumiho
 
-    kref = (
-        f"kref://{space_path.strip('/')}/{profile_item_name}.{profile_kind}"
-    )
+    # space_path may be project-qualified ("/CognitiveMemory/facts") or
+    # relative ("facts") — the project argument qualifies the latter.
+    rel = space_path.strip("/")
+    proj = project.strip("/")
+    if rel != proj and not rel.startswith(f"{proj}/"):
+        rel = f"{proj}/{rel}" if rel else proj
+    kref = f"kref://{rel}/{profile_item_name}.{profile_kind}"
     try:
         item = kumiho.get_item(kref)
         if item is None:
@@ -641,6 +775,7 @@ def get_space_profile(
                     setattr(signals, key, value)
         except (ValueError, TypeError):
             pass
+        observed = meta.get("observed_label", "") or None
         return SpaceProfile(
             space_path=space_path,
             signals=signals,
@@ -648,6 +783,7 @@ def get_space_profile(
             label=label,
             pinned=meta.get("pinned", "") == "true",
             previous_label=meta.get("previous_label", "") or None,
+            observed_label=observed if observed in SPACE_CLASSES else None,
         )
     except Exception as exc:
         logger.debug(

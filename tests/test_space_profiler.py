@@ -1,10 +1,17 @@
-"""Tests for kumiho_memory.space_profiler — per-Space knowledge profiles."""
+"""Tests for kumiho_memory.space_profiler — per-Space knowledge profiles.
+
+The fakes deliberately mirror real SDK/server behavior that masked bugs
+in review round 1: ``get_revisions`` returns newest-FIRST (the server
+does ``ORDER BY number DESC``), module-level ``get_attribute`` rejects
+bare space paths (Kref validation), and ``get_edges`` takes an
+``Optional[str]`` filter.
+"""
 
 import asyncio
 import json
 import sys
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -21,7 +28,7 @@ from kumiho_memory.space_profiler import (
 
 
 # ---------------------------------------------------------------------------
-# Fakes — mirror the test_dream_state pattern
+# Fakes — mirror the real SDK/server contracts
 # ---------------------------------------------------------------------------
 
 
@@ -32,18 +39,27 @@ class FakeKref:
 
 class FakeRevision:
     def __init__(self, kref, metadata=None, *, created_at="",
-                 published=False, deprecated=False):
+                 published=False, deprecated=False, number=0, latest=False,
+                 tags=None):
         self.kref = FakeKref(kref)
         self.metadata = metadata or {}
         self.created_at = created_at
         self.published = published
         self.deprecated = deprecated
+        self.number = number
+        self.latest = latest
+        self._cached_tags = list(tags or [])
         self._edges: list = []
-        self.tagged: list = []
         self.edges_created: list = []
 
     def get_edges(self, edge_type_filter=None):
-        return list(self._edges)
+        # Mirror the real SDK: edge_type_filter is Optional[str].
+        if edge_type_filter is not None and not isinstance(edge_type_filter, str):
+            raise TypeError("edge_type_filter must be a string")
+        edges = list(self._edges)
+        if edge_type_filter:
+            edges = [e for e in edges if e.edge_type == edge_type_filter]
+        return edges
 
     def create_edge(self, target, edge_type, metadata=None):
         self.edges_created.append(
@@ -58,7 +74,12 @@ class FakeItem:
         self._revisions: List[FakeRevision] = []
 
     def get_revisions(self):
-        return list(self._revisions)
+        # Mirror the real server: newest FIRST (ORDER BY number DESC).
+        return sorted(
+            self._revisions,
+            key=lambda r: getattr(r, "number", 0),
+            reverse=True,
+        )
 
     def get_revision_by_tag(self, tag):
         if self._revisions:
@@ -69,6 +90,7 @@ class FakeItem:
         rev = FakeRevision(
             f"{self.kref.uri}?r={len(self._revisions) + 1}",
             metadata=dict(metadata or {}),
+            number=len(self._revisions) + 1,
         )
         self._revisions.append(rev)
         return rev
@@ -87,8 +109,14 @@ class FakeSpaceHandle:
 
 
 class FakeSpace:
-    def __init__(self, path):
+    def __init__(self, path, attributes=None):
         self.path = path
+        self._attributes = dict(attributes or {})
+
+    def get_attribute(self, key):
+        # Mirror Space.get_attribute — accepts bare keys on the handle
+        # (it deliberately bypasses Kref validation).
+        return self._attributes.get(key)
 
 
 class FakeClient:
@@ -110,11 +138,9 @@ def _build_fake_sdk(
     items_by_space: Dict[str, List[FakeItem]],
     spaces: List[FakeSpace],
     items_by_kref: Optional[Dict[str, FakeItem]] = None,
-    attributes: Optional[Dict[str, Dict[str, str]]] = None,
     revisions_by_kref: Optional[Dict[str, FakeRevision]] = None,
 ):
     items_by_kref = items_by_kref if items_by_kref is not None else {}
-    attributes = attributes if attributes is not None else {}
     revisions_by_kref = revisions_by_kref or {}
     client = FakeClient(items_by_space)
 
@@ -127,10 +153,20 @@ def _build_fake_sdk(
         proj.get_space = lambda rel: FakeSpaceHandle(items_by_kref)
         return proj
 
+    def get_attribute(kref, key):
+        # Mirror the real module-level kumiho.get_attribute: it wraps
+        # the argument in Kref, which REJECTS bare space paths.
+        if not str(kref).startswith("kref://"):
+            raise ValueError(
+                f"KrefValidationError: {kref!r} must be format "
+                "kref://project/space/item.kind"
+            )
+        return None
+
     sdk.get_project = get_project
     sdk.get_client = lambda: client
     sdk.get_item = lambda kref: items_by_kref.get(kref)
-    sdk.get_attribute = lambda kref, key: attributes.get(kref, {}).get(key)
+    sdk.get_attribute = get_attribute
     sdk.get_revision = lambda kref: revisions_by_kref.get(kref)
     return sdk, items_by_kref
 
@@ -148,6 +184,8 @@ def _stable_item(kref, revision_count=1, age_days=90.0):
             metadata={"evidence_level": "official"},
             created_at=_iso_days_ago(age_days),
             published=True,
+            number=i + 1,
+            latest=(i == revision_count - 1),
         ))
     return item
 
@@ -161,6 +199,8 @@ def _churny_item(kref, revision_count=8):
             metadata={},
             created_at=_iso_days_ago(float(revision_count - i)),
             published=False,
+            number=i + 1,
+            latest=(i == revision_count - 1),
         ))
     return item
 
@@ -172,28 +212,27 @@ def _churny_item(kref, revision_count=8):
 
 def test_classify_stable_published_space_is_canonical():
     signals = SpaceSignals(
-        items_count=10, revisions_count=12,
+        items_count=10, revisions_count=12, live_revisions_count=12,
         revisions_per_item_mean=1.2, revision_rate_per_day=0.1,
         supersedes_max_depth=0,
         evidence_histogram={"official": 10},
         published_share=0.9, median_revision_age_days=60.0,
     )
-    scores, label, pinned = classify(signals)
+    scores, label = classify(signals)
     assert label == CANONICAL
-    assert pinned is False
     assert scores["churn"] <= 0.4
     assert scores["stability"] >= 0.6
 
 
 def test_classify_high_churn_unpublished_space_is_correspondence():
     signals = SpaceSignals(
-        items_count=5, revisions_count=40,
+        items_count=5, revisions_count=40, live_revisions_count=40,
         revisions_per_item_mean=8.0, revision_rate_per_day=5.0,
         supersedes_max_depth=6,
         evidence_histogram={},
         published_share=0.0, median_revision_age_days=2.0,
     )
-    scores, label, pinned = classify(signals)
+    scores, label = classify(signals)
     assert label == CORRESPONDENCE
     assert scores["churn"] >= 0.6
     assert scores["stability"] <= 0.4
@@ -201,29 +240,45 @@ def test_classify_high_churn_unpublished_space_is_correspondence():
 
 def test_classify_mixed_space_is_working():
     signals = SpaceSignals(
-        items_count=5, revisions_count=15,
+        items_count=5, revisions_count=15, live_revisions_count=15,
         revisions_per_item_mean=3.0, revision_rate_per_day=1.0,
         supersedes_max_depth=1,
         evidence_histogram={"single_source": 5},
         published_share=0.5, median_revision_age_days=10.0,
     )
-    _, label, _ = classify(signals)
+    _, label = classify(signals)
     assert label == WORKING
 
 
-def test_classify_override_wins_and_pins():
-    signals = SpaceSignals()  # would classify canonical-ish (all zeros -> working)
-    scores, label, pinned = classify(signals, override="correspondence")
-    assert label == CORRESPONDENCE
-    assert pinned is True
-    # invalid override ignored
-    _, label, pinned = classify(signals, override="bogus")
-    assert label in SPACE_CLASSES
-    assert pinned is False
-
-
 def test_classify_empty_space_is_working():
-    _, label, _ = classify(SpaceSignals())
+    _, label = classify(SpaceSignals())
+    assert label == WORKING
+
+
+def test_classify_stable_ungraded_space_is_canonical():
+    """Corpora predating the evidence schema are not penalized."""
+    signals = SpaceSignals(
+        items_count=10, revisions_count=10, live_revisions_count=10,
+        revisions_per_item_mean=1.0, revision_rate_per_day=0.0,
+        evidence_histogram={},
+        published_share=1.0, median_revision_age_days=90.0,
+    )
+    _, label = classify(signals)
+    assert label == CANONICAL
+
+
+def test_classify_stable_but_low_evidence_graded_space_is_working():
+    """Issue #13: canonical means low churn AND high evidence — a stable
+    space whose graded revisions are all unverified must not classify as
+    established concepts."""
+    signals = SpaceSignals(
+        items_count=10, revisions_count=10, live_revisions_count=10,
+        revisions_per_item_mean=1.0, revision_rate_per_day=0.0,
+        evidence_histogram={"unverified": 10},
+        published_share=1.0, median_revision_age_days=90.0,
+    )
+    scores, label = classify(signals)
+    assert scores["evidence"] < 0.3
     assert label == WORKING
 
 
@@ -243,7 +298,7 @@ def test_collect_signals_counts_and_histogram():
     )
     deprecated_item._revisions.append(FakeRevision(
         "kref://CognitiveMemory/facts/dead.conversation?r=1",
-        created_at=_iso_days_ago(5), deprecated=True,
+        created_at=_iso_days_ago(5), deprecated=True, number=1, latest=True,
     ))
     items.append(deprecated_item)
 
@@ -256,13 +311,63 @@ def test_collect_signals_counts_and_histogram():
 
     assert signals.items_count == 3
     assert signals.revisions_count == 5
+    assert signals.live_revisions_count == 4  # deprecated one excluded
     assert signals.deprecated_items == 1
     assert signals.deprecated_revisions == 1
     assert signals.evidence_histogram == {"official": 1}
-    assert signals.published_share == 1 / 5
+    assert signals.published_share == 1 / 4  # over LIVE revisions
     assert signals.deprecation_ratio == 1 / 5
     assert signals.revisions_per_item_mean == 5 / 3
     assert signals.median_revision_age_days > 0
+
+
+def test_collect_signals_histogram_reads_mirrored_tag():
+    """A revision graded via the evidence:<level> tag alone (metadata
+    write failed) still counts — parse_evidence is the canonical
+    resolver, reading the _cached_tags snapshot (no RPC)."""
+    space_path = "/CognitiveMemory/facts"
+    item = FakeItem("kref://CognitiveMemory/facts/t.conversation")
+    item._revisions.append(FakeRevision(
+        "kref://CognitiveMemory/facts/t.conversation?r=1",
+        metadata={},  # no evidence_level key
+        created_at=_iso_days_ago(1), number=1, latest=True,
+        tags=["published", "evidence:corroborated"],
+    ))
+
+    sdk, _ = _build_fake_sdk(
+        items_by_space={space_path: [item]},
+        spaces=[FakeSpace(space_path)],
+    )
+    signals = SpaceProfiler(dry_run=True).collect_signals(sdk, space_path)
+    assert signals.evidence_histogram == {"corroborated": 1}
+
+
+def test_deprecated_revisions_do_not_inflate_stability():
+    """9 old published-but-deprecated revisions + 1 fresh live revision
+    must NOT read as a stable canonical space."""
+    space_path = "/CognitiveMemory/facts"
+    item = FakeItem("kref://CognitiveMemory/facts/d.conversation")
+    for i in range(9):
+        item._revisions.append(FakeRevision(
+            f"kref://CognitiveMemory/facts/d.conversation?r={i + 1}",
+            created_at=_iso_days_ago(90), published=True, deprecated=True,
+            number=i + 1,
+        ))
+    item._revisions.append(FakeRevision(
+        "kref://CognitiveMemory/facts/d.conversation?r=10",
+        created_at=_iso_days_ago(0.5), published=False,
+        number=10, latest=True,
+    ))
+
+    sdk, _ = _build_fake_sdk(
+        items_by_space={space_path: [item]},
+        spaces=[FakeSpace(space_path)],
+    )
+    signals = SpaceProfiler(dry_run=True).collect_signals(sdk, space_path)
+    assert signals.published_share == 0.0  # the only live revision is unpublished
+    assert signals.median_revision_age_days < 1
+    _, label = classify(signals)
+    assert label != CANONICAL
 
 
 def test_collect_signals_excludes_profiler_and_cursor_items():
@@ -274,14 +379,14 @@ def test_collect_signals_excludes_profiler_and_cursor_items():
     )
     profile_item._revisions.append(FakeRevision(
         "kref://CognitiveMemory/facts/_space_profile.space-profile?r=1",
-        created_at=_iso_days_ago(0.1),
+        created_at=_iso_days_ago(0.1), number=1, latest=True,
     ))
     cursor_item = FakeItem(
         "kref://CognitiveMemory/facts/_dream_state.conversation",
     )
     cursor_item._revisions.append(FakeRevision(
         "kref://CognitiveMemory/facts/_dream_state.conversation?r=1",
-        created_at=_iso_days_ago(0.1),
+        created_at=_iso_days_ago(0.1), number=1, latest=True,
     ))
 
     sdk, _ = _build_fake_sdk(
@@ -294,14 +399,20 @@ def test_collect_signals_excludes_profiler_and_cursor_items():
     assert signals.revisions_count == 0
 
 
-def test_supersedes_chain_depth_bounded():
+def test_supersedes_chain_walked_from_true_latest_despite_desc_order():
+    """The server returns revisions newest-first — the chain walk must
+    start from the true latest revision (the oldest has no outgoing
+    SUPERSEDES edges), bounded by max_supersedes_depth."""
     space_path = "/CognitiveMemory/claims"
     item = FakeItem("kref://CognitiveMemory/claims/x.conversation")
     revs = {}
     prev_uri = None
     for i in range(4):
         uri = f"kref://CognitiveMemory/claims/x.conversation?r={i + 1}"
-        rev = FakeRevision(uri, created_at=_iso_days_ago(4 - i))
+        rev = FakeRevision(
+            uri, created_at=_iso_days_ago(4 - i),
+            number=i + 1, latest=(i == 3),
+        )
         if prev_uri:
             edge = types.SimpleNamespace(
                 edge_type="SUPERSEDES", target_kref=FakeKref(prev_uri),
@@ -309,7 +420,12 @@ def test_supersedes_chain_depth_bounded():
             rev._edges.append(edge)
         revs[uri] = rev
         prev_uri = uri
-    item._revisions = [revs[f"kref://CognitiveMemory/claims/x.conversation?r={i + 1}"] for i in range(4)]
+    item._revisions = [
+        revs[f"kref://CognitiveMemory/claims/x.conversation?r={i + 1}"]
+        for i in range(4)
+    ]
+    # FakeItem.get_revisions sorts DESC — newest first, like the server.
+    assert item.get_revisions()[0].number == 4
 
     sdk, _ = _build_fake_sdk(
         items_by_space={space_path: [item]},
@@ -320,6 +436,11 @@ def test_supersedes_chain_depth_bounded():
     signals = profiler.collect_signals(sdk, space_path)
     assert signals.supersedes_edge_count == 1
     assert signals.supersedes_max_depth == 2  # bounded below true depth 3
+
+    # Unbounded: full chain depth from the true latest revision.
+    profiler = SpaceProfiler(dry_run=True, max_supersedes_depth=10)
+    signals = profiler.collect_signals(sdk, space_path)
+    assert signals.supersedes_max_depth == 3
 
 
 # ---------------------------------------------------------------------------
@@ -356,10 +477,29 @@ def test_run_persists_profile_revision():
     assert profile_item is not None
     rev = profile_item._revisions[-1]
     assert rev.metadata["label"] == CANONICAL
+    assert rev.metadata["observed_label"] == CANONICAL
     assert rev.metadata["type"] == "space_profile"
     json.loads(rev.metadata["scores"])  # valid JSON
     parsed_signals = json.loads(rev.metadata["signals"])
     assert parsed_signals["items_count"] == 1
+
+
+def test_run_empty_space_not_persisted_or_labeled():
+    """Zero observations is not a classification — nothing persisted,
+    no label tallied (the project root is empty here too)."""
+    space_path = "/CognitiveMemory/empty"
+    items_by_kref: Dict[str, FakeItem] = {}
+    sdk, created = _build_fake_sdk(
+        items_by_space={space_path: []},
+        spaces=[FakeSpace(space_path)],
+        items_by_kref=items_by_kref,
+    )
+
+    result = _run_profiler(sdk)
+    assert result["spaces_profiled"] == 2
+    assert result["labels"] == {}  # nothing tallied
+    assert result["profiles"][space_path]["empty"] is True
+    assert "__last_created__" not in created  # nothing persisted
 
 
 def test_run_supersedes_edge_links_profile_drift():
@@ -371,7 +511,7 @@ def test_run_supersedes_edge_links_profile_drift():
     existing._revisions.append(FakeRevision(
         f"{profile_kref}?r=1",
         metadata={"label": CORRESPONDENCE},
-        created_at=_iso_days_ago(1),
+        created_at=_iso_days_ago(1), number=1, latest=True,
     ))
 
     sdk, _ = _build_fake_sdk(
@@ -392,19 +532,47 @@ def test_run_supersedes_edge_links_profile_drift():
     assert (f"{profile_kref}?r=1", "SUPERSEDES") in new_rev.edges_created
 
 
-def test_run_override_pins_label():
+def test_run_override_pins_label_via_space_handle():
+    """The space_class pin is read through the Space handle — the
+    module-level get_attribute rejects bare paths (Kref validation), so
+    a handle-based read is the only route that works on a real server."""
     space_path = "/CognitiveMemory/facts"
     sdk, _ = _build_fake_sdk(
         items_by_space={
-            space_path: [_stable_item("kref://CognitiveMemory/facts/a.conversation")],
+            # churny content, pinned canonical
+            space_path: [_churny_item("kref://CognitiveMemory/facts/b.conversation")],
         },
-        spaces=[FakeSpace(space_path)],
-        attributes={space_path: {"space_class": CORRESPONDENCE}},
+        spaces=[FakeSpace(space_path, attributes={"space_class": CANONICAL})],
     )
 
     result = _run_profiler(sdk)
-    assert result["profiles"][space_path]["label"] == CORRESPONDENCE
+    assert result["profiles"][space_path]["label"] == CANONICAL
     assert result["profiles"][space_path]["pinned"] is True
+
+
+def test_run_pinned_space_reports_observation_drift():
+    """AC 4: a pinned space is never relabeled, but disagreement between
+    the pin and the observed classification IS reported as drift."""
+    space_path = "/CognitiveMemory/facts"
+    sdk, _ = _build_fake_sdk(
+        items_by_space={
+            # correspondence-looking content pinned canonical
+            space_path: [
+                _churny_item("kref://CognitiveMemory/facts/b.conversation", 20),
+                _churny_item("kref://CognitiveMemory/facts/c.conversation", 20),
+            ],
+        },
+        spaces=[FakeSpace(space_path, attributes={"space_class": CANONICAL})],
+    )
+
+    result = _run_profiler(sdk)
+    profile = result["profiles"][space_path]
+    assert profile["label"] == CANONICAL          # pin holds
+    assert profile["observed_label"] == CORRESPONDENCE
+    drift = [d for d in result["drift"] if d["space_path"] == space_path]
+    assert drift and drift[0]["pinned"] is True
+    assert drift[0]["from"] == CANONICAL
+    assert drift[0]["to"] == CORRESPONDENCE
 
 
 def test_run_dry_run_does_not_persist():
@@ -429,20 +597,26 @@ def test_run_dry_run_does_not_persist():
 # ---------------------------------------------------------------------------
 
 
-def test_get_space_profile_round_trip(monkeypatch):
+def _profile_item_fixture():
     profile_kref = "kref://CognitiveMemory/facts/_space_profile.space-profile"
     item = FakeItem(profile_kref)
     item._revisions.append(FakeRevision(
         f"{profile_kref}?r=1",
         metadata={
             "label": CANONICAL,
-            "pinned": "false",
+            "observed_label": WORKING,
+            "pinned": "true",
             "previous_label": WORKING,
             "scores": json.dumps({"churn": 0.1, "evidence": 0.8, "stability": 0.9}),
             "signals": json.dumps({"items_count": 7, "published_share": 0.9}),
         },
+        number=1, latest=True,
     ))
+    return profile_kref, item
 
+
+def test_get_space_profile_round_trip(monkeypatch):
+    profile_kref, item = _profile_item_fixture()
     fake_kumiho = types.ModuleType("kumiho")
     fake_kumiho.get_item = lambda kref: item if kref == profile_kref else None
     monkeypatch.setitem(sys.modules, "kumiho", fake_kumiho)
@@ -450,9 +624,23 @@ def test_get_space_profile_round_trip(monkeypatch):
     profile = get_space_profile("CognitiveMemory", "/CognitiveMemory/facts")
     assert profile is not None
     assert profile.label == CANONICAL
+    assert profile.observed_label == WORKING
+    assert profile.pinned is True
     assert profile.previous_label == WORKING
     assert profile.scores["stability"] == 0.9
     assert profile.signals.items_count == 7
+
+
+def test_get_space_profile_qualifies_relative_path(monkeypatch):
+    """The project argument qualifies project-relative space paths."""
+    profile_kref, item = _profile_item_fixture()
+    fake_kumiho = types.ModuleType("kumiho")
+    fake_kumiho.get_item = lambda kref: item if kref == profile_kref else None
+    monkeypatch.setitem(sys.modules, "kumiho", fake_kumiho)
+
+    profile = get_space_profile("CognitiveMemory", "facts")
+    assert profile is not None
+    assert profile.label == CANONICAL
 
 
 def test_get_space_profile_missing_returns_none(monkeypatch):

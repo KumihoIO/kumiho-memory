@@ -637,6 +637,12 @@ class DreamState:
                 item_kref = item.kref.uri if hasattr(item, "kref") else ""
                 if cursor_item_kref and item_kref == cursor_item_kref:
                     continue
+                # Skip SpaceProfiler bookkeeping items — even in
+                # kind_filter="" mode their fresh unpublished revisions
+                # must never be LLM-assessed (deprecation would corrupt
+                # the profile SUPERSEDES drift chain).
+                if item_kref.endswith(".space-profile"):
+                    continue
 
                 try:
                     # Get the latest revision

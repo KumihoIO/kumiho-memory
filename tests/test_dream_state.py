@@ -1272,3 +1272,35 @@ def test_safe_policy_tags_prefers_cached_snapshot():
         tags = ["evidence:corroborated"]
 
     assert _safe_policy_tags(_TagsAttrOnly()) == ["evidence:corroborated"]
+
+
+def test_collect_revisions_skips_space_profile_items():
+    """kind_filter='' (process all kinds) must still never feed
+    SpaceProfiler bookkeeping items to LLM assessment — their fresh
+    unpublished revisions would be deprecatable."""
+    profile_item, profile_rev = _make_item_with_revision(
+        "kref://CognitiveMemory/facts/_space_profile.space-profile",
+        "kref://CognitiveMemory/facts/_space_profile.space-profile?r=1",
+        {"title": "profile", "label": "working"},
+        created_at="2026-07-01T12:00:00+00:00",
+    )
+    normal_item, normal_rev = _make_item_with_revision(
+        "kref://CognitiveMemory/facts/n.conversation",
+        "kref://CognitiveMemory/facts/n.conversation?r=1",
+        {"title": "normal"},
+        created_at="2026-07-01T12:00:00+00:00",
+    )
+    sdk, client, _ = _build_fake_sdk(
+        spaces=[FakeSpace("/CognitiveMemory/facts")],
+        items_by_space={
+            "/CognitiveMemory/facts": [profile_item, normal_item],
+        },
+    )
+    ds = _make_dream_state(sdk, kind_filter="")
+    try:
+        revisions = ds._collect_revisions(sdk, None)
+        krefs = [r.kref.uri for r in revisions]
+        assert normal_rev.kref.uri in krefs
+        assert profile_rev.kref.uri not in krefs
+    finally:
+        _cleanup_sdk()
