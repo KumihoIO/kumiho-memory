@@ -106,6 +106,7 @@ def cmd_ingest_skill(args: argparse.Namespace) -> int:
             space_name=args.space,
             tags=args.tags,
             dry_run=args.dry_run,
+            evidence_level=args.evidence_level,
         )
         for r in results:
             tag = "[NEW]" if r.created_new_item else "[REV]"
@@ -125,6 +126,7 @@ def cmd_ingest_skill(args: argparse.Namespace) -> int:
             space_name=args.space,
             tags=args.tags,
             dry_run=args.dry_run,
+            evidence_level=args.evidence_level,
         )
         tag = "[NEW]" if result.created_new_item else "[REV]"
         print(f"  {tag} {result.item_name} → {result.revision_kref}")
@@ -156,6 +158,7 @@ def cmd_ingest_skill(args: argparse.Namespace) -> int:
         space_name=args.space,
         section_filter=args.section,
         dry_run=args.dry_run,
+        evidence_level=args.evidence_level,
     )
     for r in results:
         tag = "[NEW]" if r.created_new_item else "[REV]"
@@ -243,6 +246,13 @@ def main(argv: list[str] | None = None) -> int:
         nargs="+",
         default=None,
         help="Additional tags for ingested items",
+    )
+    ingest.add_argument(
+        "--evidence-level",
+        default=None,
+        choices=["official", "corroborated", "single_source", "unverified"],
+        help="Evidence grade stamped as revision metadata + mirrored "
+        "evidence:<level> tag (default: no grade)",
     )
     ingest.add_argument(
         "--list",

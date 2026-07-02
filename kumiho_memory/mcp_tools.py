@@ -221,6 +221,8 @@ def tool_memory_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
             session_id=args.get("session_id"),
             working_memory_limit=args.get("working_memory_limit", 10),
             recall_limit=args.get("recall_limit", 5),
+            evidence_level=args.get("evidence_level"),
+            source=args.get("source"),
         )
     )
 
@@ -240,7 +242,11 @@ def tool_memory_consolidate(args: Dict[str, Any]) -> Dict[str, Any]:
     """Consolidate a session — summarize, redact PII, store to graph."""
     manager = _get_manager()
     return asyncio.run(
-        manager.consolidate_session(session_id=args["session_id"])
+        manager.consolidate_session(
+            session_id=args["session_id"],
+            evidence_level=args.get("evidence_level"),
+            source=args.get("source"),
+        )
     )
 
 
@@ -634,6 +640,23 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "default": 5,
                     "description": "Max long-term memories to recall.",
                 },
+                "evidence_level": {
+                    "type": "string",
+                    "enum": ["official", "corroborated", "single_source", "unverified"],
+                    "description": (
+                        "Evidence grade stamped on the consolidated memory "
+                        "(metadata + mirrored evidence:<level> tag). Stashed "
+                        "in session metadata and applied at consolidation. "
+                        "Omit to leave the memory ungraded."
+                    ),
+                },
+                "source": {
+                    "type": "string",
+                    "description": (
+                        "Source identifier for evidence tracking, e.g. "
+                        "'press-release:acme', 'news:reuters', 'chat:user'."
+                    ),
+                },
             },
             "required": ["user_id", "message"],
         },
@@ -673,6 +696,23 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                 "session_id": {
                     "type": "string",
                     "description": "Session identifier to consolidate.",
+                },
+                "evidence_level": {
+                    "type": "string",
+                    "enum": ["official", "corroborated", "single_source", "unverified"],
+                    "description": (
+                        "Evidence grade stamped on the stored memory "
+                        "(metadata + mirrored evidence:<level> tag). "
+                        "Overrides any grade stashed at ingest time. "
+                        "Omit to leave the memory ungraded."
+                    ),
+                },
+                "source": {
+                    "type": "string",
+                    "description": (
+                        "Source identifier for evidence tracking, e.g. "
+                        "'press-release:acme', 'news:reuters', 'chat:user'."
+                    ),
                 },
             },
             "required": ["session_id"],

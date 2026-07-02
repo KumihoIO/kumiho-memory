@@ -94,9 +94,10 @@ def test_memory_manager_consolidation_calls_store():
             assert artifact_path.endswith(".md")
 
             # Verify space-based subdirectory structure:
-            # StubSummarizer returns topics=["tea"], so space_hint="tea"
-            # Expected path: {tmpdir}/CognitiveMemory/tea/{session}.md
-            expected_dir = os.path.join(tmpdir, "CognitiveMemory", "tea")
+            # session metadata (user_id + context) resolves the space to
+            # personal/user-1 — the topic hint is only a fallback.
+            # Expected path: {tmpdir}/CognitiveMemory/personal/user-1/{session}.md
+            expected_dir = os.path.join(tmpdir, "CognitiveMemory", "personal", "user-1")
             assert os.path.dirname(artifact_path) == expected_dir
 
             content = open(artifact_path, encoding="utf-8").read()
@@ -970,5 +971,315 @@ def test_consolidation_raises_without_queue():
                 assert False, "Should have raised ConnectionError"
             except ConnectionError:
                 pass
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Evidence-level schema tests (issue #9)
+# ---------------------------------------------------------------------------
+
+
+def _make_evidence_manager(buffer, stored, tmpdir):
+    async def store_stub(**kwargs):
+        stored.update(kwargs)
+        return {"item_kref": "kref://memory/item"}
+
+    return UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=store_stub,
+        consolidation_threshold=2,
+        artifact_root=tmpdir,
+    )
+
+
+def test_consolidation_stamps_evidence_from_ingest():
+    """evidence_level/source stashed at ingest survive to the store payload
+    as metadata keys plus the mirrored evidence:<level> tag."""
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    stored = {}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = _make_evidence_manager(buffer, stored, tmpdir)
+
+        async def run():
+            ingest = await manager.ingest_message(
+                user_id="user-ev1",
+                message="Acme announced record earnings.",
+                context="personal",
+                evidence_level="official",
+                source="press-release:acme",
+            )
+            await manager.add_assistant_response(
+                session_id=ingest["session_id"],
+                response="Noted.",
+            )
+            result = await manager.consolidate_session(session_id=ingest["session_id"])
+            assert result["success"] is True
+            assert stored["metadata"]["evidence_level"] == "official"
+            assert stored["metadata"]["source"] == "press-release:acme"
+            assert "evidence:official" in stored["tags"]
+            assert "summarized" in stored["tags"]
+            assert "published" in stored["tags"]
+
+        asyncio.run(run())
+
+
+def test_consolidation_explicit_evidence_overrides_session():
+    """An explicit consolidate_session arg wins over ingest-time metadata."""
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    stored = {}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = _make_evidence_manager(buffer, stored, tmpdir)
+
+        async def run():
+            ingest = await manager.ingest_message(
+                user_id="user-ev2",
+                message="Some rumor.",
+                context="personal",
+                evidence_level="unverified",
+            )
+            await manager.add_assistant_response(
+                session_id=ingest["session_id"],
+                response="Noted.",
+            )
+            await manager.consolidate_session(
+                session_id=ingest["session_id"],
+                evidence_level="corroborated",
+                source="news:reuters",
+            )
+            assert stored["metadata"]["evidence_level"] == "corroborated"
+            assert stored["metadata"]["source"] == "news:reuters"
+            assert "evidence:corroborated" in stored["tags"]
+            assert "evidence:unverified" not in stored["tags"]
+
+        asyncio.run(run())
+
+
+def test_consolidation_without_evidence_is_unchanged():
+    """No evidence provided -> no evidence keys, tag set untouched."""
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    stored = {}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = _make_evidence_manager(buffer, stored, tmpdir)
+
+        async def run():
+            ingest = await manager.ingest_message(
+                user_id="user-ev3",
+                message="I like tea.",
+                context="personal",
+            )
+            await manager.add_assistant_response(
+                session_id=ingest["session_id"],
+                response="Green tea is best.",
+            )
+            await manager.consolidate_session(session_id=ingest["session_id"])
+            assert stored["tags"] == ["summarized", "published"]
+            assert "evidence_level" not in stored["metadata"]
+            assert "source" not in stored["metadata"]
+
+        asyncio.run(run())
+
+
+def test_ingest_rejects_unknown_evidence_level():
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+
+    async def run():
+        try:
+            await manager.ingest_message(
+                user_id="user-ev4",
+                message="Whatever.",
+                evidence_level="rumor",
+            )
+            assert False, "Should have raised ValueError"
+        except ValueError:
+            pass
+
+    asyncio.run(run())
+
+
+def test_fetch_revision_metadata_exposes_evidence(monkeypatch):
+    """Round-trip read side: recall entries surface evidence_level/source
+    metadata and the mirrored tag; ungraded revisions gain no new keys."""
+    import sys
+    import types
+
+    class FakeRevision:
+        def __init__(self, metadata, tags):
+            self.metadata = metadata
+            self.tags = tags
+            self.created_at = "2026-07-02T00:00:00Z"
+
+    revisions = {
+        "kref://memory/item/rev/graded": FakeRevision(
+            {"title": "Graded", "summary": "S", "evidence_level": "official",
+             "source": "press-release:acme"},
+            ["published", "evidence:official"],
+        ),
+        "kref://memory/item/rev/plain": FakeRevision(
+            {"title": "Plain", "summary": "S"},
+            ["published"],
+        ),
+    }
+
+    fake_kumiho = types.ModuleType("kumiho")
+    fake_kumiho.get_revision = lambda kref: revisions[kref]
+    monkeypatch.setitem(sys.modules, "kumiho", fake_kumiho)
+
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+
+    async def run():
+        graded = await manager._fetch_revision_metadata(
+            "kref://memory/item/rev/graded", load_artifacts=False,
+        )
+        assert graded["evidence_level"] == "official"
+        assert graded["source"] == "press-release:acme"
+        assert "evidence:official" in graded["tags"]
+
+        plain = await manager._fetch_revision_metadata(
+            "kref://memory/item/rev/plain", load_artifacts=False,
+        )
+        assert "evidence_level" not in plain
+        assert "source" not in plain
+
+    asyncio.run(run())
+
+
+def test_recall_memories_exposes_evidence_via_public_api(monkeypatch):
+    """Full round-trip through the PUBLIC recall path: memory_retrieve
+    returns krefs, recall_memories() results expose the evidence grade."""
+    import sys
+    import types
+
+    class FakeRevision:
+        def __init__(self, metadata, tags):
+            self.metadata = metadata
+            self.tags = tags
+            self.created_at = "2026-07-02T00:00:00Z"
+
+    revisions = {
+        "kref://memory/item/rev/official": FakeRevision(
+            {"title": "Official", "summary": "S", "evidence_level": "official",
+             "source": "press-release:acme"},
+            ["published", "evidence:official"],
+        ),
+    }
+
+    fake_kumiho = types.ModuleType("kumiho")
+    fake_kumiho.get_revision = lambda kref: revisions[kref]
+    monkeypatch.setitem(sys.modules, "kumiho", fake_kumiho)
+
+    async def retrieve_stub(**kwargs):
+        return {
+            "revision_krefs": ["kref://memory/item/rev/official"],
+            "scores": [0.9],
+        }
+
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+        memory_retrieve=retrieve_stub,
+    )
+
+    async def run():
+        results = await manager.recall_memories("acme earnings")
+        assert len(results) == 1
+        assert results[0]["evidence_level"] == "official"
+        assert results[0]["source"] == "press-release:acme"
+        assert "evidence:official" in results[0]["tags"]
+
+    asyncio.run(run())
+
+
+def test_consolidation_empty_string_evidence_behaves_like_none():
+    """evidence_level='' must not cancel the ingest-stashed grade —
+    it behaves like None and the session fallback still applies."""
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    stored = {}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = _make_evidence_manager(buffer, stored, tmpdir)
+
+        async def run():
+            ingest = await manager.ingest_message(
+                user_id="user-ev5",
+                message="Official statement.",
+                context="personal",
+                evidence_level="official",
+                source="press-release:acme",
+            )
+            await manager.add_assistant_response(
+                session_id=ingest["session_id"],
+                response="Noted.",
+            )
+            await manager.consolidate_session(
+                session_id=ingest["session_id"],
+                evidence_level="",
+                source="",
+            )
+            assert stored["metadata"]["evidence_level"] == "official"
+            assert stored["metadata"]["source"] == "press-release:acme"
+            assert "evidence:official" in stored["tags"]
+
+        asyncio.run(run())
+
+
+def test_evidence_on_later_message_preserves_session_identity():
+    """Evidence provided on a non-first message must not wipe the
+    user_id/context stashed at message 1 (merge, not replace)."""
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    stored = {}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = _make_evidence_manager(buffer, stored, tmpdir)
+
+        async def run():
+            ingest = await manager.ingest_message(
+                user_id="user-ev6",
+                message="First message, no evidence.",
+                context="personal",
+            )
+            session_id = ingest["session_id"]
+            await manager.ingest_message(
+                user_id="user-ev6",
+                message="Second message with evidence.",
+                context="personal",
+                session_id=session_id,
+                evidence_level="single_source",
+                source="news:reuters",
+            )
+            meta = await buffer.get_session_metadata(manager.project, session_id)
+            assert meta["user_id"] == "user-ev6"
+            assert meta["context"] == "personal"
+            assert meta["evidence_level"] == "single_source"
+            assert meta["source"] == "news:reuters"
 
         asyncio.run(run())

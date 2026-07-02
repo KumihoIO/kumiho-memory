@@ -863,3 +863,79 @@ class TestEdgeCases:
         result = IngestResult(item_name="i", item_kref="k", revision_kref="r")
         assert result.artifact_kref is None
         assert result.created_new_item is False
+
+
+# ---------------------------------------------------------------------------
+# Tests — evidence-level stamping (issue #9)
+# ---------------------------------------------------------------------------
+
+
+class TestIngestEvidence(TestIngestSkillWithMock):
+    """Evidence grade lands in revision metadata + mirrored graph tag."""
+
+    def test_ingest_skill_stamps_evidence(self, monkeypatch):
+        space = self._setup_mocks(monkeypatch)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+            f.write(MINIMAL_SKILL)
+            f.flush()
+            path = f.name
+
+        try:
+            ingest_skill(path, evidence_level="official")
+            for item in space._items.values():
+                rev = item._revisions[-1]
+                assert rev.metadata["evidence_level"] == "official"
+                assert "published" in rev._tags
+                assert "evidence:official" in rev._tags
+        finally:
+            os.unlink(path)
+
+    def test_ingest_skill_without_evidence_unchanged(self, monkeypatch):
+        space = self._setup_mocks(monkeypatch)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+            f.write(MINIMAL_SKILL)
+            f.flush()
+            path = f.name
+
+        try:
+            ingest_skill(path)
+            for item in space._items.values():
+                rev = item._revisions[-1]
+                assert "evidence_level" not in rev.metadata
+                assert rev._tags == ["published"]
+        finally:
+            os.unlink(path)
+
+    def test_ingest_file_stamps_evidence(self, monkeypatch):
+        space = self._setup_mocks(monkeypatch)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+            f.write(REFERENCE_DOC)
+            f.flush()
+            path = f.name
+
+        try:
+            ingest_file(path, item_name="ref-doc", evidence_level="corroborated")
+            rev = space._items["ref-doc"]._revisions[-1]
+            assert rev.metadata["evidence_level"] == "corroborated"
+            assert "evidence:corroborated" in rev._tags
+        finally:
+            os.unlink(path)
+
+    def test_ingest_rejects_unknown_evidence_level(self, monkeypatch):
+        self._setup_mocks(monkeypatch)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+            f.write(REFERENCE_DOC)
+            f.flush()
+            path = f.name
+
+        try:
+            with pytest.raises(ValueError, match="Unknown evidence level"):
+                ingest_file(path, item_name="ref-doc", evidence_level="rumor")
+            with pytest.raises(ValueError, match="Unknown evidence level"):
+                ingest_skill(path, evidence_level="rumor")
+        finally:
+            os.unlink(path)

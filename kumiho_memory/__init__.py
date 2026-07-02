@@ -26,6 +26,16 @@ from kumiho_memory.assessors import (
     create_llm_assessor,
     heuristic_prefilter,
 )
+from kumiho_memory.evidence import (
+    CORROBORATED,
+    DEFAULT_EVIDENCE_LEVEL,
+    EVIDENCE_LEVELS,
+    OFFICIAL,
+    SINGLE_SOURCE,
+    UNVERIFIED,
+    evidence_tag,
+    parse_evidence,
+)
 
 __all__ = [
     "__version__",
@@ -51,4 +61,12 @@ __all__ = [
     "DEFAULT_STORAGE_POLICY",
     "create_llm_assessor",
     "heuristic_prefilter",
+    "OFFICIAL",
+    "CORROBORATED",
+    "SINGLE_SOURCE",
+    "UNVERIFIED",
+    "EVIDENCE_LEVELS",
+    "DEFAULT_EVIDENCE_LEVEL",
+    "evidence_tag",
+    "parse_evidence",
 ]

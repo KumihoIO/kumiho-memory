@@ -691,3 +691,76 @@ def test_memory_dream_state_accepts_gemini_and_base_url():
         assert "base_url" in dream_tool["inputSchema"]["properties"]
     finally:
         sys.modules.pop("kumiho", None)
+
+
+# ---------------------------------------------------------------------------
+# Tests — evidence-level plumbing (issue #9)
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_and_consolidate_schemas_accept_evidence():
+    """Both lifecycle tools expose optional evidence_level/source args."""
+    by_name = {tool["name"]: tool for tool in MEMORY_TOOLS}
+    for name in ("kumiho_memory_ingest", "kumiho_memory_consolidate"):
+        props = by_name[name]["inputSchema"]["properties"]
+        assert "evidence_level" in props, f"{name} missing evidence_level"
+        assert props["evidence_level"]["enum"] == [
+            "official", "corroborated", "single_source", "unverified",
+        ]
+        assert "source" in props, f"{name} missing source"
+        # Optional — must not be required
+        required = by_name[name]["inputSchema"].get("required", [])
+        assert "evidence_level" not in required
+        assert "source" not in required
+
+
+def test_memory_ingest_forwards_evidence_to_consolidation():
+    """Evidence passed to the ingest tool is stamped on the stored memory."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            manager, stored = _install_test_manager(tmpdir)
+            ingest = tool_memory_ingest({
+                "user_id": "user-mcp-ev",
+                "message": "Acme shipped v2.0",
+                "evidence_level": "official",
+                "source": "press-release:acme",
+            })
+            tool_memory_add_response({
+                "session_id": ingest["session_id"],
+                "response": "Recorded.",
+            })
+            result = tool_memory_consolidate({
+                "session_id": ingest["session_id"],
+            })
+            assert result["success"] is True
+            assert stored["metadata"]["evidence_level"] == "official"
+            assert stored["metadata"]["source"] == "press-release:acme"
+            assert "evidence:official" in stored["tags"]
+        finally:
+            _cleanup_manager()
+
+
+def test_memory_consolidate_accepts_explicit_evidence():
+    """Evidence passed directly to the consolidate tool is stamped."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            manager, stored = _install_test_manager(tmpdir)
+            ingest = tool_memory_ingest({
+                "user_id": "user-mcp-ev2",
+                "message": "Two outlets report the same numbers",
+            })
+            tool_memory_add_response({
+                "session_id": ingest["session_id"],
+                "response": "Recorded.",
+            })
+            result = tool_memory_consolidate({
+                "session_id": ingest["session_id"],
+                "evidence_level": "corroborated",
+                "source": "news:reuters",
+            })
+            assert result["success"] is True
+            assert stored["metadata"]["evidence_level"] == "corroborated"
+            assert stored["metadata"]["source"] == "news:reuters"
+            assert "evidence:corroborated" in stored["tags"]
+        finally:
+            _cleanup_manager()

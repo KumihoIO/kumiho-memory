@@ -42,6 +42,12 @@ class FakeRedis:
         self.storage[key] = current
         return current
 
+    async def hset(self, key, mapping):
+        self.storage.setdefault(key, {}).update(mapping)
+
+    async def hgetall(self, key):
+        return dict(self.storage.get(key, {}))
+
     async def close(self):
         return None
 

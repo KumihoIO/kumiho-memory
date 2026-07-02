@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from kumiho_memory.evidence import EVIDENCE_LEVELS, evidence_tag
 from kumiho_memory.privacy import PIIRedactor
 from kumiho_memory.redis_memory import RedisMemoryBuffer
 from kumiho_memory.retry import RetryQueue, retry_with_backoff
@@ -218,7 +219,11 @@ class UniversalMemoryManager:
         context: str = "personal",
         session_id: Optional[str] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        evidence_level: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if evidence_level:
+            evidence_tag(evidence_level)  # validate early — raises ValueError
         resolved_session_id = session_id or await self._generate_session_id(user_id, context)
 
         metadata: Dict[str, Any] = {
@@ -243,12 +248,31 @@ class UniversalMemoryManager:
 
         # Persist user_id and context as session metadata so that
         # consolidate_session can derive the storage space automatically.
-        if result.get("message_count", 0) == 1:
+        # Evidence grading (evidence_level/source) is stashed the same way
+        # and applied to the stored revision at consolidation time — no
+        # revision exists to tag during ingest.
+        session_meta: Dict[str, str] = {}
+        is_first_message = result.get("message_count", 0) == 1
+        if is_first_message:
+            session_meta.update({"user_id": user_id, "context": context})
+        if evidence_level:
+            session_meta["evidence_level"] = evidence_level
+        if source:
+            session_meta["source"] = source
+        if session_meta:
             try:
+                if not is_first_message:
+                    # Partial update (evidence on a later message): merge
+                    # with the stored metadata so backends that replace
+                    # rather than merge (proxy mode) keep user_id/context.
+                    existing = await self.redis_buffer.get_session_metadata(
+                        self.project, resolved_session_id,
+                    ) or {}
+                    session_meta = {**existing, **session_meta}
                 await self.redis_buffer.set_session_metadata(
                     self.project,
                     resolved_session_id,
-                    {"user_id": user_id, "context": context},
+                    session_meta,
                 )
             except Exception as exc:
                 logger.warning(
@@ -392,6 +416,8 @@ class UniversalMemoryManager:
         session_id: Optional[str] = None,
         working_memory_limit: int = 10,
         recall_limit: int = 5,
+        evidence_level: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> Dict[str, Any]:
         ingest_result = await self.ingest_message(
             user_id=user_id,
@@ -400,6 +426,8 @@ class UniversalMemoryManager:
             channel=channel,
             context=context,
             session_id=session_id,
+            evidence_level=evidence_level,
+            source=source,
         )
         session_id = ingest_result["session_id"]
 
@@ -430,7 +458,16 @@ class UniversalMemoryManager:
         user_id: Optional[str] = None,
         context: Optional[str] = None,
         stack_revisions: Optional[bool] = None,
+        evidence_level: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # Empty string behaves like None (consistent with ingest_message) —
+        # otherwise "" would silently cancel an ingest-stashed grade while
+        # bypassing both validation and the session-metadata fallback.
+        evidence_level = evidence_level or None
+        source = source or None
+        if evidence_level:
+            evidence_tag(evidence_level)  # validate early — raises ValueError
         messages_result = await self.redis_buffer.get_messages(
             project=self.project,
             session_id=session_id,
@@ -449,15 +486,18 @@ class UniversalMemoryManager:
         resolved_space: Optional[str] = space_path
         session_user_id: Optional[str] = user_id
         session_context: Optional[str] = context  # may be overridden from metadata below
+        session_meta: Dict[str, str] = {}
+        session_meta_fetched = False
         if not resolved_space and session_user_id:
             resolved_space = (
                 f"{context}/{session_user_id}" if context else session_user_id
             )
         if not resolved_space:
+            session_meta_fetched = True
             try:
                 session_meta = await self.redis_buffer.get_session_metadata(
                     self.project, session_id,
-                )
+                ) or {}
                 session_user_id = session_meta.get("user_id")
                 session_context = session_meta.get("context", "") or session_context
                 if session_user_id:
@@ -472,6 +512,35 @@ class UniversalMemoryManager:
                     "falling back to topic-based hint",
                     session_id, exc,
                 )
+
+        # Resolve evidence grade.  Explicit args take precedence over
+        # session metadata stashed at ingest time; values from Redis are
+        # sanitized rather than raised so bad data never blocks
+        # consolidation.  The fetch is skipped when the space-resolution
+        # block above already loaded the metadata (even if empty) — one
+        # roundtrip per consolidation at most.
+        resolved_evidence: Optional[str] = evidence_level
+        resolved_source: Optional[str] = source
+        if (resolved_evidence is None or resolved_source is None) and not session_meta_fetched:
+            try:
+                session_meta = await self.redis_buffer.get_session_metadata(
+                    self.project, session_id,
+                ) or {}
+            except Exception as exc:
+                logger.debug(
+                    "Failed to load session evidence metadata for %s: %s",
+                    session_id, exc,
+                )
+        if resolved_evidence is None:
+            resolved_evidence = session_meta.get("evidence_level") or None
+        if resolved_source is None:
+            resolved_source = session_meta.get("source") or None
+        if resolved_evidence and resolved_evidence not in EVIDENCE_LEVELS:
+            logger.warning(
+                "Ignoring unknown evidence_level %r for session %s",
+                resolved_evidence, session_id,
+            )
+            resolved_evidence = None
 
         # Run summarization (full model) and implications (light model)
         # in parallel — implications don't depend on the summary result.
@@ -684,6 +753,16 @@ class UniversalMemoryManager:
                 payload["space_hint"] = topic_hint
             if session_user_id:
                 payload["metadata"]["user_id"] = session_user_id
+
+            # Evidence grade: canonical metadata key + mirrored graph tag
+            # (tags get server-side time-range history).  Only stamped
+            # when a grade was provided — unmarked memories keep the
+            # existing tag set.
+            if resolved_evidence:
+                payload["metadata"]["evidence_level"] = resolved_evidence
+                payload["tags"].append(evidence_tag(resolved_evidence))
+            if resolved_source:
+                payload["metadata"]["source"] = resolved_source
 
             if all_attachments:
                 payload["metadata"]["attachments"] = all_attachments
@@ -1328,6 +1407,12 @@ class UniversalMemoryManager:
                 "created_at": getattr(revision, "created_at", ""),
                 "tags": getattr(revision, "tags", []),
             }
+            # Evidence grade (issue #9 schema) — only set when the
+            # revision carries it, so ungraded results stay unchanged.
+            if meta.get("evidence_level"):
+                entry["evidence_level"] = meta["evidence_level"]
+            if meta.get("source"):
+                entry["source"] = meta["source"]
 
             # Read the raw conversation from the local artifact file.
             if load_artifacts:

@@ -46,6 +46,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from kumiho_memory.evidence import evidence_tag
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -276,6 +278,7 @@ def ingest_skill(
     space_name: str = "Skills",
     section_filter: Optional[str] = None,
     dry_run: bool = False,
+    evidence_level: Optional[str] = None,
 ) -> list[IngestResult]:
     """Parse a SKILL.md and ingest all non-inline sections into the graph.
 
@@ -285,10 +288,15 @@ def ingest_skill(
         space_name: Space within the project (created if missing).
         section_filter: If set, only ingest the section with this slug name.
         dry_run: If ``True``, parse and log but don't call the Kumiho API.
+        evidence_level: Optional evidence grade (see
+            :mod:`kumiho_memory.evidence`) stamped as revision metadata
+            plus the mirrored ``evidence:<level>`` tag.
 
     Returns:
         List of :class:`IngestResult` — one per ingested section.
     """
+    if evidence_level:
+        evidence_tag(evidence_level)  # validate early — raises ValueError
     parsed = parse_skill(path)
     source_file = parsed.source_path or Path(path).resolve()
 
@@ -337,6 +345,7 @@ def ingest_skill(
             skill_description=parsed.description,
             skill_tags=parsed.tags,
             source_file=source_file,
+            evidence_level=evidence_level,
         )
         results.append(result)
         logger.info("Ingested: %s → %s", section.name, result.revision_kref)
@@ -369,6 +378,7 @@ def _ingest_section(
     skill_description: str,
     skill_tags: list[str],
     source_file: Path,
+    evidence_level: Optional[str] = None,
 ) -> IngestResult:
     """Ingest a single section as an item + revision + artifact."""
     kref_uri = f"kref://{project}/{space_name}/{section.name}.skill"
@@ -393,6 +403,8 @@ def _ingest_section(
         "source_skill": skill_name,
         "content": section.content,
     }
+    if evidence_level:
+        metadata["evidence_level"] = evidence_level
     revision = item.create_revision(metadata=metadata)
 
     # 3. Attach source file as artifact
@@ -407,6 +419,8 @@ def _ingest_section(
 
     # 4. Tag as published (server auto-moves from previous revision)
     revision.tag("published")
+    if evidence_level:
+        revision.tag(evidence_tag(evidence_level))
 
     return IngestResult(
         item_name=section.name,
@@ -430,6 +444,7 @@ def ingest_file(
     space_name: str = "Skills",
     tags: Optional[list[str]] = None,
     dry_run: bool = False,
+    evidence_level: Optional[str] = None,
 ) -> IngestResult:
     """Ingest a standalone markdown file as a single skill item.
 
@@ -440,10 +455,15 @@ def ingest_file(
         space_name: Space within the project.
         tags: Additional tags (``["skill"]`` is always included).
         dry_run: Parse and log only.
+        evidence_level: Optional evidence grade (see
+            :mod:`kumiho_memory.evidence`) stamped as revision metadata
+            plus the mirrored ``evidence:<level>`` tag.
 
     Returns:
         :class:`IngestResult` for the ingested item.
     """
+    if evidence_level:
+        evidence_tag(evidence_level)  # validate early — raises ValueError
     path = Path(path).resolve()
     text = path.read_text(encoding="utf-8")
 
@@ -493,13 +513,16 @@ def ingest_file(
         else:
             raise
 
-    revision = item.create_revision(metadata={
+    file_metadata = {
         "title": title,
         "summary": summary or f"Reference: {title}",
         "tags": json.dumps(all_tags),
         "agent_compat": json.dumps(["claude", "zeroclaw", "openclaw"]),
         "content": text,
-    })
+    }
+    if evidence_level:
+        file_metadata["evidence_level"] = evidence_level
+    revision = item.create_revision(metadata=file_metadata)
 
     artifact = revision.create_artifact(
         name=path.name,
@@ -507,6 +530,8 @@ def ingest_file(
     )
 
     revision.tag("published")
+    if evidence_level:
+        revision.tag(evidence_tag(evidence_level))
 
     return IngestResult(
         item_name=item_name,
@@ -529,6 +554,7 @@ def ingest_batch(
     space_name: str = "Skills",
     tags: Optional[list[str]] = None,
     dry_run: bool = False,
+    evidence_level: Optional[str] = None,
 ) -> list[IngestResult]:
     """Ingest all ``.md`` files in a directory as standalone skill items.
 
@@ -538,6 +564,7 @@ def ingest_batch(
         space_name: Space within the project.
         tags: Additional tags for all items.
         dry_run: Parse and log only.
+        evidence_level: Optional evidence grade applied to every file.
 
     Returns:
         List of :class:`IngestResult` — one per file.
@@ -559,6 +586,7 @@ def ingest_batch(
             space_name=space_name,
             tags=tags,
             dry_run=dry_run,
+            evidence_level=evidence_level,
         )
         results.append(result)
 
