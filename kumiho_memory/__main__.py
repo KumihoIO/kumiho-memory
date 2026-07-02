@@ -192,6 +192,23 @@ def cmd_dream(args: argparse.Namespace) -> int:
     return 1 if errors else 0
 
 
+def cmd_profile(args: argparse.Namespace) -> int:
+    """Run a SpaceProfiler pass (pure aggregation, no LLM)."""
+    from kumiho_memory import SpaceProfiler
+
+    profiler = SpaceProfiler(
+        project=args.project,
+        window_days=args.window_days,
+        dry_run=args.dry_run,
+    )
+
+    result = asyncio.run(profiler.run())
+
+    print(json.dumps(result, indent=2, default=str))
+    errors = result.get("errors", [])
+    return 1 if errors else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kumiho-memory",
@@ -307,6 +324,31 @@ def main(argv: list[str] | None = None) -> int:
         "(overrides KUMIHO_DREAM_EXTRA_INSTRUCTIONS; pass '' to disable it)",
     )
 
+    # -- profile subcommand --
+    profile = sub.add_parser(
+        "profile",
+        help="Profile each Space's knowledge dynamics (SpaceProfiler)",
+        description="Aggregate per-Space churn/evidence/stability signals, "
+        "classify each Space (canonical/working/correspondence), and persist "
+        "versioned space-profile items. Pure aggregation — no LLM.",
+    )
+    profile.add_argument(
+        "--project",
+        default="CognitiveMemory",
+        help="Kumiho project name (default: CognitiveMemory)",
+    )
+    profile.add_argument(
+        "--window-days",
+        type=int,
+        default=30,
+        help="Look-back window for the revision-rate signal (default: 30)",
+    )
+    profile.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Classify but do not persist profiles",
+    )
+
     parsed = parser.parse_args(argv)
 
     # Configure logging
@@ -320,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_ingest_skill(parsed)
     elif parsed.command == "dream":
         return cmd_dream(parsed)
+    elif parsed.command == "profile":
+        return cmd_profile(parsed)
 
     parser.print_help()
     return 0

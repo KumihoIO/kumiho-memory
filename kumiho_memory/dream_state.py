@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from kumiho_memory import _graph_walk as _walk
 from kumiho_memory.summarization import (
     LLMAdapter,
     MemorySummarizer,
@@ -554,88 +555,19 @@ class DreamState:
 
     def _list_project_spaces(self, project: Any) -> List[Any]:
         """Enumerate project spaces without relying on one recursive RPC."""
-        root_path = f"/{self.project}"
-        discovered: List[Any] = []
-        seen_paths = set()
-        pending_paths = [root_path]
-
-        while pending_paths:
-            parent_path = pending_paths.pop(0)
-            cursor: Optional[str] = None
-
-            while True:
-                try:
-                    page = project.get_spaces(
-                        parent_path=parent_path,
-                        recursive=False,
-                        page_size=self.space_page_size,
-                        cursor=cursor,
-                    )
-                except TypeError:
-                    # Older SDK stubs/tests only support the legacy recursive API.
-                    spaces = list(project.get_spaces(recursive=True))
-                    logger.info(
-                        "Dream State: using legacy recursive space enumeration "
-                        "for project %s",
-                        self.project,
-                    )
-                    return spaces
-                except Exception as exc:
-                    raise RuntimeError(
-                        "Failed to list child spaces under "
-                        f"'{parent_path}' (cursor={cursor or '-'})"
-                    ) from exc
-
-                children = list(page)
-                for space in children:
-                    path = getattr(space, "path", "")
-                    if not path or path in seen_paths:
-                        continue
-                    seen_paths.add(path)
-                    discovered.append(space)
-                    pending_paths.append(path)
-
-                cursor = getattr(page, "next_cursor", None)
-                if not cursor:
-                    break
-
-        return discovered
+        return _walk.list_project_spaces(
+            project, self.project, page_size=self.space_page_size,
+        )
 
     def _list_space_items(self, sdk: Any, space_path: str) -> List[Any]:
         """List items in a space in bounded pages to avoid RPC deadlines."""
-        client = sdk.get_client()
-        kind_arg = self.kind_filter if self.kind_filter else ""
-        collected: List[Any] = []
-        cursor: Optional[str] = None
-
-        while True:
-            try:
-                page = client.get_items(
-                    parent_path=space_path,
-                    kind_filter=kind_arg,
-                    page_size=self.item_page_size,
-                    cursor=cursor,
-                    include_deprecated=False,
-                )
-            except TypeError:
-                page = client.get_items(
-                    parent_path=space_path,
-                    kind_filter=kind_arg,
-                    include_deprecated=False,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Failed to list items in "
-                    f"'{space_path}' (cursor={cursor or '-'})"
-                ) from exc
-
-            collected.extend(list(page))
-
-            cursor = getattr(page, "next_cursor", None)
-            if not cursor:
-                break
-
-        return collected
+        return _walk.list_space_items(
+            sdk,
+            space_path,
+            kind_filter=self.kind_filter if self.kind_filter else "",
+            page_size=self.item_page_size,
+            include_deprecated=False,
+        )
 
     def _collect_revisions(
         self, sdk: Any, last_run_at: Optional[str]

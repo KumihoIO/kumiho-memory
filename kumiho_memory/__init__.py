@@ -21,6 +21,13 @@ from kumiho_memory.privacy import PIIRedactor, CredentialDetectedError
 from kumiho_memory.retry import RetryQueue
 from kumiho_memory.dream_state import DreamState, MemoryAssessment, DreamStateStats
 from kumiho_memory.graph_augmentation import GraphAugmentedRecall, GraphAugmentationConfig
+from kumiho_memory.space_profiler import (
+    SPACE_CLASSES,
+    SpaceProfile,
+    SpaceProfiler,
+    SpaceSignals,
+    get_space_profile,
+)
 from kumiho_memory.assessors import (
     DEFAULT_STORAGE_POLICY,
     EvidencePolicy,
@@ -83,4 +90,9 @@ __all__ = [
     "EvidenceRankConfig",
     "apply_evidence_weights",
     "evidence_badge",
+    "SPACE_CLASSES",
+    "SpaceProfile",
+    "SpaceProfiler",
+    "SpaceSignals",
+    "get_space_profile",
 ]

@@ -391,6 +391,18 @@ def tool_memory_store_execution(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def tool_memory_space_profile(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Profile each Space's knowledge dynamics (no LLM)."""
+    from kumiho_memory import SpaceProfiler
+
+    profiler = SpaceProfiler(
+        project=args.get("project", "CognitiveMemory"),
+        window_days=args.get("window_days", 30),
+        dry_run=args.get("dry_run", False),
+    )
+    return asyncio.run(profiler.run())
+
+
 def tool_memory_dream_state(args: Dict[str, Any]) -> Dict[str, Any]:
     """Run a Dream State memory consolidation cycle."""
     from kumiho_memory import DreamState
@@ -1206,6 +1218,37 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "kumiho_memory_space_profile",
+        "description": (
+            "Profile each Space's knowledge dynamics: aggregate churn/"
+            "evidence/stability signals, classify Spaces as canonical/"
+            "working/correspondence, and persist versioned space-profile "
+            "items. Pure aggregation — no LLM calls. A space_class Space "
+            "attribute pins the label (drift is then reported only). Use "
+            "dry_run=true to classify without persisting."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "default": "CognitiveMemory",
+                    "description": "Kumiho project to profile.",
+                },
+                "window_days": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "Look-back window for the revision-rate signal.",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Classify but do not persist profiles.",
+                },
+            },
+        },
+    },
 ]
 
 
@@ -1226,4 +1269,5 @@ MEMORY_TOOL_HANDLERS: Dict[str, Any] = {
     "kumiho_memory_reflect": tool_memory_reflect,
     "kumiho_memory_store_execution": tool_memory_store_execution,
     "kumiho_memory_dream_state": tool_memory_dream_state,
+    "kumiho_memory_space_profile": tool_memory_space_profile,
 }

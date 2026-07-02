@@ -282,6 +282,61 @@ applies to the **adjusted** score — an `unverified` memory sitting just
 above the threshold can drop below it. That is the intended screening
 behavior; use `_base_score` if you need the raw retrieval score.
 
+#### Space profiles (per-collection extraction strategy)
+
+A collection's observed dynamics are a signal about what kind of
+knowledge lives in it. `SpaceProfiler` aggregates per-Space statistics
+from existing SDK queries (pure aggregation, **no LLM**):
+
+| signal | source |
+|---|---|
+| churn | revisions per item, revision rate in the window (`latest` tag-move proxy), SUPERSEDES chain depth |
+| evidence histogram | `evidence_level` metadata per revision |
+| deprecation ratio | `deprecated` flags on items/revisions |
+| stability | published share, median revision age |
+
+…and classifies each Space:
+
+| label | meaning | thresholds |
+|---|---|---|
+| `canonical` | established concepts | stability ≥ 0.6 and churn ≤ 0.4 |
+| `correspondence` | claims / requests / responses | churn ≥ 0.6 and stability ≤ 0.4 |
+| `working` | active projects/notes | everything else |
+
+The profile persists as a `kind="space-profile"` Item — one per Space,
+one revision per run, with `SUPERSEDES` edges linking runs so profile
+drift is itself a versioned chain. A Space owner pins the label with the
+`space_class` Space attribute; the profiler then reports drift only.
+
+```bash
+kumiho-memory profile --dry-run          # classify without persisting
+kumiho-memory profile --window-days 14
+```
+
+MCP tool: `kumiho_memory_space_profile`. Read side for strategy
+consumers (assessor / Dream State policy / recall):
+
+```python
+from kumiho_memory import get_space_profile
+
+profile = get_space_profile("CognitiveMemory", "/CognitiveMemory/news")
+if profile and profile.label == "correspondence":
+    # e.g. store claims as events, never promote to fact
+    ...
+```
+
+The extraction rule this enables: **in `correspondence` spaces, claims
+are events, not facts** — store them attributed ("X claimed Y on DATE")
+and raise corroboration thresholds, instead of promoting them into the
+belief set. (Consumption hooks land with the assessor/Dream State/recall
+pieces of the epic; the profiler + `get_space_profile` are the
+foundation.)
+
+Note: true `latest` tag-move counting is not possible client-side (the
+SDK exposes point-in-time tag resolution, not tag-move events) —
+revision-creation frequency is the documented proxy, valid because
+`latest` moves on every `create_revision`.
+
 ---
 
 ### Roadmap
