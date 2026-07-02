@@ -2,24 +2,29 @@
 
 ---
 
-## Experimental client-side utilities for AI agent memory integration
+## Client-side memory provider for AI agents — working memory, consolidation, and belief revision on the Kumiho Cognitive Memory graph
 
 ---
 
-### ⚠️ Status
+### Status
 
-> **Experimental / Preview (0.1.x)**
-> This package is provided for early experimentation and reference usage.
-> APIs and behavior may change without notice.
-> Latest patch: `0.1.2` (2026-02-09) - README refresh and version metadata sync.
+> **Beta (0.6.x)**
+> Actively developed; the public API is stabilizing but may still change
+> between minor versions.
+> Latest release: `0.6.0` (2026-07-02) — Level-of-Evidence belief revision:
+> evidence grading, a corroboration-aware assessor, Dream State policy
+> injection, evidence-weighted recall, and per-Space knowledge profiles.
+> See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the full history.
 
 ---
 
 ### What this package is
 
-`kumiho-memory` provides **client-side utilities** that help AI agents
-temporarily buffer interaction context and interface with the broader
-Kumiho Cognitive Memory architecture.
+`kumiho-memory` is a **client-side memory provider**: it buffers working
+memory in Redis, consolidates conversations into the Kumiho Cognitive
+Memory graph, and layers belief-revision policy (evidence grading,
+corroboration, deployment-controlled deprecation) on top — all without
+requiring changes to the Kumiho server.
 
 It is designed to be:
 
@@ -28,45 +33,63 @@ It is designed to be:
 * Framework-agnostic
 * Safe to use in local or sandboxed environments
 
----
-
 ### What this package is NOT
 
-To avoid confusion, this package **does NOT** implement:
+`kumiho-memory` is a client of the Kumiho graph, not the graph itself:
 
-* ❌ A full cognitive memory system
-* ❌ Long-term memory graphs or lineage tracking
-* ❌ Memory consolidation or offline processing
-* ❌ Automated belief revision or pruning
-* ❌ The "Dream State" consolidation pipeline
+* ❌ It does not implement the graph store, hybrid search, or edge
+  storage — that's the Kumiho server (`kumiho-server`), reached through
+  the core `kumiho` SDK.
+* ❌ It does not run its own consolidation server — `DreamState` and
+  `SpaceProfiler` are library/CLI/MCP-invoked passes over the graph, not
+  a standing service.
 
-Those capabilities exist at the **system level** and are intentionally
-decoupled from this client-side library.
+Within those bounds, this package **does** implement working-memory
+buffering, LLM-based consolidation, offline consolidation (Dream State),
+graph-augmented recall, and evidence-aware belief revision — all
+client-side, no server changes required.
 
 ---
 
-### Design intent
+### Features
 
-This separation is intentional.
-
-By keeping advanced memory logic outside the client library:
-
-* Memory remains independent of any specific LLM
-* Client environments stay fast and lightweight
-* Sensitive or irreversible memory operations are centrally controlled
-* The architecture remains portable across platforms and models
+* **Working memory** — Redis-backed session buffering
+  (`RedisMemoryBuffer`), proxy/auth-resilient.
+* **Consolidation** — LLM summarization + PII redaction into versioned
+  graph revisions (`UniversalMemoryManager.consolidate_session`).
+* **Dream State** — offline consolidation pass: relevance assessment,
+  deprecation (capped, published-protected), tag/metadata enrichment,
+  relationship discovery. Accepts deployment policy via
+  `extra_instructions`.
+* **Graph-augmented recall** — multi-query reformulation + edge
+  traversal + semantic fallback (`GraphAugmentedRecall`).
+* **Sibling revision filtering** — BM25-light or embedding-based
+  filtering of stacked-item history.
+* **Auto-assessment** — background write-time screening
+  (`create_llm_assessor`) with a heuristic pre-filter and graph novelty
+  check before any LLM call.
+* **Level-of-Evidence belief revision** — memories carry an evidence
+  grade (`official` / `corroborated` / `single_source` / `unverified`);
+  a corroboration-aware assessor grades claims automatically, recall
+  reranks and badges by grade, and Dream State respects grade-aware
+  deployment policy. See below for details.
+* **Space profiles** — per-Space churn/evidence/stability signals
+  classify each Space (`canonical` / `working` / `correspondence`) so
+  extraction strategy can adapt per collection.
+* **Skill ingest** — parse and version `SKILL.md` files and reference
+  docs into the graph (`kumiho-memory ingest-skill`).
+* **MCP tools** — 13 tool wrappers, auto-discovered by the core `kumiho`
+  MCP server (see table below).
 
 ---
 
 ### Typical use cases
 
-* Experimenting with memory-aware AI agents
-* Prototyping agent workflows that require short-term context buffering
-* Reference integration for platforms such as:
-
-  * Multi-agent systems
-  * Collaborative AI environments
-  * MCP-compatible agent runtimes
+* Production memory backend for AI agents and MCP-compatible runtimes
+* Multi-agent and collaborative AI systems that need shared, versioned
+  long-term memory
+* Applications that must weigh conflicting information by source
+  credibility (news, claims, multi-source corroboration)
 
 ---
 
@@ -101,16 +124,16 @@ memory.add_message(
 ### Architectural note
 
 `kumiho-memory` is one component within a larger, model-agnostic memory
-architecture.
+architecture. Persistent storage, hybrid search, and edge/relationship
+storage live in the Kumiho server (`kumiho-server`), reached through the
+core `kumiho` SDK — this package never talks to the server directly.
 
-The full system includes:
-
-* Client-side buffers (this package)
-* Persistent memory storage
-* Structured relationships between memories
-* Offline consolidation and lifecycle management
-
-This package intentionally exposes **only the client-side surface**.
+Working-memory buffering, consolidation, offline lifecycle management
+(Dream State, SpaceProfiler), and belief-revision policy are all
+implemented **client-side, in this package**, calling the server only
+through the standard SDK operations (create/read revisions, tags,
+metadata, edges). No server changes are required for any feature in this
+package, including the Level-of-Evidence subsystem below.
 
 ---
 
@@ -345,13 +368,56 @@ revision-creation frequency is the documented proxy, valid because
 
 ---
 
+### MCP Tools
+
+13 tool wrappers, auto-discovered by the core `kumiho` MCP server:
+
+| Tool | Description |
+| ------ | ------------- |
+| `kumiho_chat_add` | Add message to Redis working memory |
+| `kumiho_chat_get` | Retrieve session messages |
+| `kumiho_chat_clear` | Clear session working memory |
+| `kumiho_memory_ingest` | Buffer message + recall context |
+| `kumiho_memory_add_response` | Add assistant response to buffer |
+| `kumiho_memory_consolidate` | Summarize, redact, store to graph |
+| `kumiho_memory_recall` | Semantic search with dedup guard |
+| `kumiho_memory_discover_edges` | Link new memory to related memories |
+| `kumiho_memory_store_execution` | Store tool/command results |
+| `kumiho_memory_engage` | Recall + build context in one call |
+| `kumiho_memory_reflect` | Buffer response + store captures |
+| `kumiho_memory_dream_state` | Run Dream State consolidation cycle |
+| `kumiho_memory_space_profile` | Profile each Space's knowledge dynamics |
+
+---
+
+### Modules
+
+| Module | Public API |
+| -------- | ------------ |
+| `memory_manager` | `UniversalMemoryManager`, `AutoAssessFn`, `MemoryAssessResult`, `get_memory_space` |
+| `redis_memory` | `RedisMemoryBuffer` |
+| `summarization` | `MemorySummarizer`, `LLMAdapter`, `EmbeddingAdapter`, `OpenAICompatAdapter`, `OpenAICompatEmbeddingAdapter`, `AnthropicAdapter` |
+| `privacy` | `PIIRedactor`, `CredentialDetectedError` |
+| `retry` | `RetryQueue` |
+| `dream_state` | `DreamState`, `MemoryAssessment`, `DreamStateStats` |
+| `graph_augmentation` | `GraphAugmentedRecall`, `GraphAugmentationConfig` |
+| `assessors` | `create_llm_assessor`, `create_evidence_assessor`, `EvidencePolicy`, `grade_evidence`, `heuristic_prefilter`, `DEFAULT_STORAGE_POLICY` |
+| `evidence` | `evidence_tag`, `parse_evidence`, `OFFICIAL`, `CORROBORATED`, `SINGLE_SOURCE`, `UNVERIFIED`, `EVIDENCE_LEVELS`, `DEFAULT_EVIDENCE_LEVEL` |
+| `evidence_rank` | `apply_evidence_weights`, `evidence_badge`, `EvidenceRankConfig` |
+| `space_profiler` | `SpaceProfiler`, `SpaceProfile`, `SpaceSignals`, `get_space_profile`, `SPACE_CLASSES` |
+| `skill_ingest` | `ingest_skill`, `ingest_file`, `ingest_batch`, `parse_skill` |
+| `mcp_tools` | `MEMORY_TOOLS`, `MEMORY_TOOL_HANDLERS` |
+
+---
+
 ### Roadmap
 
-* `0.1.x` — Experimental preview (current)
-* `0.2.x` — Stabilized client APIs
-* `1.0.0` — Production-ready client SDK
+* `0.5.x` — Graph-augmented recall, sibling filtering, recall dedup
+* `0.6.x` — Level-of-Evidence belief revision (current)
+* `1.0.0` — Stabilized public API, production-ready client SDK
 
-The scope of this package will remain limited to **client-side concerns**.
+The scope of this package will remain limited to **client-side concerns**
+— no kumiho-server changes are required by anything on this roadmap.
 
 ---
 

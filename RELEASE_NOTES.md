@@ -1,5 +1,129 @@
 # Release Notes — kumiho-memory
 
+## v0.6.0
+
+**Release Date:** 2026-07-02
+
+`v0.6.0` is a minor release introducing **Level-of-Evidence belief
+revision**: memories carry a trust grade, and revision/consolidation/
+recall decisions weigh that grade — official statements are pinned,
+claims promote to facts only when independently corroborated, and
+low-trust content is down-ranked instead of competing on relevance
+alone. Entirely client-side; no kumiho-server changes.
+
+### Highlights
+
+#### Evidence-level schema (`evidence` module)
+
+- New `evidence_level` revision-metadata convention (`official` /
+  `corroborated` / `single_source` / `unverified`) mirrored into a
+  `evidence:<level>` graph tag for server-side time-range history.
+- `evidence_tag()` / `parse_evidence()` helpers; metadata wins when the
+  two carriers diverge.
+- `ingest_message` / `consolidate_session` accept `evidence_level` +
+  `source`; grades are stashed at ingest and applied at consolidation.
+  Grades are **only stamped when provided** — ungraded flows are
+  byte-identical to previous behavior.
+- `skill_ingest` and the `ingest-skill` CLI gain `--evidence-level`.
+
+#### Corroboration-aware evidence assessor (`assessors` module)
+
+- `create_evidence_assessor(adapter, policy=EvidencePolicy())` — a
+  drop-in `AutoAssessFn` that grades incoming claims via a screened
+  three-stage pipeline (heuristic → graph novelty → LLM judgment +
+  policy):
+  - **Official pinning** — claims contradicting an `evidence:official`
+    memory are stored `unverified` with the conflict recorded; the
+    pinned belief is never revised.
+  - **Corroboration** — ≥ N agreeing memories with distinct sources and
+    no contradiction promote to `corroborated`, `memory_type=fact`,
+    with optional `SUPPORTS` edges to corroborators.
+  - The assessor can never emit `official` — that grade is operator-only.
+- New MCP env wiring: `KUMIHO_EVIDENCE_ASSESSOR=1`,
+  `KUMIHO_EVIDENCE_MIN_CORROBORATION`, `KUMIHO_EVIDENCE_SUPPORTS_EDGES=1`.
+- `EdgeType.SUPPORTS` added to `GraphAugmentationConfig`'s default
+  traversal edge types.
+
+#### Dream State deployment policy (`dream_state` module)
+
+- `DreamState(extra_instructions=...)` appends deployment-specific
+  policy (e.g. "never deprecate `evidence:official` memories") under a
+  `## DEPLOYMENT POLICY` section of the assessment prompt.
+- Three routes with documented precedence: explicit arg >
+  `KUMIHO_DREAM_EXTRA_INSTRUCTIONS` env var; `""` disables the env
+  policy. New CLI flag `kumiho-memory dream --policy`.
+- The assessment payload now includes each memory's `evidence_level`
+  and policy-relevant graph tags. Hard guardrails (deprecation cap,
+  published protection, conservative-KEEP) remain enforced in code
+  after the LLM's suggestions and are not overridable by policy.
+
+#### Evidence-weighted recall + context badges (`evidence_rank` module)
+
+- Deterministic score adjustment per grade (`official` +0.15,
+  `corroborated` +0.08, `single_source` 0.0, `unverified` −0.10) — zero
+  extra LLM calls, applied in both plain and graph-augmented recall
+  before result caps.
+- **Default ON**, with a strict no-op guarantee: recall results are
+  byte-identical when no retrieved memory carries a grade. Kill switch:
+  `KUMIHO_EVIDENCE_RERANK=0`.
+- `kumiho_memory_engage` context is prefixed with grade badges
+  (`[official]`, `[unverified]`); `kumiho_memory_recall` exposes the
+  grade as the `evidence_level` field.
+
+#### Space profiles (`space_profiler` module, new)
+
+- `SpaceProfiler` aggregates per-Space churn/evidence/stability signals
+  from existing SDK queries (pure aggregation, no LLM) and classifies
+  each Space as `canonical` / `working` / `correspondence`.
+- Profiles persist as versioned `kind="space-profile"` items with
+  `SUPERSEDES` edges linking runs, so profile drift is itself a
+  queryable chain. A `space_class` Space attribute pins the label; the
+  profiler then reports pin/observation disagreement as drift instead
+  of relabeling.
+- New CLI subcommand `kumiho-memory profile` and MCP tool
+  `kumiho_memory_space_profile`. Read-side API: `get_space_profile()`.
+
+### MCP Tools
+
+13 tool wrappers, up from 10:
+
+| Tool | Description |
+| ------ | ------------- |
+| `kumiho_memory_engage` | Recall + build context in one call |
+| `kumiho_memory_reflect` | Buffer response + store captures |
+| `kumiho_memory_space_profile` | Profile each Space's knowledge dynamics |
+
+(The other 10 are unchanged from `v0.5.3` — see the full table in
+`README.md`.)
+
+### Modules
+
+New: `evidence`, `evidence_rank`, `assessors` (evidence-aware additions),
+`space_profiler`.
+
+### Test Coverage
+
+281 tests total (up from 84 in `v0.3.1`), including dedicated suites for
+`evidence`, `assessors` (evidence path), `evidence_rank`, `dream_state`
+(policy injection), and `space_profiler`.
+
+### Requirements
+
+Unchanged from `v0.5.3` — no new external dependencies.
+
+### Upgrade
+
+```bash
+pip install -U kumiho-memory[all]
+```
+
+No breaking API changes — every new parameter is additive with a
+back-compatible default, and evidence-aware features are either
+explicitly opt-in (assessor, Dream State policy) or strict no-ops on
+ungraded data (recall reranking).
+
+---
+
 ## v0.5.3
 
 **Release Date:** 2026-05-13
