@@ -1024,6 +1024,13 @@ def test_consolidation_stamps_evidence_from_ingest():
             assert "evidence:official" in stored["tags"]
             assert "summarized" in stored["tags"]
             assert "published" in stored["tags"]
+            # The server freezes a revision as immutable once "published"
+            # is applied — any tag applied after it is silently dropped.
+            # The evidence tag MUST be ordered before "published".
+            assert (
+                stored["tags"].index("evidence:official")
+                < stored["tags"].index("published")
+            )
 
         asyncio.run(run())
 

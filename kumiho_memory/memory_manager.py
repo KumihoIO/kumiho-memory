@@ -892,10 +892,12 @@ class UniversalMemoryManager:
             # Evidence grade: canonical metadata key + mirrored graph tag
             # (tags get server-side time-range history).  Only stamped
             # when a grade was provided — unmarked memories keep the
-            # existing tag set.
+            # existing tag set.  MUST be applied before "published" —
+            # the server freezes a revision as immutable once "published"
+            # lands, silently rejecting every tag applied afterward.
             if resolved_evidence:
                 payload["metadata"]["evidence_level"] = resolved_evidence
-                payload["tags"].append(evidence_tag(resolved_evidence))
+                payload["tags"].insert(-1, evidence_tag(resolved_evidence))
             if resolved_source:
                 payload["metadata"]["source"] = resolved_source
 

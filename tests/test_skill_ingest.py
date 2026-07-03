@@ -888,6 +888,10 @@ class TestIngestEvidence(TestIngestSkillWithMock):
                 assert rev.metadata["evidence_level"] == "official"
                 assert "published" in rev._tags
                 assert "evidence:official" in rev._tags
+                # The server freezes a revision as immutable once
+                # "published" lands — tags applied afterward are
+                # silently dropped, so evidence must be tagged first.
+                assert rev._tags.index("evidence:official") < rev._tags.index("published")
         finally:
             os.unlink(path)
 
@@ -921,6 +925,8 @@ class TestIngestEvidence(TestIngestSkillWithMock):
             rev = space._items["ref-doc"]._revisions[-1]
             assert rev.metadata["evidence_level"] == "corroborated"
             assert "evidence:corroborated" in rev._tags
+            assert "published" in rev._tags
+            assert rev._tags.index("evidence:corroborated") < rev._tags.index("published")
         finally:
             os.unlink(path)
 

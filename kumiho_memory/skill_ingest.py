@@ -417,10 +417,12 @@ def _ingest_section(
         },
     )
 
-    # 4. Tag as published (server auto-moves from previous revision)
-    revision.tag("published")
+    # 4. Tag evidence grade BEFORE published — the server freezes a
+    # revision as immutable once "published" lands, silently rejecting
+    # any tag applied afterward.
     if evidence_level:
         revision.tag(evidence_tag(evidence_level))
+    revision.tag("published")  # server auto-moves from previous revision
 
     return IngestResult(
         item_name=section.name,
@@ -529,9 +531,11 @@ def ingest_file(
         location=str(path),
     )
 
-    revision.tag("published")
+    # Evidence grade BEFORE published — see the ordering note in
+    # _ingest_section: a published revision is server-side immutable.
     if evidence_level:
         revision.tag(evidence_tag(evidence_level))
+    revision.tag("published")
 
     return IngestResult(
         item_name=item_name,
