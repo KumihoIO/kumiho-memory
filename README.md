@@ -11,7 +11,9 @@
 > **Beta (0.6.x)**
 > Actively developed; the public API is stabilizing but may still change
 > between minor versions.
-> Latest release: `0.6.0` (2026-07-02) — Level-of-Evidence belief revision:
+> Latest release: `0.6.1` (2026-07-03) — fixes the mirrored evidence-tag
+> carrier introduced in `0.6.0` (requires `kumiho>=0.10.1`).
+> `0.6.0` (2026-07-02) introduced Level-of-Evidence belief revision:
 > evidence grading, a corroboration-aware assessor, Dream State policy
 > injection, evidence-weighted recall, and per-Space knowledge profiles.
 > See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the full history.

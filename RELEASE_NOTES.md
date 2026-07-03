@@ -1,5 +1,49 @@
 # Release Notes — kumiho-memory
 
+## v0.6.1
+
+**Release Date:** 2026-07-03
+
+`v0.6.1` is a patch release fixing the mirrored evidence-tag carrier
+introduced in `v0.6.0`, discovered via live verification against a
+self-hosted CE server.
+
+### Bug fix
+
+The kumiho server freezes a revision as immutable the instant its
+`published` tag is applied — any tag applied afterward is silently
+rejected (`PERMISSION_DENIED`). `consolidate_session` and
+`skill_ingest`'s evidence-tag mirroring (issue #9, `v0.6.0`) tagged
+`published` *before* the mirrored `evidence:<level>` tag, so the tag
+carrier never actually landed on the server for any consolidated or
+skill-ingested memory — only the `evidence_level` **metadata** carrier
+worked correctly. Recall reranking and badges were unaffected (they
+read `evidence_level` from metadata), but tag-based server-side
+time-range auditing of evidence grades was silently broken.
+
+- `consolidate_session`: evidence tag now applied before `published`.
+- `skill_ingest.ingest_skill` / `ingest_file`: same ordering fix.
+- Added order-regression assertions to the evidence test suite.
+
+This fix pairs with a companion fix in the core `kumiho` SDK
+(`kumiho>=0.10.1`): `tool_memory_store` — the default store backend
+used by `consolidate_session` — called a nonexistent module-level
+function for tag application, so **no tag was ever actually applied**
+via that path, including the base `published` tag itself. Upgrading
+`kumiho-memory` alone fixes the ordering; upgrading `kumiho` too is
+required for any tag (including `published`) to land at all via the
+default store path. See the `kumiho` package's own release notes.
+
+### Upgrade
+
+```bash
+pip install -U "kumiho-memory[all]" "kumiho>=0.10.1"
+```
+
+No API changes; safe to upgrade from `v0.6.0` with no code changes.
+
+---
+
 ## v0.6.0
 
 **Release Date:** 2026-07-02
