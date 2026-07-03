@@ -1556,7 +1556,9 @@ class UniversalMemoryManager:
             entry: Dict[str, Any] = {
                 "title": meta.get("title", ""),
                 "summary": meta.get("summary", ""),
-                "type": meta.get("type", ""),
+                # "type" is a server-reserved metadata key stripped from
+                # reads; newer writes mirror it as "memory_type".
+                "type": meta.get("type") or meta.get("memory_type") or "",
                 "space": meta.get("space", ""),
                 "created_at": getattr(revision, "created_at", ""),
                 "tags": getattr(revision, "tags", []),
