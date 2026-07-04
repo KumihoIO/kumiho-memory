@@ -368,15 +368,39 @@ def tool_memory_consolidate(args: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Recall deduplication
 # ---------------------------------------------------------------------------
-# Models sometimes generate parallel kumiho_memory_recall calls within a
-# single response despite instructions not to.  This lock serializes recall
-# calls so the first one executes and any duplicate within the dedup window
-# returns an empty result with a warning — giving the model nothing to
-# summarize, which eliminates the duplicate "Retrieved..." output lines.
+# Models sometimes generate parallel kumiho_memory_recall calls for the SAME
+# query within a single response despite instructions not to.  This lock
+# serializes recall calls so the first one executes and any *identical-query*
+# duplicate within the dedup window returns an empty result — eliminating the
+# duplicate "Retrieved..." output lines.  The dedup keys off the query + scope
+# (not just time), so DISTINCT queries — including concurrent ones from parallel
+# agents — always execute instead of being starved by one global timestamp.
 
 _recall_lock = threading.Lock()
-_recall_cache_time: float = 0.0
 _RECALL_DEDUP_WINDOW_SECS = 5.0
+# Recall signature -> monotonic time it last executed. Only a true duplicate
+# (same query + scope) within the window is suppressed.
+_recall_recent: Dict[str, float] = {}
+
+
+def _recall_signature(args: Dict[str, Any]) -> str:
+    """Dedup key: the query plus the scope args that determine the result set."""
+    return "\x1f".join(str(x) for x in (
+        args.get("query", ""),
+        args.get("space_paths") or "",
+        args.get("memory_types") or "",
+        args.get("recall_mode") or "",
+        bool(args.get("graph_augmented", False)),
+    ))
+
+
+def _recall_is_duplicate(args: Dict[str, Any], now: float) -> bool:
+    """True if an identical recall ran within the dedup window. Prunes expired
+    signatures first so the cache stays small."""
+    for key in [k for k, t in _recall_recent.items()
+                if now - t >= _RECALL_DEDUP_WINDOW_SECS]:
+        _recall_recent.pop(key, None)
+    return _recall_signature(args) in _recall_recent
 
 
 def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -386,15 +410,13 @@ def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
     time window (e.g. parallel tool calls from the model), subsequent calls
     return an empty result with a note instead of hitting the backend again.
     """
-    global _recall_cache_time
-
     with _recall_lock:
         now = time.monotonic()
-        if now - _recall_cache_time < _RECALL_DEDUP_WINDOW_SECS:
+        if _recall_is_duplicate(args, now):
             logger.warning(
-                "kumiho_memory_recall called again within %.1fs dedup window "
-                "— returning empty (new_query=%r)",
-                now - _recall_cache_time,
+                "kumiho_memory_recall called again with the same query within "
+                "%.1fs — returning empty (query=%r)",
+                _RECALL_DEDUP_WINDOW_SECS,
                 args.get("query", ""),
             )
             return {
@@ -402,9 +424,8 @@ def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
                 "count": 0,
                 "deduplicated": True,
                 "note": (
-                    "Duplicate recall — results already returned in this "
-                    "response. Do not call kumiho_memory_recall more than "
-                    "once per response."
+                    "Duplicate recall — identical query already returned in "
+                    "this response. Vary the query or reuse the prior results."
                 ),
             }
 
@@ -422,7 +443,7 @@ def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
         results = _filter_by_min_score(results, _min_score_from_args(args))
         result = {"results": results, "count": len(results), "recall_mode": recall_mode}
 
-        _recall_cache_time = time.monotonic()
+        _recall_recent[_recall_signature(args)] = time.monotonic()
         return result
 
 
@@ -530,11 +551,9 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
     Returns pre-built context, raw results, and source krefs for linking.
     Shares the recall deduplication guard with ``tool_memory_recall``.
     """
-    global _recall_cache_time
-
     with _recall_lock:
         now = time.monotonic()
-        if now - _recall_cache_time < _RECALL_DEDUP_WINDOW_SECS:
+        if _recall_is_duplicate(args, now):
             return {
                 "context": "",
                 "results": [],
@@ -542,8 +561,8 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
                 "count": 0,
                 "deduplicated": True,
                 "note": (
-                    "Duplicate recall within dedup window. "
-                    "Results already returned this turn."
+                    "Duplicate recall — identical query already returned in "
+                    "this response. Vary the query or reuse the prior results."
                 ),
             }
 
@@ -564,7 +583,7 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
         )
         source_krefs = [m["kref"] for m in results if m.get("kref")]
 
-        _recall_cache_time = time.monotonic()
+        _recall_recent[_recall_signature(args)] = time.monotonic()
         return {
             "context": context,
             "results": results,
