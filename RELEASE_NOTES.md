@@ -19,9 +19,15 @@ in a single, deterministic pass:
 - **MMR diversity** — greedy maximal-marginal-relevance reorder (λ=0.72,
   relevance-dominant) suppresses near-duplicate revisions crowding the top-k,
   complementing Dream State's write-time dedup.
-- **Cross-encoder relevance (opt-in)** — a pluggable `Reranker`; the bundled
-  backend uses `fastembed`'s multilingual `bge-reranker` (ONNX, no torch) and
-  is enabled with `KUMIHO_RERANK_CROSS_ENCODER=1`.
+- **Relevance reranker (opt-in)** — a pluggable `Reranker` stage. Two backends:
+  - `KUMIHO_RERANK_CROSS_ENCODER=1` — local `fastembed` multilingual
+    `bge-reranker` (ONNX, no torch, no API).
+  - `KUMIHO_RERANK_LLM=1` — the **host LLM itself** reranks, reusing the
+    manager's already-configured adapter (`summarizer.adapter` + `light_model`)
+    — no separate reranker model, download, or API key. This is the
+    "the LLM running Kumiho reranks" design, wired as a first-class option via
+    `make_llm_reranker`. One `chat` call per recall; any failure is a safe
+    no-op. (Cross-encoder wins if both are set.)
 
 Recency + MMR are **default on and conservative**; the server's relevance order
 is still preserved when no signal (evidence, recency, cross-encoder) actually

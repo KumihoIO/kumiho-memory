@@ -176,25 +176,32 @@ def _get_manager():
         except Exception as exc:
             logger.warning("Evidence rerank config failed: %s", exc)
 
+    summarizer = MemorySummarizer()
+
     # Post-recall rerank: recency decay + MMR diversity — DEFAULT ON and
     # conservative (small recency boost; relevance-dominant MMR).
-    # KUMIHO_RECALL_RERANK=0/false is the kill switch.  Cross-encoder relevance
-    # is opt-in and needs the optional 'fastembed' dependency:
-    # KUMIHO_RERANK_CROSS_ENCODER=1.
+    # KUMIHO_RECALL_RERANK=0/false is the kill switch.  A relevance reranker
+    # stage is opt-in, via either:
+    #   KUMIHO_RERANK_CROSS_ENCODER=1  -> local bge cross-encoder (needs fastembed)
+    #   KUMIHO_RERANK_LLM=1            -> the host LLM itself, reusing the
+    #                                     configured summarizer adapter (no extra
+    #                                     model/key). Cross-encoder wins if both.
     rerank_config = None
     reranker = None
     try:
-        from kumiho_memory.recall_rerank import RerankConfig, try_fastembed_reranker
+        from kumiho_memory.recall_rerank import (
+            RerankConfig,
+            make_llm_reranker,
+            try_fastembed_reranker,
+        )
         if os.environ.get("KUMIHO_RECALL_RERANK", "").strip().lower() in ("0", "false"):
             rerank_config = RerankConfig(recency_enabled=False, mmr_enabled=False)
             logger.info("Post-recall rerank (recency/MMR) disabled via env")
         else:
             rerank_config = RerankConfig()
-        if os.environ.get("KUMIHO_RERANK_CROSS_ENCODER", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        ):
+
+        _truthy = ("1", "true", "yes")
+        if os.environ.get("KUMIHO_RERANK_CROSS_ENCODER", "").strip().lower() in _truthy:
             reranker = try_fastembed_reranker()
             if reranker is not None:
                 rerank_config.cross_encoder_enabled = True
@@ -204,10 +211,23 @@ def _get_manager():
                     "KUMIHO_RERANK_CROSS_ENCODER=1 but fastembed/model is "
                     "unavailable — install the 'fastembed' extra to enable."
                 )
+        if reranker is None and os.environ.get(
+            "KUMIHO_RERANK_LLM", ""
+        ).strip().lower() in _truthy:
+            adapter = getattr(summarizer, "adapter", None)
+            model = getattr(summarizer, "light_model", "") or ""
+            if adapter is not None:
+                reranker = make_llm_reranker(adapter, model)
+                rerank_config.cross_encoder_enabled = True
+                logger.info("LLM recall rerank enabled (host adapter, model=%s)", model)
+            else:
+                logger.warning(
+                    "KUMIHO_RERANK_LLM=1 but no LLM adapter is configured — set "
+                    "ANTHROPIC_API_KEY or OPENAI_API_KEY to enable LLM rerank."
+                )
     except Exception as exc:
         logger.warning("Post-recall rerank setup failed: %s", exc)
 
-    summarizer = MemorySummarizer()
     buffer = RedisMemoryBuffer()
     _manager = UniversalMemoryManager(
         redis_buffer=buffer,

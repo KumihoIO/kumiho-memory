@@ -12,8 +12,11 @@ Design principles (mirrors :mod:`kumiho_memory.evidence_rank`):
 * **Every stage no-ops safely.** No timestamp → no recency change. No reranker
   → no cross-encoder change. No evidence → no evidence change. Turning the
   pipeline on can reorder results but never crashes or blanks recall.
-* **Deterministic.** No LLM calls, no randomness; the same inputs always
-  produce the same ordering (stable sort, greedy MMR).
+* **Deterministic by default.** recency + MMR + evidence make no LLM calls and
+  are fully deterministic. The cross-encoder stage is optional; its reranker may
+  be a local cross-encoder (:func:`try_fastembed_reranker`) or the host LLM
+  itself (:func:`make_llm_reranker`, reusing the manager's existing adapter — no
+  extra API key), both opt-in.
 
 Order of operations in :func:`rerank`:
 ``cross-encoder (optional) → +evidence prior → +recency prior → sort → MMR``.
@@ -334,5 +337,105 @@ def try_fastembed_reranker(
 
     def _rerank(query: str, texts: Sequence[str]) -> Sequence[float]:
         return list(encoder.rerank(query, list(texts)))
+
+    return _rerank
+
+
+# ---------------------------------------------------------------------------
+# LLM reranker — reuse the host LLM (no separate reranker model or API key)
+# ---------------------------------------------------------------------------
+
+def _run_coro_sync(make_coro: Callable[[], Any]) -> Any:
+    """Run an async factory to completion from sync code.
+
+    The reranker interface is synchronous but LLM adapters are async, and the
+    pipeline may run inside an event loop (async recall). If a loop is already
+    running we execute the coroutine in a throwaway thread with its own loop;
+    otherwise we run it directly.
+    """
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+        running = True
+    except RuntimeError:
+        running = False
+    if not running:
+        return asyncio.run(make_coro())
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(lambda: asyncio.run(make_coro())).result()
+
+
+def _parse_llm_scores(raw: Any, n: int) -> List[float]:
+    """Parse ``n`` relevance floats from an LLM response (array or {"scores":[]})."""
+    import json
+
+    text = raw.strip() if isinstance(raw, str) else ""
+    arr: Any = None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, list):
+            arr = obj
+        elif isinstance(obj, dict):
+            arr = obj.get("scores")
+            if not isinstance(arr, list):
+                arr = next((v for v in obj.values() if isinstance(v, list)), None)
+    except Exception:
+        start, end = text.find("["), text.rfind("]")
+        if 0 <= start < end:
+            try:
+                arr = json.loads(text[start : end + 1])
+            except Exception:
+                arr = None
+    if not isinstance(arr, list) or len(arr) != n:
+        raise ValueError("LLM reranker returned unparseable or mismatched scores")
+    return [float(x) for x in arr]
+
+
+def make_llm_reranker(
+    adapter: Any,
+    model: str,
+    *,
+    char_limit: int = 600,
+    max_tokens: int = 400,
+) -> Reranker:
+    """Build a :data:`Reranker` that scores relevance with the host LLM.
+
+    Reuses whatever LLM the manager already runs (``summarizer.adapter`` +
+    ``light_model``) — **no separate reranker model, download, or API key**.
+    One ``chat`` call per rerank scores all candidates. Any failure (LLM error,
+    unparseable output) raises, which the pipeline's cross-encoder stage catches
+    and treats as a no-op, so recall never breaks.
+
+    This is the wiring for the original "the LLM running Kumiho reranks" design:
+    plug the returned callable in as ``reranker`` with
+    ``RerankConfig(cross_encoder_enabled=True)``.
+    """
+    system = (
+        "You are a precise search reranker. Given a query and candidate memory "
+        "documents, rate how well each document answers the query, from 0.0 "
+        "(irrelevant) to 1.0 (directly answers it). Judge relevance only. "
+        'Respond with ONLY a JSON object of the form {"scores": [n, n, ...]} '
+        "with one number per document, in the given order."
+    )
+
+    def _rerank(query: str, texts: Sequence[str]) -> Sequence[float]:
+        docs = "\n".join(f"[{i}] {t[:char_limit]}" for i, t in enumerate(texts))
+        user = (
+            f"Query:\n{query}\n\nDocuments:\n{docs}\n\n"
+            f'Return {{"scores": [...]}} with exactly {len(texts)} numbers (0.0-1.0).'
+        )
+        raw = _run_coro_sync(
+            lambda: adapter.chat(
+                messages=[{"role": "user", "content": user}],
+                model=model,
+                system=system,
+                max_tokens=max_tokens,
+                json_mode=True,
+            )
+        )
+        return _parse_llm_scores(raw, len(texts))
 
     return _rerank

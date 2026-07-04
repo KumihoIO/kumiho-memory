@@ -158,6 +158,71 @@ def test_rerank_empty_list():
     assert rerank("q", [], config=RerankConfig()) == []
 
 
+# ---------------- LLM reranker ----------------
+
+class _FakeAdapter:
+    """Async chat adapter returning a canned response (records the call)."""
+
+    def __init__(self, response):
+        self.response = response
+        self.calls = 0
+
+    async def chat(self, *, messages, model, system="", max_tokens=1024, json_mode=False):
+        self.calls += 1
+        self.last_model = model
+        return self.response
+
+
+def test_parse_llm_scores_variants():
+    from kumiho_memory.recall_rerank import _parse_llm_scores
+    assert _parse_llm_scores('{"scores": [0.1, 0.9]}', 2) == [0.1, 0.9]
+    assert _parse_llm_scores("[0.2, 0.8]", 2) == [0.2, 0.8]
+    assert _parse_llm_scores('here: {"scores":[1,0]} ok', 2) == [1.0, 0.0]
+    with pytest.raises(ValueError):
+        _parse_llm_scores("nonsense", 2)
+    with pytest.raises(ValueError):
+        _parse_llm_scores("[0.1]", 2)  # wrong length
+
+
+def test_llm_reranker_reorders_from_sync_context():
+    from kumiho_memory.recall_rerank import make_llm_reranker
+    adapter = _FakeAdapter('{"scores": [0.0, 1.0]}')
+    rr = make_llm_reranker(adapter, "light-model")
+    a = _mem(title="alpha", score=0.9)
+    b = _mem(title="bravo", score=0.1)
+    cfg = RerankConfig(cross_encoder_enabled=True, cross_encoder_weight=1.0,
+                       mmr_enabled=False, recency_enabled=False)
+    out = rerank("q", [a, b], config=cfg, reranker=rr, now=NOW)
+    assert out[0]["title"] == "bravo"
+    assert adapter.calls == 1 and adapter.last_model == "light-model"
+
+
+def test_llm_reranker_works_inside_running_loop():
+    # Simulates the async recall path: the sync reranker must bridge to the
+    # already-running loop via a worker thread.
+    import asyncio
+    from kumiho_memory.recall_rerank import make_llm_reranker
+
+    async def run():
+        adapter = _FakeAdapter('{"scores": [1.0, 0.0]}')
+        rr = make_llm_reranker(adapter, "m")
+        return rr("q", ["doc a", "doc b"])
+
+    scores = asyncio.run(run())
+    assert scores == [1.0, 0.0]
+
+
+def test_llm_reranker_failure_is_a_noop():
+    from kumiho_memory.recall_rerank import make_llm_reranker
+    bad = _FakeAdapter("not json at all")
+    rr = make_llm_reranker(bad, "m")
+    a = _mem(title="a", score=0.9)
+    b = _mem(title="b", score=0.8)
+    cfg = RerankConfig(cross_encoder_enabled=True, mmr_enabled=False, recency_enabled=False)
+    out = rerank("q", [a, b], config=cfg, reranker=rr, now=NOW)
+    assert [m["title"] for m in out] == ["a", "b"]  # unchanged
+
+
 def test_default_reranker_model_is_a_known_fastembed_id():
     # Guards against a model-name typo silently disabling the cross-encoder
     # (try_fastembed_reranker swallows the load error and returns None).
