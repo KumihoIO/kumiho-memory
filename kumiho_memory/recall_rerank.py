@@ -311,12 +311,16 @@ def rerank(
 # ---------------------------------------------------------------------------
 
 def try_fastembed_reranker(
-    model_name: str = "Xenova/bge-reranker-base",
+    model_name: str = "BAAI/bge-reranker-base",
 ) -> Optional[Reranker]:
     """Return a multilingual cross-encoder reranker, or ``None`` if unavailable.
 
-    Uses :mod:`fastembed` (optional dependency, ONNX — no torch). Returns
-    ``None`` when fastembed or the model cannot be loaded, so callers can wire it
+    Uses :mod:`fastembed` (optional dependency, ONNX — no torch). ``model_name``
+    must be one of ``fastembed``'s supported cross-encoders (see
+    ``TextCrossEncoder.list_supported_models()``); the multilingual options are
+    ``BAAI/bge-reranker-base`` (default) and
+    ``jinaai/jina-reranker-v2-base-multilingual``. Returns ``None`` when
+    fastembed or the model cannot be loaded, so callers can wire it
     unconditionally and simply skip cross-encoder rerank when it is not present.
     """
     try:
