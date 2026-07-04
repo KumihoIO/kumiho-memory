@@ -108,6 +108,11 @@ _SIBLING_CHAR_BUDGET = 20_000
 # fall back to char-budget mode which keeps all siblings that fit.
 _SIBLING_STRONG_SCORE = 0.40
 
+# A stored event_date must be a clean ISO-8601 calendar date (YYYY, YYYY-MM, or
+# YYYY-MM-DD). Guards against the summarizer emitting prose ("last week") into the
+# structured event_date field despite the prompt asking for normalized ISO.
+_ISO_EVENT_DATE_RE = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
+
 
 def _tokenize(text: str) -> List[str]:
     """Lowercase split + strip punctuation, filtering stopwords."""
@@ -836,6 +841,18 @@ class UniversalMemoryManager:
             if event_summaries:
                 structured_metadata["events"] = "; ".join(event_summaries)
 
+            # Canonical event_date = the earliest concrete date among this
+            # memory's events (valid-time), kept SEPARATE from the server-set
+            # created_at (storage time). ISO-8601 sorts chronologically, so
+            # min() of the validated dates is the earliest. Surfaced at recall
+            # in both modes and usable as an opt-in temporal ranking signal.
+            iso_dates = [
+                d for ev in events
+                if _ISO_EVENT_DATE_RE.match(d := str(ev.get("event_date", "")).strip())
+            ]
+            if iso_dates:
+                structured_metadata["event_date"] = min(iso_dates)
+
         if decisions:
             dec_texts = [d.get("decision", "") for d in decisions if d.get("decision")]
             if dec_texts:
@@ -1525,12 +1542,18 @@ class UniversalMemoryManager:
             summary = mem.get("summary", "")
             content = mem.get("content", "")
             badge = evidence_badge(mem, self.evidence_rank_config)
+            # Temporal anchor for summarized mode (full mode already carries
+            # dates inline in the raw content). Collapses to "" when absent.
+            ev_date = mem.get("event_date", "")
+            date_prefix = f"[{ev_date}] " if ev_date else ""
 
             if mode == "full" and content:
                 texts.append(badge + content[:4000])
             elif summary:
                 texts.append(
-                    f"{badge}{title}: {summary}" if title else badge + summary
+                    f"{badge}{date_prefix}{title}: {summary}"
+                    if title
+                    else f"{badge}{date_prefix}{summary}"
                 )
 
             # Unfold sibling revisions only in full mode.  In summarized
@@ -1593,6 +1616,11 @@ class UniversalMemoryManager:
                 entry["evidence_level"] = meta["evidence_level"]
             if meta.get("source"):
                 entry["source"] = meta["source"]
+            # Semantic event date (valid-time). Surfaced BEFORE the
+            # load_artifacts branch so it reaches summarized recall too —
+            # the one mode that is otherwise date-blind (no content loaded).
+            if meta.get("event_date"):
+                entry["event_date"] = meta["event_date"]
 
             # Read the raw conversation from the local artifact file.
             if load_artifacts:

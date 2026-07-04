@@ -58,6 +58,7 @@ def build_summary_schema_mode() -> Dict[str, Any]:
                 "items": _strict_object_schema({
                     "event": {"type": "string"},
                     "when": {"type": "string"},
+                    "event_date": {"type": "string"},
                     "participants": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -1087,6 +1088,7 @@ class MemorySummarizer:
             "    {\n"
             '      "event": "Specific incident or action that happened",\n'
             '      "when": "Date or time when it occurred (e.g. \'7 May 2023\', \'June 2023\', \'2022\', \'last week\') — use exact dates from the conversation when available",\n'
+            '      "event_date": "Normalized ISO-8601 form of \'when\' (YYYY-MM-DD, or YYYY-MM / YYYY at lower precision), or \'\' if no date is inferable",\n'
             '      "participants": ["person1"],\n'
             '      "consequence": "What changed as a result (behavioral change, decision, outcome)"\n'
             "    }\n"
@@ -1109,6 +1111,7 @@ class MemorySummarizer:
             "- Each event must be a concrete thing that happened, not a general topic or theme\n"
             "- Always include the consequence: what changed, what was decided, or what behavior resulted\n"
             "- Always include the 'when' field for each event — use exact dates from the conversation when available, otherwise use relative dates or 'unknown'\n"
+            "- Also set 'event_date': the normalized ISO-8601 date the event occurred (YYYY-MM-DD, or YYYY-MM / YYYY when only partial precision is known). Resolve relative references ('last Tuesday', 'two weeks ago', 'yesterday') against an absolute anchor present in the conversation (e.g. a '[7 May 2023]' message prefix). If no date can be inferred, set event_date to an empty string \"\" — NEVER guess or fabricate a date.\n"
             "- Extract ALL factual claims into knowledge.facts — include every piece of concrete information: names, places, brands, model numbers, job titles, relationships, hobbies, preferences, possessions, plans, amounts, measurements. If someone mentions owning a specific car, phone, or tool, that's a fact. If they mention where they work, live, or travel, that's a fact.\n"
             "- Extract decisions with their rationale into knowledge.decisions\n"
             "- Redact PII using placeholders like [EMAIL], [PHONE]\n"

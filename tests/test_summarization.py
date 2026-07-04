@@ -317,6 +317,16 @@ def test_openai_compat_adapter_uses_extra_body_when_max_completion_tokens_param_
     assert client.calls[0]["extra_body"]["reasoning_effort"] == "minimal"
 
 
+def test_summary_schema_includes_event_date():
+    from kumiho_memory.summarization import build_summary_schema_mode
+
+    event_props = (
+        build_summary_schema_mode()["schema"]["properties"]["events"]["items"]["properties"]
+    )
+    assert "event_date" in event_props
+    assert event_props["event_date"]["type"] == "string"
+
+
 def test_openai_compat_adapter_uses_json_schema_for_array_mode():
     from kumiho_memory.summarization import OpenAICompatAdapter, build_string_array_wrapper_schema
 

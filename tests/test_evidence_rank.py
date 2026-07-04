@@ -223,6 +223,23 @@ def test_build_recalled_context_no_badges_when_disabled():
     assert "[official]" not in ctx
 
 
+def test_build_recalled_context_prepends_event_date_in_summarized():
+    # In summarized mode (no artifact content) the event_date anchor is the only
+    # way a temporal question sees a date — assert it is surfaced, and only for
+    # memories that carry one.
+    async def retrieve_stub(**kwargs):
+        return []
+
+    manager = _make_manager(retrieve_stub)
+    dated = _mem("kref://dated", 0.5)
+    dated["event_date"] = "2023-05-08"
+    undated = _mem("kref://undated", 0.4)
+    ctx = manager.build_recalled_context([dated, undated], recall_mode="summarized")
+    assert "[2023-05-08] kref://dated: s" in ctx    # anchor surfaced
+    assert "[2023-05-08] kref://undated" not in ctx  # not on the undated memory
+    assert "kref://undated: s" in ctx                # undated memory unaffected
+
+
 # ---------------------------------------------------------------------------
 # Graph-augmented path
 # ---------------------------------------------------------------------------

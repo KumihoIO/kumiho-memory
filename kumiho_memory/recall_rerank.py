@@ -65,6 +65,18 @@ class RerankConfig:
     cross_encoder_enabled: bool = False
     cross_encoder_weight: float = 0.6
 
+    #: Event-proximity prior (opt-in, TEMPORAL queries only). Boosts memories
+    #: whose semantic ``event_date`` (valid-time) is near the query's reference
+    #: time, decaying by half every ``event_proximity_half_life_days``. Distinct
+    #: from recency, which measures *storage* age from ``created_at``. Fires only
+    #: when the caller passes ``rerank(..., query_time=...)`` — so non-temporal
+    #: queries (``query_time=None``) are never reweighted by it. Keep the boost
+    #: ``<= recency_max_boost``: the two correlated temporal priors are capped
+    #: jointly so time can never outweigh relevance.
+    event_proximity_enabled: bool = False
+    event_proximity_half_life_days: float = 45.0
+    event_proximity_max_boost: float = 0.12
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -116,6 +128,41 @@ def _recency_boost(mem: Dict[str, Any], config: RerankConfig, now: datetime) -> 
     if hl <= 0:
         return config.recency_max_boost
     return config.recency_max_boost * math.exp(-_LN2 * age_days / hl)
+
+
+def _pad_iso_date(value: Any) -> str:
+    """Pad a partial ISO date (``YYYY`` / ``YYYY-MM``) to ``YYYY-MM-DD``.
+
+    The summarizer stores ``event_date`` at whatever precision it can infer, but
+    :func:`_parse_ts` needs a full calendar date. Anything else passes through.
+    """
+    if not isinstance(value, str):
+        return ""
+    v = value.strip()
+    if re.fullmatch(r"\d{4}", v):
+        return f"{v}-01-01"
+    if re.fullmatch(r"\d{4}-\d{2}", v):
+        return f"{v}-01"
+    return v
+
+
+def _event_proximity_boost(
+    mem: Dict[str, Any], config: RerankConfig, query_time: datetime
+) -> float:
+    """Exponential-decay boost from ``|event_date − query_time|`` (valid-time).
+
+    Distinct from :func:`_recency_boost`, which measures *storage* age from
+    ``created_at``. No-ops (``0.0``) when the memory carries no parseable
+    ``event_date`` — so legacy/undated revisions are unaffected.
+    """
+    ts = _parse_ts(_pad_iso_date(mem.get("event_date")))
+    if ts is None:
+        return 0.0
+    gap_days = abs((query_time - ts).total_seconds()) / 86400.0
+    hl = config.event_proximity_half_life_days
+    if hl <= 0:
+        return config.event_proximity_max_boost
+    return config.event_proximity_max_boost * math.exp(-_LN2 * gap_days / hl)
 
 
 _TOKEN_RE = re.compile(r"[0-9a-z]+|[가-힣]+", re.IGNORECASE)
@@ -236,6 +283,7 @@ def rerank(
     reranker: Optional[Reranker] = None,
     limit: Optional[int] = None,
     now: Optional[datetime] = None,
+    query_time: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
     """Full post-recall rerank: cross-encoder → +evidence → +recency → sort → MMR.
 
@@ -244,6 +292,12 @@ def rerank(
     pass. Adjusts dicts in place and returns the reordered list. Memories without
     a numeric relevance score are never given a fabricated one and trail the
     scored results in their original order.
+
+    ``query_time`` is the reference instant for the optional event-proximity
+    prior (:attr:`RerankConfig.event_proximity_enabled`). Pass it ONLY for
+    queries with a temporal intent; leaving it ``None`` (the default) keeps the
+    event-proximity signal fully dormant, so general recall is never reweighted
+    by event dates. ``now`` remains the reference for the storage-recency prior.
     """
     config = config or RerankConfig()
     evidence_config = evidence_config or EvidenceRankConfig()
@@ -264,6 +318,18 @@ def rerank(
     ev_active = evidence_config.enabled and any(levels)
     rec_enabled = config.recency_enabled and config.recency_max_boost != 0.0
     rec_active = False
+    # Event-proximity fires only for temporal queries: opt-in config AND a
+    # caller-supplied query_time. query_time=None => this prior is a no-op.
+    evt_enabled = (
+        config.event_proximity_enabled
+        and config.event_proximity_max_boost != 0.0
+        and query_time is not None
+    )
+    evt_active = False
+    # Recency (storage age) and event-proximity (valid-time) correlate when
+    # created_at ≈ event_date, so their sum is capped at the larger single
+    # boost — two temporal priors must never jointly outweigh relevance.
+    temporal_cap = max(config.recency_max_boost, config.event_proximity_max_boost)
 
     scored: List[Dict[str, Any]] = []
     unscored: List[Dict[str, Any]] = []
@@ -284,7 +350,13 @@ def rerank(
             if ts is not None:
                 rec_active = True
                 rec_delta = _recency_boost(mem, config, now)
-        mem["score"] = base + ev_delta + rec_delta
+        evt_delta = 0.0
+        if evt_enabled:
+            eb = _event_proximity_boost(mem, config, query_time)
+            if eb > 0.0:
+                evt_active = True
+                evt_delta = eb
+        mem["score"] = base + ev_delta + min(rec_delta + evt_delta, temporal_cap)
         if evidence_config.badges:
             badge = evidence_badge(mem, evidence_config)
             if badge:
@@ -297,7 +369,7 @@ def rerank(
     # 3. Sort by adjusted score ONLY when a signal actually reweighted the set.
     #    With no evidence/recency/cross-encoder the server's relevance order is
     #    authoritative and preserved (back-compat with evidence-only recall).
-    if ev_active or rec_active or ce_active:
+    if ev_active or rec_active or ce_active or evt_active:
         scored.sort(key=lambda m: m.get("score", 0.0), reverse=True)
     ordered = scored + unscored
 
