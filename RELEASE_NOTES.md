@@ -1,5 +1,43 @@
 # Release Notes — kumiho-memory
 
+## v0.8.0
+
+**Release Date:** 2026-07-04
+
+`v0.8.0` adds **`event_date`** — a semantic *valid-time* for each memory (when the
+remembered event actually occurred), distinct from `created_at` (when it was
+stored). The summarizing LLM already reads the raw conversation, so it tags the
+temporal referent at write time ("prospective indexing").
+
+### New — event_date (valid-time)
+
+- **Extraction** — the summarizer emits a normalized ISO `event_date`
+  (`YYYY-MM-DD`, degrading to `YYYY-MM` / `YYYY`) per event, resolving relative
+  references ("last Tuesday", "two weeks ago") against an anchor in the
+  conversation. Empty when no date is inferable — never fabricated.
+- **Storage** — the earliest concrete event date is stored as clean revision
+  metadata, kept strictly separate from the server-authoritative `created_at`.
+- **Surfacing** — recall returns `event_date` in **both** summarized and full
+  mode. In summarized mode (where raw content is not loaded) the recalled
+  context is prefixed with `[event_date]`, giving temporal questions a date
+  anchor they otherwise lack.
+- **Ranking (opt-in, default-off)** — a temporal event-proximity prior in
+  `recall_rerank`. It fires **only** for temporal queries: enable
+  `RerankConfig.event_proximity_enabled` **and** pass `rerank(..., query_time=...)`.
+  With no `query_time` it is a strict no-op, so general recall is never
+  reweighted. Recency (storage age) and event-proximity (valid-time) are capped
+  jointly so two correlated temporal priors can't outweigh relevance.
+
+Backwards compatible: memories without an `event_date` (legacy or non-temporal)
+carry no key and are unaffected at every stage. Requires kumiho-server to reserve
+`event_date` from the fulltext blob ([kumiho-server#25](https://github.com/KumihoIO/kumiho-server/pull/25)); persistence itself needs no server change.
+
+### Fixed
+
+- Corrected the default cross-encoder model id (`Xenova/bge-reranker-base` →
+  `BAAI/bge-reranker-base`), which had silently disabled the bundled
+  `fastembed` reranker. A guard test now pins it to a supported id.
+
 ## v0.7.0
 
 **Release Date:** 2026-07-04
