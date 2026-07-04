@@ -1,5 +1,37 @@
 # Release Notes — kumiho-memory
 
+## v0.7.0
+
+**Release Date:** 2026-07-04
+
+`v0.7.0` adds a **post-recall reranking pipeline** — the reranking stage peer
+memory systems (Zep, mem0) ship and Kumiho was missing — layered on top of the
+existing evidence-grade weighting.
+
+### New — `recall_rerank`
+
+Recall now runs `cross-encoder (optional) → +evidence → +recency → sort → MMR`
+in a single, deterministic pass:
+
+- **Recency decay** — recent memories get a small exponential boost
+  (half-life 45 days, max +0.12), so fresh knowledge breaks ties over stale
+  memories. No-ops when a memory has no timestamp.
+- **MMR diversity** — greedy maximal-marginal-relevance reorder (λ=0.72,
+  relevance-dominant) suppresses near-duplicate revisions crowding the top-k,
+  complementing Dream State's write-time dedup.
+- **Cross-encoder relevance (opt-in)** — a pluggable `Reranker`; the bundled
+  backend uses `fastembed`'s multilingual `bge-reranker` (ONNX, no torch) and
+  is enabled with `KUMIHO_RERANK_CROSS_ENCODER=1`.
+
+Recency + MMR are **default on and conservative**; the server's relevance order
+is still preserved when no signal (evidence, recency, cross-encoder) actually
+reweights the set, so ungraded recall stays backward-compatible.
+`KUMIHO_RECALL_RERANK=0` is a kill switch.
+
+Part of the retrieval-optimization roadmap alongside kumiho-server's normalized
+hybrid fusion (#23), configurable embeddings endpoint (#24), and Korean
+tokenizer identifier fix (#22).
+
 ## v0.6.1
 
 **Release Date:** 2026-07-03

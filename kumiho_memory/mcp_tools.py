@@ -176,6 +176,37 @@ def _get_manager():
         except Exception as exc:
             logger.warning("Evidence rerank config failed: %s", exc)
 
+    # Post-recall rerank: recency decay + MMR diversity — DEFAULT ON and
+    # conservative (small recency boost; relevance-dominant MMR).
+    # KUMIHO_RECALL_RERANK=0/false is the kill switch.  Cross-encoder relevance
+    # is opt-in and needs the optional 'fastembed' dependency:
+    # KUMIHO_RERANK_CROSS_ENCODER=1.
+    rerank_config = None
+    reranker = None
+    try:
+        from kumiho_memory.recall_rerank import RerankConfig, try_fastembed_reranker
+        if os.environ.get("KUMIHO_RECALL_RERANK", "").strip().lower() in ("0", "false"):
+            rerank_config = RerankConfig(recency_enabled=False, mmr_enabled=False)
+            logger.info("Post-recall rerank (recency/MMR) disabled via env")
+        else:
+            rerank_config = RerankConfig()
+        if os.environ.get("KUMIHO_RERANK_CROSS_ENCODER", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            reranker = try_fastembed_reranker()
+            if reranker is not None:
+                rerank_config.cross_encoder_enabled = True
+                logger.info("Cross-encoder recall rerank enabled (fastembed)")
+            else:
+                logger.warning(
+                    "KUMIHO_RERANK_CROSS_ENCODER=1 but fastembed/model is "
+                    "unavailable — install the 'fastembed' extra to enable."
+                )
+    except Exception as exc:
+        logger.warning("Post-recall rerank setup failed: %s", exc)
+
     summarizer = MemorySummarizer()
     buffer = RedisMemoryBuffer()
     _manager = UniversalMemoryManager(
@@ -187,6 +218,8 @@ def _get_manager():
         embedding_adapter=embedding_adapter,
         auto_assess_fn=auto_assess_fn,
         evidence_rank=evidence_rank,
+        rerank=rerank_config,
+        reranker=reranker,
     )
     return _manager
 

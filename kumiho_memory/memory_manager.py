@@ -189,6 +189,8 @@ class UniversalMemoryManager:
         auto_assess_min_messages: int = 3,
         auto_assess_window: int = 6,
         evidence_rank: Optional[Any] = None,
+        rerank: Optional[Any] = None,
+        reranker: Optional[Any] = None,
     ) -> None:
         self.project = project
         self.consolidation_threshold = consolidation_threshold
@@ -235,6 +237,19 @@ class UniversalMemoryManager:
             from kumiho_memory.evidence_rank import EvidenceRankConfig
             evidence_rank = EvidenceRankConfig(enabled=False, badges=False)
         self.evidence_rank_config = evidence_rank
+        # Post-recall reranking: recency decay + MMR diversity (deterministic,
+        # default on, conservative) and an optional cross-encoder relevance
+        # stage.  None -> defaults; falsy -> everything disabled.  Subsumes
+        # evidence weighting on the plain recall path (applied once).
+        from kumiho_memory.recall_rerank import RerankConfig
+        if rerank is None:
+            rerank = RerankConfig()
+        elif not rerank:
+            rerank = RerankConfig(
+                recency_enabled=False, mmr_enabled=False, cross_encoder_enabled=False
+            )
+        self.rerank_config = rerank
+        self.reranker = reranker
         # Background memory assessor (model-agnostic, optional)
         self.auto_assess_fn: Optional[AutoAssessFn] = auto_assess_fn
         self.auto_assess_min_messages = auto_assess_min_messages
@@ -1401,10 +1416,19 @@ class UniversalMemoryManager:
             query, limit=limit, space_paths=space_paths,
             memory_types=memory_types,
         )
-        # Evidence weighting on the plain path.  The graph path applies it
-        # inside GraphAugmentedRecall (before its caps) — never both.
-        from kumiho_memory.evidence_rank import apply_evidence_weights
-        memories = apply_evidence_weights(memories, self.evidence_rank_config)
+        # Post-recall rerank on the plain path: cross-encoder (optional) +
+        # evidence prior + recency prior + MMR diversity, applied once.  The
+        # graph path applies its own evidence weighting inside
+        # GraphAugmentedRecall (before its caps) — never both.
+        from kumiho_memory.recall_rerank import rerank
+        memories = rerank(
+            query,
+            memories,
+            evidence_config=self.evidence_rank_config,
+            config=self.rerank_config,
+            reranker=self.reranker,
+            limit=limit,
+        )
         return await self._enrich_with_siblings(memories, query)
 
     def _get_graph_recall(self) -> Optional[Any]:
