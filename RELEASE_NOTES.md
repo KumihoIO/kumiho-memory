@@ -1,5 +1,23 @@
 # Release Notes — kumiho-memory
 
+## v0.8.1
+
+**Release Date:** 2026-07-05
+
+Bug fix for the recall/engage deduplication guard.
+
+### Fixed
+
+- `kumiho_memory_recall` / `kumiho_memory_engage` keyed their 5-second dedup
+  guard on a single global timestamp, so **any** recall within the window was
+  suppressed regardless of query — a session-wide singleton lock. Under
+  concurrency (e.g. parallel agents) this starved legitimate **distinct**
+  recalls, returning `count=0` "Duplicate recall within dedup window" on a
+  first, unrelated call. The guard now keys on a signature of the query +
+  scope (`space_paths`, `memory_types`, `recall_mode`, `graph_augmented`), so
+  only a **true duplicate** (same query + scope) within the window is
+  suppressed; distinct queries — including concurrent ones — always execute.
+
 ## v0.8.0
 
 **Release Date:** 2026-07-04
