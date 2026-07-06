@@ -1,5 +1,29 @@
 # Release Notes — kumiho-memory
 
+## v0.8.2
+
+**Release Date:** 2026-07-06
+
+Bug fix: recall now surfaces the LLM-extracted atomic facts and ranks
+stacked-revision siblings on them — restoring direct single-hop retrieval that a
+prior sibling-reranker change had regressed on the LoCoMo benchmark.
+
+### Fixed
+
+- `UniversalMemoryManager.build_recalled_context` appends a concise `Facts:`
+  block from the revision's extracted facts, so the answering LLM reads the
+  precise attribute→value claim directly (e.g. *"Melanie has been married for
+  five years"*) instead of having to infer it from the narrative summary.
+- `_filter_siblings_by_embedding` folds the extracted facts into the text that
+  is scored against the query. A revision whose title/summary is off-topic but
+  whose facts hold the answer (e.g. a *"Sweden"* fact under a *"counseling"*
+  summary) now ranks into context instead of being dropped by the sibling
+  reranker.
+
+Measured on the official LoCoMo benchmark (summarized mode): recovers the
+direct single-hop retrieval regressed by the LLM sibling reranker and improves
+open-domain recall, with no change to multi-hop.
+
 ## v0.8.1
 
 **Release Date:** 2026-07-05
