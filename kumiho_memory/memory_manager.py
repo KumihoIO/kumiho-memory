@@ -1547,13 +1547,27 @@ class UniversalMemoryManager:
             ev_date = mem.get("event_date", "")
             date_prefix = f"[{ev_date}] " if ev_date else ""
 
+            # Surface the extracted atomic facts (attribute→value claims like
+            # "Melanie has been married for five years") as a concise, easily
+            # parsed block. They are already embedded in the narrative summary,
+            # but pulling them out lets the answering LLM read the precise
+            # claim directly instead of digging it out of prose — the same
+            # profile-style precise recall that dedicated fact stores rely on.
+            facts = mem.get("facts", "")
+            if isinstance(facts, (list, tuple)):
+                facts = "; ".join(
+                    f.get("claim", str(f)) if isinstance(f, dict) else str(f)
+                    for f in facts
+                )
+            facts_suffix = f"\nFacts: {facts}" if facts else ""
+
             if mode == "full" and content:
-                texts.append(badge + content[:4000])
+                texts.append(badge + content[:4000] + facts_suffix)
             elif summary:
                 texts.append(
-                    f"{badge}{date_prefix}{title}: {summary}"
-                    if title
-                    else f"{badge}{date_prefix}{summary}"
+                    (f"{badge}{date_prefix}{title}: {summary}"
+                     if title
+                     else f"{badge}{date_prefix}{summary}") + facts_suffix
                 )
 
             # Unfold sibling revisions only in full mode.  In summarized
@@ -1662,7 +1676,22 @@ class UniversalMemoryManager:
         for sib in siblings:
             t = sib.get("title", "")
             s = sib.get("summary", "")
-            sib_texts.append(f"{t}: {s}" if t else s)
+            # Fact-level ranking: fold the extracted atomic facts into the text
+            # scored against the query. A revision whose title/summary is off
+            # topic but whose facts hold the answer ("Caroline is from Sweden"
+            # under a "counseling" summary) would otherwise rank too low to
+            # reach the context. Scoring on the facts too lifts the revision
+            # that actually contains the queried attribute — the precise,
+            # profile-style retrieval that direct single-hop / temporal
+            # questions need.
+            f = sib.get("facts", "")
+            if isinstance(f, (list, tuple)):
+                f = "; ".join(
+                    x.get("claim", str(x)) if isinstance(x, dict) else str(x)
+                    for x in f
+                )
+            base = f"{t}: {s}" if t else s
+            sib_texts.append(f"{base}\nFacts: {f}" if f else base)
 
         try:
             all_texts = [query] + sib_texts
