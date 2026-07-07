@@ -1452,12 +1452,20 @@ class UniversalMemoryManager:
         self,
         memories: List[Dict[str, Any]],
         query: str,
+        alt_queries: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Add sibling revisions and artifact content to pre-recalled memories.
 
         Runs once on the final merged set after graph augmentation has
         deduplicated results, so sibling enrichment and LLM reranking
         happen exactly once per unique item.
+
+        ``alt_queries`` carries the reformulated angles of a multi-query
+        recall (graph-augmented path).  Sibling selection sees every angle,
+        so an item recalled via a reformulation keeps the revisions relevant
+        to *that* angle — with only the original query, a multi-topic
+        question (multi-hop) selects siblings for its dominant topic and
+        drops the other hop's evidence.
         """
         _load_arts = self.recall_mode == "full"
 
@@ -1483,9 +1491,17 @@ class UniversalMemoryManager:
                     except Exception:
                         pass
 
+            primary_score = mem.get("score", 0.0)
+            if isinstance(primary_score, bool) or not isinstance(
+                primary_score, (int, float)
+            ):
+                primary_score = 0.0
+
             siblings = await self._fetch_sibling_revision_summaries(
                 item_kref, mem.get("kref", ""), query=query,
                 load_artifacts=_load_arts,
+                alt_queries=alt_queries,
+                primary_score=float(primary_score),
             )
             if siblings:
                 mem["sibling_revisions"] = siblings
@@ -1894,6 +1910,7 @@ class UniversalMemoryManager:
         self,
         siblings: List[Dict[str, Any]],
         query: str,
+        alt_queries: Optional[List[str]] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Use the LLM to select the most relevant siblings.
 
@@ -1957,8 +1974,22 @@ class UniversalMemoryManager:
             "separated by commas. If none are clearly relevant, return 'none'."
         )
 
+        # Reformulated angles (multi-query recall): show the LLM every angle
+        # so it selects summaries covering EACH aspect of a multi-topic
+        # question, not just its dominant one.
+        angles_text = ""
+        if alt_queries:
+            angle_lines = "\n".join(f"- {a}" for a in alt_queries if a)
+            if angle_lines:
+                angles_text = (
+                    "\nThe message may also be understood from these angles "
+                    "(pick summaries relevant to ANY of them):\n"
+                    f"{angle_lines}\n"
+                )
+
         user_msg = (
-            f"User's message:\n{query}\n\n"
+            f"User's message:\n{query}\n"
+            f"{angles_text}\n"
             f"Stored conversation summaries:\n{summaries_text}"
         )
 
@@ -2017,6 +2048,7 @@ class UniversalMemoryManager:
         siblings: List[Dict[str, Any]],
         query: str,
         current_rev_kref: str = "",
+        alt_queries: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Rank siblings by a local, in-process relevance signal.
 
@@ -2053,11 +2085,19 @@ class UniversalMemoryManager:
                 )
 
         # BM25-light keyword overlap (same scoring as the default Mode 3 path).
-        query_tokens = _tokenize(query)
+        # With reformulated angles present, a sibling scores as its BEST match
+        # across the original query and every angle — a multi-hop question's
+        # second hop matches its reformulation even when it barely overlaps
+        # the original phrasing.
+        angle_tokens = [_tokenize(query)] + [
+            _tokenize(a) for a in (alt_queries or []) if a
+        ]
+        angle_tokens = [t for t in angle_tokens if t]
         for sib in siblings:
             text = f"{sib.get('title', '')} {sib.get('summary', '')}"
-            sib["_score"] = (
-                _token_overlap_score(query_tokens, text) if query_tokens else 0.0
+            sib["_score"] = max(
+                (_token_overlap_score(t, text) for t in angle_tokens),
+                default=0.0,
             )
 
         best_score = max((s["_score"] for s in siblings), default=0.0)
@@ -2121,6 +2161,8 @@ class UniversalMemoryManager:
         query: str,
         item_kref: str,
         current_rev_kref: str = "",
+        alt_queries: Optional[List[str]] = None,
+        primary_score: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """Select relevant siblings: LLM reranker primary, deterministic fallback.
 
@@ -2152,11 +2194,14 @@ class UniversalMemoryManager:
             return siblings
 
         # --- Primary: LLM reranking (semantic inversion) ---
-        llm_result = await self._rerank_siblings_with_llm(siblings, query)
+        llm_result = await self._rerank_siblings_with_llm(
+            siblings, query, alt_queries=alt_queries,
+        )
         if llm_result:
             # Bounded union: recover one strong lexical match the LLM missed.
             ranked = self._rank_siblings_deterministic(
                 list(siblings), query, current_rev_kref,
+                alt_queries=alt_queries,
             )
             if ranked:
                 top = ranked[0]
@@ -2175,7 +2220,31 @@ class UniversalMemoryManager:
         # --- Fallback: deterministic ranking (LLM None / error / unavailable) ---
         ranked = self._rank_siblings_deterministic(
             siblings, query, current_rev_kref,
+            alt_queries=alt_queries,
         )
+        # Parity guard: without the LLM's judgment, the published revision
+        # must compete at the item's own recall score.  The downstream
+        # context builder skips the primary item entry whenever the sibling
+        # list is non-empty — so a fallback list that carries the primary at
+        # a near-zero keyword score silently DEMOTES the whole item relative
+        # to the pre-fallback behavior (empty list -> primary entry ranked at
+        # the item's recall score).  That demotion is what halved multi-hop:
+        # the second hop's item usually fails the LLM pick (weak lexical
+        # overlap with a multi-topic question) and then vanished from the
+        # composed context.  Floor the primary revision's _score at the
+        # item's recall score to restore the old ranking exactly; extra
+        # fallback siblings keep their own scores and can only add below it.
+        if ranked and current_rev_kref and primary_score > 0.0:
+            for sib in ranked:
+                if sib.get("kref") == current_rev_kref:
+                    if float(sib.get("_score", 0.0) or 0.0) < primary_score:
+                        sib["_score"] = primary_score
+                        ranked = sorted(
+                            ranked,
+                            key=lambda s: float(s.get("_score", 0.0) or 0.0),
+                            reverse=True,
+                        )
+                    break
         logger.info(
             "LLM sibling reranker returned None; deterministic fallback kept "
             "%d/%d siblings (query: %.60s)",
@@ -2189,6 +2258,8 @@ class UniversalMemoryManager:
         current_rev_kref: str,
         query: str = "",
         load_artifacts: bool = True,
+        alt_queries: Optional[List[str]] = None,
+        primary_score: float = 0.0,
     ) -> List[Dict[str, str]]:
         """Fetch title+summary from sibling revisions of a stacked item.
 
@@ -2265,6 +2336,8 @@ class UniversalMemoryManager:
                     # fallback (no external API, no ScoreRevisions RPC).
                     siblings = await self._filter_siblings_by_server_search(
                         siblings, query, item_kref, current_rev_kref,
+                        alt_queries=alt_queries,
+                        primary_score=primary_score,
                     )
 
                 # Clean up internal keys before loading artifacts.

@@ -105,11 +105,12 @@ class GraphAugmentedRecall:
     config:
         Optional configuration overrides.
     sibling_fetch_fn:
-        Optional async callable ``(memories, query) -> memories`` that
-        attaches ``sibling_revisions`` (scored against *query*) to the merged
-        base results.  When provided, it runs before edge traversal so
-        traversal and the semantic fallback can seed from the top-scored
-        flattened revisions (see
+        Optional async callable ``(memories, query, alt_queries) -> memories``
+        that attaches ``sibling_revisions`` (scored against *query* and every
+        reformulated angle in *alt_queries*) to the merged base results.  A
+        legacy 2-arg ``(memories, query)`` callable is also accepted.  When
+        provided, it runs before edge traversal so traversal and the semantic
+        fallback can seed from the top-scored flattened revisions (see
         :attr:`GraphAugmentationConfig.sibling_seeded_traversal`).
     """
 
@@ -238,7 +239,18 @@ class GraphAugmentedRecall:
         # top-scored *revisions* instead of the item shells.
         if self.sibling_fetch_fn is not None:
             try:
-                memories = await self.sibling_fetch_fn(memories, query)
+                # Pass the reformulated angles: sibling selection must see
+                # every angle of a multi-query recall, or a multi-topic
+                # question keeps only its dominant topic's revisions (the
+                # per-subquery enrichment this pipeline replaced scored
+                # siblings against each angle).
+                try:
+                    memories = await self.sibling_fetch_fn(
+                        memories, query, alt_queries,
+                    )
+                except TypeError:
+                    # Host injected a 2-arg fetcher — original contract.
+                    memories = await self.sibling_fetch_fn(memories, query)
             except Exception as exc:
                 logger.debug("sibling_fetch_fn failed, seeding from primaries: %s", exc)
 

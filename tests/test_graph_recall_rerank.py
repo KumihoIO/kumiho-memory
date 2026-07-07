@@ -186,6 +186,58 @@ def test_seed_krefs_skips_empty_krefs():
 
 
 # ---------------------------------------------------------------------------
+# sibling_fetch_fn receives the reformulated angles
+# ---------------------------------------------------------------------------
+
+class _ReformulatingAdapter:
+    async def chat(self, *, messages, model, system=None, max_tokens=1024,
+                   json_mode=False):
+        return "angle one\nangle two"
+
+
+def test_sibling_fetch_fn_receives_alt_queries():
+    seen = {}
+
+    async def fetch3(memories, query, alt_queries):
+        seen["query"] = query
+        seen["alts"] = alt_queries
+        return memories
+
+    async def recall_fn(query, *, limit, space_paths=None, memory_types=None):
+        return [{"kref": "kref://base", "title": "t", "summary": "s",
+                 "score": 0.5}]
+
+    gr = GraphAugmentedRecall(
+        recall_fn=recall_fn, adapter=_ReformulatingAdapter(), model="light",
+        config=GraphAugmentationConfig(reformulate_queries=True, max_hops=0),
+        sibling_fetch_fn=fetch3,
+    )
+    asyncio.run(gr.recall("trigger", limit=2))
+    assert seen["query"] == "trigger"
+    assert seen["alts"] == ["angle one", "angle two"]
+
+
+def test_legacy_two_arg_sibling_fetch_fn_still_works():
+    calls = []
+
+    async def fetch2(memories, query):
+        calls.append(query)
+        return memories
+
+    async def recall_fn(query, *, limit, space_paths=None, memory_types=None):
+        return [{"kref": "kref://base", "title": "t", "summary": "s",
+                 "score": 0.5}]
+
+    gr = GraphAugmentedRecall(
+        recall_fn=recall_fn, adapter=_ReformulatingAdapter(), model="light",
+        config=GraphAugmentationConfig(reformulate_queries=True, max_hops=0),
+        sibling_fetch_fn=fetch2,
+    )
+    out = asyncio.run(gr.recall("trigger", limit=2))
+    assert out and calls == ["trigger"]
+
+
+# ---------------------------------------------------------------------------
 # on_llm_usage accounting hook
 # ---------------------------------------------------------------------------
 

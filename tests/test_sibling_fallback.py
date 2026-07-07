@@ -188,6 +188,143 @@ def test_fallback_retains_primary_revision():
 
 
 # --------------------------------------------------------------------------
+# Fallback parity: the published revision competes at the item's recall score
+# (the multi-hop regression — a weak-scored fallback list silently DEMOTED
+# the whole item because downstream context assembly skips the primary item
+# entry whenever siblings are non-empty)
+# --------------------------------------------------------------------------
+
+def test_fallback_floors_primary_at_item_recall_score():
+    mgr = _make_manager(_SummarizerWithAdapter(_RerankAdapter(response="none")))
+    primary = _weak("p")  # near-zero keyword overlap with QUERY
+    sibs = [_weak("b"), primary]
+    out = asyncio.run(
+        mgr._filter_siblings_by_server_search(
+            sibs, QUERY, "item", "p", primary_score=0.83,
+        )
+    )
+    by_kref = {s["kref"]: s for s in out}
+    assert by_kref["p"]["_score"] == 0.83  # floored at the item's score
+    assert out[0]["kref"] == "p"           # and re-ranked to the front
+
+
+def test_fallback_floor_keeps_higher_deterministic_score():
+    # When the primary already outsores the floor, it keeps its own score.
+    mgr = _make_manager(_SummarizerWithAdapter(_RerankAdapter(response="none")))
+    primary = _strong()  # strong lexical match, kref "a"
+    out = asyncio.run(
+        mgr._filter_siblings_by_server_search(
+            [primary, _weak("b")], QUERY, "item", "a", primary_score=0.01,
+        )
+    )
+    assert out[0]["kref"] == "a"
+    assert out[0]["_score"] > 0.01  # own keyword score, not the tiny floor
+
+
+def test_fallback_no_floor_when_primary_unknown_or_scoreless():
+    mgr = _make_manager(_SummarizerWithAdapter(_RerankAdapter(response="none")))
+    sibs = [_weak("b"), _weak("c")]
+    out = asyncio.run(
+        mgr._filter_siblings_by_server_search(sibs, QUERY, "item")
+    )  # no current_rev_kref, no primary_score
+    assert all(s.get("_score", 0.0) < 0.5 for s in out)
+
+
+def test_llm_success_never_floored():
+    # LoCoMo-Plus protection: on LLM success the selection (and its scores)
+    # are untouched — the floor applies only to the deterministic fallback.
+    mgr = _make_manager(_SummarizerWithAdapter(_RerankAdapter(response="2")))
+    primary = _weak("p")
+    sibs = [_weak("b"), primary]
+    out = asyncio.run(
+        mgr._filter_siblings_by_server_search(
+            sibs, "philosophy of mind", "item", "p", primary_score=0.9,
+        )
+    )
+    assert [s["kref"] for s in out] == ["p"]
+    assert out[0]["_score"] == 1.0  # LLM-assigned, not the 0.9 floor
+
+
+def test_fallback_end_to_end_multihop_item_survives_context():
+    # Regression scenario in miniature: item A's siblings carry LLM-style
+    # scores (1.0/0.9); item B's LLM said "none" so it fell back.  B's
+    # primary must still reach the composed context — pre-fix its near-zero
+    # keyword _score buried it and the hop-2 fact vanished.
+    from kumiho_memory.context_compose import compose_context
+
+    mgr = _make_manager(_SummarizerWithAdapter(_RerankAdapter(response="none")))
+    b_primary = _sib("bp", "Trip", "visited museum in Paris with sister")
+    b_sibs = asyncio.run(
+        mgr._filter_siblings_by_server_search(
+            [b_primary, _weak("b2")], QUERY, "item-b", "bp", primary_score=0.8,
+        )
+    )
+    memories = [
+        {"kref": "a", "title": "A", "summary": "sa", "score": 0.7,
+         "sibling_revisions": [
+             {"kref": "a1", "title": "A1", "summary": "swim class", "_score": 1.0},
+             {"kref": "a2", "title": "A2", "summary": "pool party", "_score": 0.9},
+         ]},
+        {"kref": "b", "title": "B", "summary": "sb", "score": 0.8,
+         "sibling_revisions": b_sibs},
+    ]
+    ctx = compose_context(memories, QUERY, top_k=3)
+    assert "visited museum in Paris" in ctx  # hop-2 evidence present
+
+
+# --------------------------------------------------------------------------
+# Multi-angle sibling selection (reformulated queries reach the selectors)
+# --------------------------------------------------------------------------
+
+def test_deterministic_scores_max_over_angles():
+    # The sibling matches only the ALT query — with angles it lands in the
+    # strong branch; without them it would be weak-signal budget mode.
+    mgr = _make_manager(_SummarizerNoAdapter())
+    hop2 = _sib("h2", "Museum", "visited museum exhibits in Paris")
+    out = mgr._rank_siblings_deterministic(
+        [hop2, _weak("b")], "swimming pool",
+        alt_queries=["museum exhibits Paris"],
+    )
+    assert out[0]["kref"] == "h2"
+    assert out[0]["_score"] >= mgr.sibling_strong_score
+
+
+class _PromptCapturingAdapter(_RerankAdapter):
+    def __init__(self, response="none"):
+        super().__init__(response=response)
+        self.last_user_msg = ""
+
+    async def chat(self, *, messages, model, system="", max_tokens=1024, **kw):
+        self.last_user_msg = messages[0]["content"]
+        return await super().chat(
+            messages=messages, model=model, system=system,
+            max_tokens=max_tokens, **kw,
+        )
+
+
+def test_llm_prompt_includes_angles():
+    adapter = _PromptCapturingAdapter(response="1")
+    mgr = _make_manager(_SummarizerWithAdapter(adapter))
+    asyncio.run(
+        mgr._filter_siblings_by_server_search(
+            [_weak("b")], QUERY, "item",
+            alt_queries=["angle one", "angle two"],
+        )
+    )
+    assert "angle one" in adapter.last_user_msg
+    assert "angle two" in adapter.last_user_msg
+
+
+def test_llm_prompt_no_angle_block_without_alts():
+    adapter = _PromptCapturingAdapter(response="1")
+    mgr = _make_manager(_SummarizerWithAdapter(adapter))
+    asyncio.run(
+        mgr._filter_siblings_by_server_search([_weak("b")], QUERY, "item")
+    )
+    assert "angles" not in adapter.last_user_msg
+
+
+# --------------------------------------------------------------------------
 # No-op guards
 # --------------------------------------------------------------------------
 
