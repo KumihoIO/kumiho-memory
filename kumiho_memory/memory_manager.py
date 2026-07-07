@@ -1336,39 +1336,43 @@ class UniversalMemoryManager:
                 # duplicate expensive work.  Sibling enrichment runs once
                 # on the final merged set.
                 #
-                # Retrieve-wide-then-trim applies here exactly as on the
-                # plain path: over-fetch candidates, run the full rerank
-                # stack on the wide merged set, trim back to the size the
-                # caller would have gotten unwidened, THEN enrich — so the
-                # best-reranked candidates survive and only they pay for
-                # sibling enrichment.
-                multiplier = self.recall_candidate_multiplier
-                fetch_limit = (
-                    math.ceil(limit * multiplier) if multiplier > 1.0 else limit
-                )
+                # Rerank placement (measured, not aesthetic): the
+                # cross-encoder and retrieve-wide-then-trim run PER
+                # SUB-QUERY inside graph recall (see _graph_base_recall,
+                # wired as gr's recall_fn) — each reformulated angle trims
+                # its own candidates by relevance TO THAT ANGLE.  Applying
+                # them here instead, against the original query on the
+                # merged set, evicts multi-hop evidence: a second hop's
+                # memory scores low against the full multi-topic question,
+                # so a post-merge cross-encoder trim removes exactly what
+                # the answer needs (measured: multi-hop 0.299 per-angle vs
+                # 0.194 post-merge on the same data and levers).
                 memories = await gr.recall(
                     query,
-                    limit=fetch_limit,
+                    limit=limit,
                     space_paths=space_paths,
                     memory_types=memory_types,
                 )
-                # Same post-recall rerank stack as the plain path:
-                # cross-encoder (optional) + evidence prior + recency prior +
-                # event-proximity (temporal queries) + MMR diversity.  Every
-                # stage no-ops safely; evidence is recomputed from base_score
-                # so GraphAugmentedRecall's internal weighting is never
-                # double-counted.  Traversal-only entries carry score 0.0 and
-                # no created_at, so without a cross-encoder they keep
-                # trailing the direct hits — the historical partition — while
-                # a cross-encoder gives them a real relevance measurement.
+                # Final pass over the merged set: deterministic priors only
+                # — evidence (recomputed from base_score, so per-angle
+                # weighting is never double-counted), recency,
+                # event-proximity (temporal queries), MMR diversity.  The
+                # cross-encoder is deliberately EXCLUDED here: per-angle
+                # relevance was already measured above, and re-scoring
+                # against the original query would reintroduce the
+                # multi-hop eviction this pipeline just avoided.
+                from dataclasses import replace as _dc_replace
                 from kumiho_memory.recall_rerank import rerank
                 target = self.graph_augmentation_config.max_total or (limit * 3)
+                final_cfg = _dc_replace(
+                    self.rerank_config, cross_encoder_enabled=False,
+                )
                 memories = rerank(
                     query,
                     memories,
                     evidence_config=self.evidence_rank_config,
-                    config=self.rerank_config,
-                    reranker=self.reranker,
+                    config=final_cfg,
+                    reranker=None,
                     limit=target,
                     query_time=query_time,
                 )
@@ -1380,6 +1384,51 @@ class UniversalMemoryManager:
             query, limit=limit, space_paths=space_paths,
             memory_types=memory_types, query_time=query_time,
         )
+
+    async def _graph_base_recall(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        space_paths: Optional[List[str]] = None,
+        memory_types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Per-sub-query recall for graph augmentation: widen → rerank → trim.
+
+        The inner ``recall_fn`` for :class:`GraphAugmentedRecall`.  Each
+        reformulated angle gets its own retrieve-wide-then-trim and rerank
+        stack (cross-encoder included) scored against *that angle's* query —
+        so the candidates that survive per-angle trimming are the ones
+        relevant to each hop of a multi-topic question.  Running these
+        levers once on the merged set against the original query instead
+        measurably evicts multi-hop evidence (the second hop scores low
+        against the full question).
+
+        No sibling enrichment, no artifacts — the merged set is enriched
+        exactly once downstream.
+        """
+        multiplier = self.recall_candidate_multiplier
+        fetch_limit = (
+            math.ceil(limit * multiplier) if multiplier > 1.0 else limit
+        )
+        memories = await self._lightweight_recall(
+            query, limit=fetch_limit, space_paths=space_paths,
+            memory_types=memory_types,
+        )
+        if not memories:
+            return memories
+        from kumiho_memory.recall_rerank import rerank
+        memories = rerank(
+            query,
+            memories,
+            evidence_config=self.evidence_rank_config,
+            config=self.rerank_config,
+            reranker=self.reranker,
+            limit=limit,
+        )
+        if len(memories) > limit:
+            memories = memories[:limit]
+        return memories
 
     async def _lightweight_recall(
         self,
@@ -1601,7 +1650,7 @@ class UniversalMemoryManager:
             self._graph_recall = GraphAugmentedRecall(
                 adapter=adapter,
                 model=model,
-                recall_fn=self._lightweight_recall,
+                recall_fn=self._graph_base_recall,
                 config=self.graph_augmentation_config,
                 evidence_rerank_fn=lambda mems: apply_evidence_weights(
                     mems, self.evidence_rank_config,

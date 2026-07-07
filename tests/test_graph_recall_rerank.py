@@ -124,7 +124,7 @@ def test_graph_path_runs_rerank_stack_with_query_time():
     assert [m["title"] for m in out_dormant] == ["far", "near"]
 
 
-def test_graph_path_widens_fetch_and_trims_to_max_total():
+def test_graph_path_trims_merged_set_to_max_total():
     pool = [
         {"kref": f"kref://m{i}", "title": f"m{i}", "summary": "",
          "score": 0.4 + 0.1 * i}
@@ -132,22 +132,107 @@ def test_graph_path_widens_fetch_and_trims_to_max_total():
     ]
     mgr = _make_manager(
         graph_augmentation=GraphAugmentationConfig(max_total=3),
-        recall_candidate_multiplier=2.0,
         rerank=RerankConfig(recency_enabled=False, mmr_enabled=False),
     )
     stub = _wire_graph_stub(mgr, pool)
+    # Real graph recall returns merge+traversal sets larger than the limit —
+    # make the stub do the same so the max_total trim has work to do.
+    async def _overflowing(query, *, limit, space_paths=None, memory_types=None):
+        return [dict(m) for m in stub.pool]
 
+    stub.recall = _overflowing
     out = asyncio.run(mgr.recall_memories("q", limit=2, graph_augmented=True))
-    assert stub.last_limit == 4       # ceil(2 * 2.0) — over-fetch
     assert len(out) == 3              # trimmed to config.max_total
 
 
-def test_graph_path_default_multiplier_passes_limit_through():
+def test_graph_path_passes_plain_limit_not_widened():
+    # The multiplier widens PER SUB-QUERY (inside _graph_base_recall), never
+    # the limit handed to graph recall — widening the merged set and trimming
+    # it against the original query is the measured multi-hop eviction bug.
     pool = [{"kref": "kref://a", "title": "a", "summary": "", "score": 0.5}]
-    mgr = _make_manager(graph_augmentation=True)
+    mgr = _make_manager(graph_augmentation=True, recall_candidate_multiplier=3.0)
     stub = _wire_graph_stub(mgr, pool)
     asyncio.run(mgr.recall_memories("q", limit=3, graph_augmented=True))
     assert stub.last_limit == 3
+
+
+# ---------------------------------------------------------------------------
+# _graph_base_recall — per-sub-query widen → rerank (CE vs THAT query) → trim
+# ---------------------------------------------------------------------------
+
+class _RecordingRetrieve:
+    def __init__(self, pool):
+        self.pool = pool
+        self.last_limit = None
+
+    async def __call__(self, *, project, query, limit, **kw):
+        self.last_limit = limit
+        return [dict(m) for m in self.pool[:limit]]
+
+
+def _make_manager_with_retrieve(pool, **kw):
+    buffer = RedisMemoryBuffer(client=FakeRedis(), redis_url="redis://test")
+
+    async def _store(**k):
+        return {}
+
+    retrieve = _RecordingRetrieve(pool)
+    mgr = UniversalMemoryManager(
+        redis_buffer=buffer,
+        memory_store=_store,
+        memory_retrieve=retrieve,
+        **kw,
+    )
+    return mgr, retrieve
+
+
+def test_graph_base_recall_widens_reranks_and_trims_per_query():
+    # Server order is ascending relevance; the cross-encoder (keyed on the
+    # sub-query text appearing in the title) must float its matches into the
+    # trimmed top — proving CE runs against THIS query inside the sub-recall.
+    pool = [
+        {"title": "noise-1", "summary": "", "score": 0.9},
+        {"title": "noise-2", "summary": "", "score": 0.8},
+        {"title": "hop2 museum", "summary": "", "score": 0.1},
+        {"title": "hop2 paris", "summary": "", "score": 0.05},
+    ]
+
+    def fake_ce(query, texts):
+        return [1.0 if "hop2" in t else 0.0 for t in texts]
+
+    mgr, retrieve = _make_manager_with_retrieve(
+        pool,
+        recall_candidate_multiplier=2.0,
+        rerank=RerankConfig(
+            recency_enabled=False, mmr_enabled=False,
+            cross_encoder_enabled=True,
+        ),
+        reranker=fake_ce,
+    )
+    out = asyncio.run(mgr._graph_base_recall("hop2 details", limit=2))
+    assert retrieve.last_limit == 4          # ceil(2 * 2.0) per sub-query
+    assert len(out) == 2                     # trimmed back to limit
+    assert {m["title"] for m in out} == {"hop2 museum", "hop2 paris"}
+
+
+def test_graph_final_pass_never_reapplies_cross_encoder():
+    # The merged-set pass must not re-score against the original query —
+    # a reranker call there would reintroduce the multi-hop eviction.
+    calls = {"n": 0}
+
+    def counting_ce(query, texts):
+        calls["n"] += 1
+        return [0.5] * len(texts)
+
+    pool = [{"kref": "kref://a", "title": "a", "summary": "", "score": 0.5}]
+    mgr = _make_manager(
+        graph_augmentation=True,
+        rerank=RerankConfig(cross_encoder_enabled=True),
+        reranker=counting_ce,
+    )
+    _wire_graph_stub(mgr, pool)  # stub bypasses _graph_base_recall entirely
+    asyncio.run(mgr.recall_memories("q", limit=2, graph_augmented=True))
+    assert calls["n"] == 0
 
 
 # ---------------------------------------------------------------------------
