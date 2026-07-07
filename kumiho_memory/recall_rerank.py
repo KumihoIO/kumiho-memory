@@ -403,6 +403,116 @@ def rerank(
 
 
 # ---------------------------------------------------------------------------
+# Two-pass focused rerank — re-score with embeddings over title+summary only
+# ---------------------------------------------------------------------------
+
+def _cosine(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
+    """Cosine similarity between two float vectors (pure python, no numpy)."""
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _focused_text(mem: Dict[str, Any]) -> str:
+    """``title: summary`` scoring text — deliberately narrow.
+
+    Unlike :func:`_text` (used by the cross-encoder/MMR stages), this strips
+    description/content *and* structured metadata (implications, events) so
+    the score measures only how directly the revision's core claim answers
+    the query.
+    """
+    title = str(mem.get("title", "") or "")
+    summary = str(mem.get("summary", "") or "")
+    return f"{title}: {summary}" if title else (summary or title or "")
+
+
+def two_pass_rerank(
+    query: str,
+    memories: List[Dict[str, Any]],
+    embedding_adapter: Optional[Any],
+) -> List[Dict[str, Any]]:
+    """Re-score recalled memories AND their siblings with focused embeddings.
+
+    Pass 1 (already done upstream): server recall + sibling scoring used
+    enriched semantic embeddings (title, summary, implications, events) to
+    cast a wide net.
+
+    Pass 2 (this function): re-score every memory and every
+    ``sibling_revisions`` entry client-side using *embedding_adapter* on
+    **title+summary text only**, replacing the server scores.  Stripping
+    implications/events from the scoring signal lets the most *directly*
+    relevant revision rank highest.  Primaries and siblings are scored in the
+    same batch, so downstream global ranking (``compose_context``) compares
+    one consistent cosine scale instead of mixing server relevance (~0-3)
+    with sibling cosines (0-1).
+
+    Scores are updated in place — ``score`` on memories (``base_score`` is
+    dropped, mirroring :func:`apply_cross_encoder`: the relevance basis was
+    replaced) and ``_score`` on siblings — and the same list is returned.
+    Ordering is left untouched; callers rank downstream.
+
+    Safe no-op guarantees: returns the input unchanged when *query* is empty,
+    *memories* is empty, no ``embedding_adapter`` is configured (debug log),
+    or embedding fails (warning log).
+    """
+    if not memories or not query:
+        return memories
+    if embedding_adapter is None:
+        logger.debug(
+            "two_pass_rerank: no embedding adapter configured — skipping"
+        )
+        return memories
+
+    # Collect scoring targets: every primary memory plus every sibling.
+    targets: List[tuple] = []  # (dict, score_key)
+    texts: List[str] = []
+    for mem in memories:
+        targets.append((mem, "score"))
+        texts.append(_focused_text(mem))
+        for sib in mem.get("sibling_revisions") or []:
+            targets.append((sib, "_score"))
+            texts.append(_focused_text(sib))
+
+    try:
+        embeddings = embedding_adapter.embed([query] + texts)
+    except Exception as e:
+        logger.warning("two_pass_rerank failed, keeping original scores: %s", e)
+        return memories
+    if len(embeddings) != len(texts) + 1:
+        logger.warning(
+            "two_pass_rerank: adapter returned %d vectors for %d texts — "
+            "keeping original scores", len(embeddings), len(texts) + 1,
+        )
+        return memories
+
+    query_vec = embeddings[0]
+    scores: List[float] = []
+    for (target, key), vec in zip(targets, embeddings[1:]):
+        old = target.get(key, 0.0)
+        new = _cosine(query_vec, vec)
+        target[key] = new
+        if key == "score":
+            # Relevance basis was replaced; priors must not recompute from
+            # the stale server score.
+            target.pop("base_score", None)
+        scores.append(new)
+        logger.debug(
+            "Two-pass rerank: %s — %s → %.3f",
+            str(target.get("title", "?"))[:50], old, new,
+        )
+
+    logger.info(
+        "Two-pass rerank: re-scored %d revisions (top: %.3f, bottom: %.3f)",
+        len(scores), max(scores) if scores else 0.0,
+        min(scores) if scores else 0.0,
+    )
+    return memories
+
+
+# ---------------------------------------------------------------------------
 # Optional bundled cross-encoder backend
 # ---------------------------------------------------------------------------
 
@@ -542,6 +652,7 @@ def resolve_reranker_from_env(
     adapter: Optional[Any] = None,
     model: Optional[str] = None,
     env: Optional[Mapping[str, str]] = None,
+    adapter_factory: Optional[Callable[[], Any]] = None,
 ) -> Optional[Reranker]:
     """Resolve a :data:`Reranker` from ``KUMIHO_RERANK_*`` env vars, or ``None``.
 
@@ -555,6 +666,14 @@ def resolve_reranker_from_env(
     * ``KUMIHO_RERANK_LLM=1`` — the host LLM itself via
       :func:`make_llm_reranker`, reusing ``adapter`` + ``model`` (no extra
       model download or API key). The cross-encoder wins if both are set.
+
+    ``adapter_factory`` is a lazy alternative to ``adapter``: it is invoked
+    (and its errors swallowed with a warning) only when ``KUMIHO_RERANK_LLM``
+    actually requests the LLM path.  Pass it when building the adapter is
+    itself fallible or expensive — e.g. a summarizer's lazy ``adapter``
+    property raises without an API key, and env resolution at manager
+    construction must not crash or eagerly build LLM clients that may never
+    be used.
 
     Returns ``None`` when no env var requests a reranker, or when the requested
     backend is unavailable (``fastembed`` missing, or no ``adapter`` for the
@@ -577,6 +696,14 @@ def resolve_reranker_from_env(
         )
 
     if str(env.get("KUMIHO_RERANK_LLM", "")).strip().lower() in truthy:
+        if adapter is None and adapter_factory is not None:
+            try:
+                adapter = adapter_factory()
+            except Exception as exc:
+                logger.warning(
+                    "KUMIHO_RERANK_LLM set but the LLM adapter could not be "
+                    "built: %s", exc,
+                )
         if adapter is not None:
             logger.info(
                 "LLM recall rerank enabled (host adapter, model=%s)", model or ""

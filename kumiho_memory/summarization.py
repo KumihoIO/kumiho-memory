@@ -138,13 +138,50 @@ class LLMAdapter(Protocol):
         max_tokens: int = 1024,
         json_mode: JsonMode = False,
     ) -> str:
-        """Send a chat request and return the raw response text."""
+        """Send a chat request and return the raw response text.
+
+        Optional usage convention: adapters that can report token usage set a
+        ``last_usage`` attribute after each call — a dict with
+        ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens`` ints
+        (the built-in adapters do).  It is best-effort (last call wins, so
+        concurrent calls on one adapter may interleave) and consumed by
+        usage-accounting hooks such as
+        :attr:`kumiho_memory.graph_augmentation.GraphAugmentationConfig.on_llm_usage`.
+        """
         ...
 
 
 # ---------------------------------------------------------------------------
 # Built-in adapters
 # ---------------------------------------------------------------------------
+
+
+def _normalize_token_usage(response: Any) -> Optional[Dict[str, int]]:
+    """Extract ``{prompt,completion,total}_tokens`` from a provider response.
+
+    Handles both OpenAI naming (``prompt_tokens``/``completion_tokens``) and
+    Anthropic/Responses naming (``input_tokens``/``output_tokens``).  Returns
+    ``None`` when the response carries no usage object.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+
+    def _int_of(*names: str) -> int:
+        for name in names:
+            value = getattr(usage, name, None)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(value)
+        return 0
+
+    prompt = _int_of("prompt_tokens", "input_tokens")
+    completion = _int_of("completion_tokens", "output_tokens")
+    total = _int_of("total_tokens") or (prompt + completion)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+    }
 
 
 class OpenAICompatAdapter:
@@ -173,6 +210,9 @@ class OpenAICompatAdapter:
     def __init__(self, client: Any, *, base_url: Optional[str] = None) -> None:
         self._client = client
         self._base_url = (base_url or "").rstrip("/")
+        #: Best-effort token usage of the most recent ``chat()`` call (see
+        #: the ``LLMAdapter.chat`` docstring for the convention).
+        self.last_usage: Optional[Dict[str, int]] = None
 
     @staticmethod
     def _json_preview(value: Any, *, limit: int = 240) -> str:
@@ -521,6 +561,7 @@ class OpenAICompatAdapter:
                 input="\n\n".join(prompt_parts),
                 max_output_tokens=max_tokens,
             )
+            self.last_usage = _normalize_token_usage(response)
 
             output_text = getattr(response, "output_text", "") or ""
             if output_text:
@@ -640,6 +681,7 @@ class OpenAICompatAdapter:
                 else:
                     request_kwargs.pop("extra_body", None)
                 token_param = alt_param
+        self.last_usage = _normalize_token_usage(response)
         return self._extract_chat_message_text(
             response=response,
             model=model,
@@ -653,6 +695,9 @@ class AnthropicAdapter:
 
     def __init__(self, client: Any) -> None:
         self._client = client
+        #: Best-effort token usage of the most recent ``chat()`` call (see
+        #: the ``LLMAdapter.chat`` docstring for the convention).
+        self.last_usage: Optional[Dict[str, int]] = None
 
     @classmethod
     def create(cls, *, api_key: Optional[str] = None) -> "AnthropicAdapter":
@@ -686,6 +731,7 @@ class AnthropicAdapter:
             kwargs["system"] = system
 
         response = await self._client.messages.create(**kwargs)
+        self.last_usage = _normalize_token_usage(response)
         return response.content[0].text if response.content else ""
 
 

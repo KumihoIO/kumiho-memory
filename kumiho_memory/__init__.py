@@ -51,6 +51,16 @@ from kumiho_memory.evidence_rank import (
     apply_evidence_weights,
     evidence_badge,
 )
+from kumiho_memory.context_compose import (
+    DEFAULT_CONTEXT_TOP_K,
+    collect_top_revisions,
+    compose_context,
+)
+from kumiho_memory.recall_rerank import (
+    RerankConfig,
+    rerank,
+    two_pass_rerank,
+)
 
 __all__ = [
     "__version__",
@@ -90,6 +100,12 @@ __all__ = [
     "EvidenceRankConfig",
     "apply_evidence_weights",
     "evidence_badge",
+    "DEFAULT_CONTEXT_TOP_K",
+    "collect_top_revisions",
+    "compose_context",
+    "RerankConfig",
+    "rerank",
+    "two_pass_rerank",
     "SPACE_CLASSES",
     "SpaceProfile",
     "SpaceProfiler",

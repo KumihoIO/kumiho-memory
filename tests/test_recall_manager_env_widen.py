@@ -85,6 +85,46 @@ def test_env_cross_encoder_mocked_activates_config(monkeypatch):
     assert mgr.rerank_config.cross_encoder_enabled is True
 
 
+def test_env_resolution_never_builds_or_crashes_on_the_adapter(monkeypatch):
+    # The summarizer's lazy ``adapter`` property builds a real LLM client and
+    # raises without an API key.  Env resolution at construction must touch
+    # it only when KUMIHO_RERANK_LLM requests it — and swallow its errors.
+    class _RaisingAdapterSummarizer:
+        light_model = "m"
+        built = 0
+
+        @property
+        def adapter(self):
+            _RaisingAdapterSummarizer.built += 1
+            raise RuntimeError("no api key configured")
+
+    monkeypatch.delenv("KUMIHO_RERANK_CROSS_ENCODER", raising=False)
+    monkeypatch.delenv("KUMIHO_RERANK_LLM", raising=False)
+    mgr = _make_manager()  # default env: property must never be touched
+    buffer = RedisMemoryBuffer(client=FakeRedis(), redis_url="redis://test")
+
+    async def _store(**k):
+        return {}
+
+    async def _retrieve(**k):
+        return []
+
+    mgr = UniversalMemoryManager(
+        redis_buffer=buffer, summarizer=_RaisingAdapterSummarizer(),
+        memory_store=_store, memory_retrieve=_retrieve,
+    )
+    assert _RaisingAdapterSummarizer.built == 0
+
+    monkeypatch.setenv("KUMIHO_RERANK_LLM", "1")
+    mgr = UniversalMemoryManager(
+        redis_buffer=buffer, summarizer=_RaisingAdapterSummarizer(),
+        memory_store=_store, memory_retrieve=_retrieve,
+    )  # property raises inside the factory — construction survives
+    assert _RaisingAdapterSummarizer.built == 1
+    assert mgr.reranker is None
+    assert mgr.rerank_config.cross_encoder_enabled is False
+
+
 def test_explicit_reranker_bypasses_env(monkeypatch):
     # When the caller passes a reranker explicitly, env is not consulted.
     monkeypatch.setenv("KUMIHO_RERANK_CROSS_ENCODER", "1")

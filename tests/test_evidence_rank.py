@@ -406,7 +406,7 @@ def test_graph_traversal_entries_not_mixed_into_weighted_sort():
         evidence_rerank_fn=lambda mems: apply_evidence_weights(mems, rank_cfg),
     )
 
-    async def fake_traverse(memories, seen_krefs, augmented):
+    async def fake_traverse(seed_krefs, seen_krefs, augmented, edge_types=None):
         for kref in ("kref://trav1", "kref://trav2"):
             augmented.append({
                 "kref": kref, "title": "t", "summary": "s",
@@ -448,7 +448,7 @@ def test_graded_traversal_entry_does_not_outrank_base_hits():
         evidence_rerank_fn=lambda mems: apply_evidence_weights(mems, rank_cfg),
     )
 
-    async def fake_traverse(memories, seen_krefs, augmented):
+    async def fake_traverse(seed_krefs, seen_krefs, augmented, edge_types=None):
         augmented.append({
             "kref": "kref://trav-official", "title": "t", "summary": "s",
             "score": 0.0, "graph_augmented": True,

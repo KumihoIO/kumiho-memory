@@ -60,6 +60,26 @@ class GraphAugmentationConfig:
     traversal_timeout: int = 30  # seconds; daemon thread timeout for gRPC edge traversal
     edge_creation_timeout: int = 60  # seconds; daemon thread timeout for edge creation
 
+    #: Enrich the merged base results with sibling revisions *before* edge
+    #: traversal, then seed traversal and the semantic fallback from the
+    #: top-scored flattened revisions instead of the primary items.  With
+    #: revision stacking the primaries are often the same 1-2 items whose
+    #: published revision carries few edges — the question-specific sibling
+    #: revisions are where post-consolidation edges actually hang.  Costs
+    #: sibling enrichment on the merged pool before the final cap (the
+    #: enrichment is reused; the manager does not re-enrich), so it is
+    #: opt-in.  No-op unless the host injects a ``sibling_fetch_fn``.
+    sibling_seeded_traversal: bool = False
+
+    #: Optional usage-accounting hook, called as ``on_llm_usage(phase, info)``
+    #: after each internal LLM call.  ``phase`` is ``"recall_reformulation"``
+    #: or ``"implication_queries"``; ``info`` carries ``model`` plus
+    #: best-effort ``prompt_tokens`` / ``completion_tokens`` /
+    #: ``total_tokens`` (zeros when the adapter does not expose a
+    #: ``last_usage`` dict — see :class:`kumiho_memory.summarization.LLMAdapter`).
+    #: Hook errors are swallowed; recall never breaks on accounting.
+    on_llm_usage: Optional[Callable[[str, Dict[str, Any]], None]] = None
+
 
 # ---------------------------------------------------------------------------
 # Core class
@@ -84,6 +104,13 @@ class GraphAugmentedRecall:
 
     config:
         Optional configuration overrides.
+    sibling_fetch_fn:
+        Optional async callable ``(memories, query) -> memories`` that
+        attaches ``sibling_revisions`` (scored against *query*) to the merged
+        base results.  When provided, it runs before edge traversal so
+        traversal and the semantic fallback can seed from the top-scored
+        flattened revisions (see
+        :attr:`GraphAugmentationConfig.sibling_seeded_traversal`).
     """
 
     def __init__(
@@ -95,6 +122,12 @@ class GraphAugmentedRecall:
         evidence_rerank_fn: Optional[
             Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
         ] = None,
+        sibling_fetch_fn: Optional[
+            Callable[
+                [List[Dict[str, Any]], str],
+                Coroutine[Any, Any, List[Dict[str, Any]]],
+            ]
+        ] = None,
     ) -> None:
         self.adapter = adapter
         self.model = model
@@ -105,6 +138,7 @@ class GraphAugmentedRecall:
         # before each result cap.  Must be idempotent — it runs at both
         # the multi-query merge slice and the final cap.
         self.evidence_rerank_fn = evidence_rerank_fn
+        self.sibling_fetch_fn = sibling_fetch_fn
 
     # ------------------------------------------------------------------
     # Public API — recall
@@ -117,14 +151,27 @@ class GraphAugmentedRecall:
         limit: int = 5,
         space_paths: Optional[List[str]] = None,
         memory_types: Optional[List[str]] = None,
+        max_total: Optional[int] = None,
+        max_hops: Optional[int] = None,
+        edge_types: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Multi-query reformulation → parallel recall → edge traversal → merge.
 
         After standard vector recall, follows edges from each recalled memory
         to discover connected memories that vector similarity alone would miss.
         Falls back to multi-hop semantic recall when no graph edges are found.
+
+        ``max_total``, ``max_hops``, and ``edge_types`` are optional per-call
+        overrides of the corresponding :class:`GraphAugmentationConfig`
+        fields; ``None`` (the default) keeps the configured values.
         """
         base_limit = limit
+        effective_max_hops = (
+            self.config.max_hops if max_hops is None else max_hops
+        )
+        effective_edge_types = (
+            self.config.edge_types if edge_types is None else edge_types
+        )
 
         # --- Stage 1: Multi-query reformulation (requires LLM) ---
         alt_queries: List[str] = []
@@ -183,21 +230,57 @@ class GraphAugmentedRecall:
         if not memories:
             return memories
 
-        seen_krefs: set = {m.get("kref", "") for m in memories if m.get("kref")}
+        # --- Stage 2b: Optional sibling enrichment (before traversal) ---
+        # With revision stacking the primaries are often the same 1-2 items;
+        # the question-specific revisions (and the edges created for them by
+        # post-consolidation discovery) live in the sibling stack.  Attaching
+        # scored siblings here lets traversal + fallback seed from the
+        # top-scored *revisions* instead of the item shells.
+        if self.sibling_fetch_fn is not None:
+            try:
+                memories = await self.sibling_fetch_fn(memories, query)
+            except Exception as exc:
+                logger.debug("sibling_fetch_fn failed, seeding from primaries: %s", exc)
+
+        # Mark sibling krefs as seen too, so edge traversal doesn't
+        # re-discover revisions we already have (no-op without siblings).
+        seen_krefs: set = set()
+        for mem in memories:
+            kref = mem.get("kref", "")
+            if kref:
+                seen_krefs.add(kref)
+            for sib in mem.get("sibling_revisions") or []:
+                sib_kref = sib.get("kref", "")
+                if sib_kref:
+                    seen_krefs.add(sib_kref)
+
         augmented = list(memories)
 
         # --- Stage 3: Edge traversal via kumiho SDK ---
+        # Seeds are the top-K scored revisions: flattened siblings when
+        # present (question-specific), otherwise the primaries — which for
+        # sibling-less memories reduces exactly to the historical
+        # ``memories[:top_k]`` (the merged list is already score-descending).
+        seed_krefs = _traversal_seed_krefs(
+            memories, self.config.top_k_for_traversal,
+        )
         graph_found = await self._traverse_edges(
-            memories, seen_krefs, augmented,
+            seed_krefs, seen_krefs, augmented,
+            edge_types=effective_edge_types,
         )
 
         # --- Stage 4: Semantic fallback (when no edges found) ---
-        if graph_found == 0 and self.config.max_hops >= 1:
+        if graph_found == 0 and effective_max_hops >= 1:
             logger.debug("No graph edges found, falling back to multi-hop semantic recall")
+            from kumiho_memory.context_compose import collect_top_revisions
+
             secondary_terms: List[str] = []
-            for mem in memories[: self.config.top_k_for_traversal]:
-                title = mem.get("title", "")
-                summary = mem.get("summary", "")
+            top_revisions = collect_top_revisions(
+                memories, self.config.top_k_for_traversal,
+            )
+            for rev_info in top_revisions:
+                title = rev_info.get("title", "")
+                summary = rev_info.get("summary", "")
                 if title:
                     secondary_terms.append(title)
                 elif summary:
@@ -241,7 +324,7 @@ class GraphAugmentedRecall:
                 logger.debug("evidence_rerank_fn failed at final cap: %s", exc)
 
         # Cap to prevent context noise
-        cap = self.config.max_total or (base_limit * 3)
+        cap = max_total or self.config.max_total or (base_limit * 3)
         if len(augmented) > cap:
             logger.info("Capping augmented memories from %d to %d", len(augmented), cap)
             augmented = augmented[:cap]
@@ -437,6 +520,7 @@ class GraphAugmentedRecall:
                 system=system,
                 max_tokens=100,
             )
+            self._report_llm_usage("recall_reformulation")
             queries = [
                 line.strip().lstrip("0123456789.-) ")
                 for line in raw.splitlines()
@@ -485,6 +569,7 @@ class GraphAugmentedRecall:
                     "queries",
                 ),
             )
+            self._report_llm_usage("implication_queries")
             # Strip markdown code fences if present
             cleaned = raw.strip()
             if cleaned.startswith("```"):
@@ -503,17 +588,47 @@ class GraphAugmentedRecall:
             )
         return []
 
+    def _report_llm_usage(self, phase: str) -> None:
+        """Invoke the optional usage hook after an internal LLM call.
+
+        Token counts come from the adapter's best-effort ``last_usage``
+        attribute (set by the built-in adapters after each ``chat()``); when
+        absent the hook still fires with zero counts so callers can at least
+        count calls.  Hook errors are logged and swallowed — accounting must
+        never break recall.
+        """
+        hook = getattr(self.config, "on_llm_usage", None)
+        if hook is None:
+            return
+        info: Dict[str, Any] = {
+            "model": self.model,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        usage = getattr(self.adapter, "last_usage", None)
+        if isinstance(usage, dict):
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                value = usage.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    info[key] = int(value)
+        try:
+            hook(phase, info)
+        except Exception as exc:
+            logger.debug("on_llm_usage hook failed for %s: %s", phase, exc)
+
     # ------------------------------------------------------------------
     # Private — edge traversal
     # ------------------------------------------------------------------
 
     async def _traverse_edges(
         self,
-        memories: List[Dict[str, Any]],
+        seed_krefs: List[str],
         seen_krefs: set,
         augmented: List[Dict[str, Any]],
+        edge_types: Optional[List[str]] = None,
     ) -> int:
-        """Follow graph edges from top-K memories and append connected nodes.
+        """Follow graph edges from the seed revisions and append connected nodes.
 
         Uses a daemon thread with OS-level timeout to prevent gRPC calls from
         hanging indefinitely on Windows (ProactorEventLoop doesn't process
@@ -525,8 +640,9 @@ class GraphAugmentedRecall:
             logger.debug("kumiho SDK not available, skipping edge traversal")
             return 0
 
-        edge_filter = set(self.config.edge_types)
-        top_k = self.config.top_k_for_traversal
+        edge_filter = set(
+            self.config.edge_types if edge_types is None else edge_types
+        )
         timeout = self.config.traversal_timeout
 
         # Mutable containers shared with the daemon thread.
@@ -536,8 +652,7 @@ class GraphAugmentedRecall:
         def _sync_graph_traverse() -> int:
             """Run all synchronous gRPC calls in a plain thread."""
             found = 0
-            for mem in memories[:top_k]:
-                kref_str = mem.get("kref", "")
+            for kref_str in seed_krefs:
                 if not kref_str:
                     continue
                 try:
@@ -620,6 +735,43 @@ class GraphAugmentedRecall:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _traversal_seed_krefs(
+    memories: List[Dict[str, Any]],
+    top_k: int,
+) -> List[str]:
+    """Top-*top_k* revision krefs to traverse edges from, best score first.
+
+    Flattens ``sibling_revisions`` (skipping the primary shell when siblings
+    exist — the sibling list contains all revisions of the item and their
+    ``_score`` is on a different scale than the item-level recall ``score``);
+    memories without siblings contribute their own kref/score.  For a
+    sibling-less result set this reduces exactly to the historical
+    ``memories[:top_k]`` seeding: the merged list arrives score-descending
+    and the sort here is stable.
+    """
+    candidates: List[tuple] = []
+    for mem in memories:
+        siblings = mem.get("sibling_revisions") or []
+        if siblings:
+            for sib in siblings:
+                sib_kref = sib.get("kref", "")
+                if sib_kref:
+                    candidates.append((sib_kref, _numeric(sib.get("_score"))))
+        else:
+            kref = mem.get("kref", "")
+            if kref:
+                candidates.append((kref, _numeric(mem.get("score"))))
+    candidates.sort(key=lambda c: c[1], reverse=True)
+    return [kref for kref, _ in candidates[:top_k]]
+
+
+def _numeric(value: Any) -> float:
+    """Coerce a score to float; non-numeric (or bool) counts as 0.0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
 
 
 def _derive_space_paths(revision_kref: str) -> Optional[List[str]]:

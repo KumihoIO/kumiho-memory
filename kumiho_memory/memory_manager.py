@@ -223,6 +223,14 @@ class UniversalMemoryManager:
         )
         self.retry_queue = retry_queue
         self.store_max_retries = store_max_retries
+        # Graph-augmented recall: pass a GraphAugmentationConfig for full
+        # control, or simply ``True`` for the default config — no boilerplate.
+        # Falsy values (None/False/0) read naturally as "disabled".
+        if graph_augmentation is True:
+            from kumiho_memory.graph_augmentation import GraphAugmentationConfig
+            graph_augmentation = GraphAugmentationConfig()
+        elif not graph_augmentation:
+            graph_augmentation = None
         self.graph_augmentation_config = graph_augmentation
         self._graph_recall: Optional[Any] = None  # lazy GraphAugmentedRecall
         self.recall_mode = recall_mode
@@ -258,9 +266,13 @@ class UniversalMemoryManager:
             # reranker wiring the MCP server does.  With NO env vars set this
             # is exactly RerankConfig() + reranker=None — behavior unchanged.
             rerank = RerankConfig.from_env()
-            adapter = getattr(self.summarizer, "adapter", None)
-            model = getattr(self.summarizer, "light_model", "") or ""
-            reranker = resolve_reranker_from_env(adapter=adapter, model=model)
+            # Lazy factory: the summarizer's ``adapter`` property builds (and
+            # may fail to build, e.g. no API key) a real LLM client — only
+            # touch it if KUMIHO_RERANK_LLM actually requests the LLM path.
+            reranker = resolve_reranker_from_env(
+                adapter_factory=lambda: getattr(self.summarizer, "adapter", None),
+                model=getattr(self.summarizer, "light_model", "") or "",
+            )
             if reranker is not None:
                 rerank.cross_encoder_enabled = True
         elif rerank is None:
@@ -1314,7 +1326,7 @@ class UniversalMemoryManager:
             (:attr:`RerankConfig.event_proximity_enabled`).  Pass it ONLY for
             queries with a temporal intent; leaving it ``None`` (the default)
             keeps that prior fully dormant, so general recall is unchanged.
-            Applies to the plain (non-graph) recall path.
+            Applies to both the plain and the graph-augmented recall path.
         """
         if graph_augmented and self.graph_augmentation_config is not None:
             gr = self._get_graph_recall()
@@ -1323,12 +1335,45 @@ class UniversalMemoryManager:
                 # artifacts) internally so reformulated queries don't
                 # duplicate expensive work.  Sibling enrichment runs once
                 # on the final merged set.
+                #
+                # Retrieve-wide-then-trim applies here exactly as on the
+                # plain path: over-fetch candidates, run the full rerank
+                # stack on the wide merged set, trim back to the size the
+                # caller would have gotten unwidened, THEN enrich — so the
+                # best-reranked candidates survive and only they pay for
+                # sibling enrichment.
+                multiplier = self.recall_candidate_multiplier
+                fetch_limit = (
+                    math.ceil(limit * multiplier) if multiplier > 1.0 else limit
+                )
                 memories = await gr.recall(
                     query,
-                    limit=limit,
+                    limit=fetch_limit,
                     space_paths=space_paths,
                     memory_types=memory_types,
                 )
+                # Same post-recall rerank stack as the plain path:
+                # cross-encoder (optional) + evidence prior + recency prior +
+                # event-proximity (temporal queries) + MMR diversity.  Every
+                # stage no-ops safely; evidence is recomputed from base_score
+                # so GraphAugmentedRecall's internal weighting is never
+                # double-counted.  Traversal-only entries carry score 0.0 and
+                # no created_at, so without a cross-encoder they keep
+                # trailing the direct hits — the historical partition — while
+                # a cross-encoder gives them a real relevance measurement.
+                from kumiho_memory.recall_rerank import rerank
+                target = self.graph_augmentation_config.max_total or (limit * 3)
+                memories = rerank(
+                    query,
+                    memories,
+                    evidence_config=self.evidence_rank_config,
+                    config=self.rerank_config,
+                    reranker=self.reranker,
+                    limit=target,
+                    query_time=query_time,
+                )
+                if len(memories) > target:
+                    memories = memories[:target]
                 return await self._enrich_with_siblings(memories, query)
 
         return await self._base_recall(
@@ -1523,6 +1568,20 @@ class UniversalMemoryManager:
 
             from kumiho_memory.evidence_rank import apply_evidence_weights
 
+            # Opt-in: seed edge traversal from top-scored sibling revisions.
+            # The enrichment runs once inside GraphAugmentedRecall (it pops
+            # _item_kref), so the manager's post-recall enrichment pass
+            # skips those entries instead of re-doing the work.
+            sibling_fetch_fn = (
+                self._enrich_with_siblings
+                if getattr(
+                    self.graph_augmentation_config,
+                    "sibling_seeded_traversal",
+                    False,
+                )
+                else None
+            )
+
             self._graph_recall = GraphAugmentedRecall(
                 adapter=adapter,
                 model=model,
@@ -1531,6 +1590,7 @@ class UniversalMemoryManager:
                 evidence_rerank_fn=lambda mems: apply_evidence_weights(
                     mems, self.evidence_rank_config,
                 ),
+                sibling_fetch_fn=sibling_fetch_fn,
             )
             return self._graph_recall
         except Exception as e:
@@ -1644,6 +1704,62 @@ class UniversalMemoryManager:
                             )
 
         return "\n\n".join(texts) if texts else ""
+
+    def compose_context(
+        self,
+        memories: List[Dict[str, Any]],
+        query: str = "",
+        *,
+        mode: Optional[str] = None,
+        top_k: Optional[int] = None,
+        char_limit: int = 8000,
+    ) -> str:
+        """Revision-centric context assembly (see :mod:`kumiho_memory.context_compose`).
+
+        Flattens primary + ``sibling_revisions`` from every recalled memory
+        (skipping the primary shell when siblings exist — they contain all
+        revisions), ranks the pool globally by ``_score``, caps it at
+        *top_k*, and renders ``"full"`` (raw content) or ``"summarized"``
+        (title+summary) text.
+
+        Complements :meth:`build_recalled_context` (item-centric, with
+        evidence badges/facts/event dates): use ``compose_context`` when the
+        best revisions should compete globally regardless of which item they
+        belong to — e.g. heavily stacked items.
+
+        *mode* defaults to the manager's ``recall_mode``; *top_k* ``None``
+        uses :data:`kumiho_memory.context_compose.DEFAULT_CONTEXT_TOP_K`
+        (pass ``0`` for unlimited).
+        """
+        from kumiho_memory.context_compose import compose_context
+
+        return compose_context(
+            memories,
+            query,
+            mode=mode or self.recall_mode,
+            top_k=top_k,
+            char_limit=char_limit,
+        )
+
+    def rerank_memories(
+        self,
+        memories: List[Dict[str, Any]],
+        query: str,
+    ) -> List[Dict[str, Any]]:
+        """Two-pass focused rerank of recalled memories and their siblings.
+
+        Re-scores every memory (``score``) and every ``sibling_revisions``
+        entry (``_score``) with the configured ``embedding_adapter`` over
+        **title+summary text only**, replacing the server scores so the most
+        directly relevant revisions rank highest in
+        :meth:`compose_context`'s global pool.  Safe no-op (input returned
+        unchanged) when no embedding adapter is configured, *query* is
+        empty, or embedding fails — see
+        :func:`kumiho_memory.recall_rerank.two_pass_rerank`.
+        """
+        from kumiho_memory.recall_rerank import two_pass_rerank
+
+        return two_pass_rerank(query, memories, self.embedding_adapter)
 
     async def _fetch_revision_metadata(
         self, kref: str, load_artifacts: bool = True,
