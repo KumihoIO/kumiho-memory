@@ -196,6 +196,7 @@ class UniversalMemoryManager:
         evidence_rank: Optional[Any] = None,
         rerank: Optional[Any] = None,
         reranker: Optional[Any] = None,
+        recall_candidate_multiplier: float = 1.0,
     ) -> None:
         self.project = project
         self.consolidation_threshold = consolidation_threshold
@@ -246,8 +247,23 @@ class UniversalMemoryManager:
         # default on, conservative) and an optional cross-encoder relevance
         # stage.  None -> defaults; falsy -> everything disabled.  Subsumes
         # evidence weighting on the plain recall path (applied once).
-        from kumiho_memory.recall_rerank import RerankConfig
-        if rerank is None:
+        from kumiho_memory.recall_rerank import (
+            RerankConfig,
+            resolve_reranker_from_env,
+        )
+        if rerank is None and reranker is None:
+            # No explicit rerank config AND no explicit reranker: honor the
+            # KUMIHO_RERANK_* / KUMIHO_RECALL_RERANK env conventions so direct
+            # construction (SDK users, benchmark harnesses) gets the same
+            # reranker wiring the MCP server does.  With NO env vars set this
+            # is exactly RerankConfig() + reranker=None — behavior unchanged.
+            rerank = RerankConfig.from_env()
+            adapter = getattr(self.summarizer, "adapter", None)
+            model = getattr(self.summarizer, "light_model", "") or ""
+            reranker = resolve_reranker_from_env(adapter=adapter, model=model)
+            if reranker is not None:
+                rerank.cross_encoder_enabled = True
+        elif rerank is None:
             rerank = RerankConfig()
         elif not rerank:
             rerank = RerankConfig(
@@ -255,6 +271,14 @@ class UniversalMemoryManager:
             )
         self.rerank_config = rerank
         self.reranker = reranker
+        # Retrieve-wide-then-trim: when > 1.0, recall over-fetches candidates
+        # (ceil(limit * multiplier)), runs the full rerank stack on the wide
+        # set, then trims back to the caller's limit — lifting gold-in-context
+        # without enlarging the returned result.  1.0 == current behavior.
+        try:
+            self.recall_candidate_multiplier = max(1.0, float(recall_candidate_multiplier))
+        except (TypeError, ValueError):
+            self.recall_candidate_multiplier = 1.0
         # Background memory assessor (model-agnostic, optional)
         self.auto_assess_fn: Optional[AutoAssessFn] = auto_assess_fn
         self.auto_assess_min_messages = auto_assess_min_messages
@@ -1263,6 +1287,7 @@ class UniversalMemoryManager:
         space_paths: Optional[List[str]] = None,
         memory_types: Optional[List[str]] = None,
         graph_augmented: bool = False,
+        query_time: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve long-term memories by semantic query.
 
@@ -1284,6 +1309,12 @@ class UniversalMemoryManager:
             When ``True`` and a ``GraphAugmentationConfig`` was provided,
             uses multi-query reformulation + graph edge traversal to
             discover connected memories that vector search alone misses.
+        query_time:
+            Reference instant for the optional event-proximity rerank prior
+            (:attr:`RerankConfig.event_proximity_enabled`).  Pass it ONLY for
+            queries with a temporal intent; leaving it ``None`` (the default)
+            keeps that prior fully dormant, so general recall is unchanged.
+            Applies to the plain (non-graph) recall path.
         """
         if graph_augmented and self.graph_augmentation_config is not None:
             gr = self._get_graph_recall()
@@ -1302,7 +1333,7 @@ class UniversalMemoryManager:
 
         return await self._base_recall(
             query, limit=limit, space_paths=space_paths,
-            memory_types=memory_types,
+            memory_types=memory_types, query_time=query_time,
         )
 
     async def _lightweight_recall(
@@ -1423,14 +1454,25 @@ class UniversalMemoryManager:
         limit: int = 5,
         space_paths: Optional[List[str]] = None,
         memory_types: Optional[List[str]] = None,
+        query_time: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """Core vector/fulltext recall without graph augmentation.
 
         Performs lightweight recall then enriches with siblings in one
         pass.  Used for non-graph-augmented path.
+
+        Retrieve-wide-then-trim: when ``recall_candidate_multiplier > 1.0``
+        the underlying search fetches ``ceil(limit * multiplier)`` candidates,
+        the full rerank stack runs on that wide set, and the result is trimmed
+        back to ``limit`` *before* the expensive sibling enrichment — so the
+        best-reranked candidates survive and only they are enriched.
         """
+        multiplier = self.recall_candidate_multiplier
+        fetch_limit = (
+            math.ceil(limit * multiplier) if multiplier > 1.0 else limit
+        )
         memories = await self._lightweight_recall(
-            query, limit=limit, space_paths=space_paths,
+            query, limit=fetch_limit, space_paths=space_paths,
             memory_types=memory_types,
         )
         # Post-recall rerank on the plain path: cross-encoder (optional) +
@@ -1445,7 +1487,13 @@ class UniversalMemoryManager:
             config=self.rerank_config,
             reranker=self.reranker,
             limit=limit,
+            query_time=query_time,
         )
+        # Trim the over-fetched candidates back to the caller's limit after
+        # reranking has surfaced the strongest to the front (rerank's MMR
+        # already front-loads `limit` items when it runs).
+        if fetch_limit > limit and len(memories) > limit:
+            memories = memories[:limit]
         return await self._enrich_with_siblings(memories, query)
 
     def _get_graph_recall(self) -> Optional[Any]:
@@ -1848,47 +1896,176 @@ class UniversalMemoryManager:
             logger.warning("LLM sibling reranker failed: %s", e)
             return None
 
+    def _rank_siblings_deterministic(
+        self,
+        siblings: List[Dict[str, Any]],
+        query: str,
+        current_rev_kref: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Rank siblings by a local, in-process relevance signal.
+
+        The deterministic counterpart to :meth:`_rerank_siblings_with_llm`.
+        Prefers embedding cosine when an ``embedding_adapter`` is configured
+        (honoring ``sibling_similarity_threshold`` and ``sibling_top_k``);
+        otherwise falls back to BM25-light keyword overlap (honoring
+        ``sibling_strong_score``, ``sibling_char_budget`` and
+        ``sibling_top_k``), exactly the scoring the default keyword path uses.
+
+        Critically it stays **in-process** — no ``ScoreRevisions`` RPC — so it
+        avoids the ~8s server round-trip the old fallback incurred.  Each kept
+        sibling carries ``_score`` (most-relevant first).
+
+        When ``current_rev_kref`` names the primary (published) revision, that
+        revision is always retained even if it scores below the cut: the
+        downstream context builder skips the primary item entry whenever the
+        sibling list is non-empty, so dropping the primary here would silently
+        lose its content.
+        """
+        if not siblings or not query:
+            return siblings
+
+        # Embedding cosine — the strongest local signal, when available.
+        if self.embedding_adapter is not None and self.sibling_similarity_threshold > 0:
+            ranked = self._filter_siblings_by_embedding(
+                siblings, query, self.sibling_similarity_threshold,
+            )
+            # The embedding filter may drop everything below threshold; only
+            # trust it when it kept something, else fall through to keyword.
+            if ranked:
+                return self._ensure_primary_retained(
+                    ranked, siblings, current_rev_kref,
+                )
+
+        # BM25-light keyword overlap (same scoring as the default Mode 3 path).
+        query_tokens = _tokenize(query)
+        for sib in siblings:
+            text = f"{sib.get('title', '')} {sib.get('summary', '')}"
+            sib["_score"] = (
+                _token_overlap_score(query_tokens, text) if query_tokens else 0.0
+            )
+
+        best_score = max((s["_score"] for s in siblings), default=0.0)
+        if best_score >= self.sibling_strong_score:
+            # Strong lexical signal — keep only meaningful matches, best first.
+            kept = sorted(
+                [s for s in siblings if s["_score"] >= self.sibling_strong_score],
+                key=lambda s: s["_score"], reverse=True,
+            )
+        else:
+            # Weak/no signal — keep all that fit the char budget, chronological
+            # for full timeline coverage (mirrors the default keyword path).
+            kept = sorted(siblings, key=lambda s: s.get("created_at") or "")
+            total = sum(
+                len(f"{s.get('title', '')} {s.get('summary', '')}") for s in kept
+            )
+            if total > self.sibling_char_budget:
+                selected: List[Dict[str, Any]] = []
+                used = 0
+                for sib in kept:
+                    chars = len(f"{sib.get('title', '')} {sib.get('summary', '')}")
+                    if used + chars > self.sibling_char_budget:
+                        continue
+                    selected.append(sib)
+                    used += chars
+                kept = selected
+
+        if self.sibling_top_k > 0 and len(kept) > self.sibling_top_k:
+            kept = kept[: self.sibling_top_k]
+
+        return self._ensure_primary_retained(kept, siblings, current_rev_kref)
+
+    @staticmethod
+    def _ensure_primary_retained(
+        kept: List[Dict[str, Any]],
+        all_siblings: List[Dict[str, Any]],
+        current_rev_kref: str,
+    ) -> List[Dict[str, Any]]:
+        """Append the primary revision to *kept* if a filter dropped it.
+
+        The downstream context builder skips the primary item entry when the
+        sibling list is non-empty, so a non-empty result that excludes the
+        primary would silently lose the primary's content.  No-ops when the
+        primary is unknown, already kept, or *kept* is empty (an empty result
+        means "use the primary directly" downstream).
+        """
+        if not current_rev_kref or not kept:
+            return kept
+        if any(s.get("kref") == current_rev_kref for s in kept):
+            return kept
+        primary = next(
+            (s for s in all_siblings if s.get("kref") == current_rev_kref), None
+        )
+        if primary is not None:
+            kept = kept + [primary]
+        return kept
+
     async def _filter_siblings_by_server_search(
         self,
         siblings: List[Dict[str, Any]],
         query: str,
         item_kref: str,
+        current_rev_kref: str = "",
     ) -> List[Dict[str, Any]]:
-        """Filter siblings using LLM reranking.
+        """Select relevant siblings: LLM reranker primary, deterministic fallback.
 
-        The LLM reads all sibling summaries and picks the most relevant
-        ones.  This handles semantic inversion (cognitive/goal questions)
-        that cosine similarity fundamentally cannot bridge.
+        Hybrid, not either/or.  The LLM reranker stays the **primary** signal:
+        it reads every sibling summary and picks the most relevant, resolving
+        the semantic inversion (cognitive/goal questions) that cosine and
+        keyword scoring fundamentally cannot bridge — its selections rank on
+        top with their assigned scores and are never overridden.
 
-        When the LLM reranker returns ``None`` (no relevant siblings or
-        adapter unavailable), return an empty list so only the primary
-        revision is used.  Dumping all siblings unfiltered into context
-        is noisy and wasteful.  The previous cosine-similarity fallback
-        was removed because it adds significant latency (~8s via
-        ``ScoreRevisions`` RPC) without meaningfully improving on the
-        LLM's judgment.
+        When the LLM returns ``None`` (no pick), errors, or is unavailable, we
+        **fall back to a deterministic in-process ranking** of the siblings
+        rather than returning ``[]``.  Returning ``[]`` there was the LoCoMo
+        single-hop / temporal regression: for direct-fact queries the LLM
+        often answers "none" yet the correct sibling is present and cheaply
+        rankable locally.  The fallback (:meth:`_rank_siblings_deterministic`)
+        prefers local embedding cosine when an adapter is configured, else
+        BM25-light keyword overlap — no ``ScoreRevisions`` RPC, so it avoids
+        the ~8s server round-trip the old fallback incurred.
+
+        On an LLM *success* a single capped union is applied: the top
+        deterministically-scored sibling is appended when (a) the LLM did not
+        already pick it and (b) it has a *strong* lexical/semantic score
+        (``>= sibling_strong_score``).  This recovers a lexically-obvious
+        match the LLM missed on direct-fact queries without flooding context,
+        and no-ops on weak-overlap cognitive queries so the LLM's precise
+        selection is left intact.
         """
         if not siblings or not query:
             return siblings
 
-        # --- Primary: LLM reranking ---
+        # --- Primary: LLM reranking (semantic inversion) ---
         llm_result = await self._rerank_siblings_with_llm(siblings, query)
         if llm_result:
+            # Bounded union: recover one strong lexical match the LLM missed.
+            ranked = self._rank_siblings_deterministic(
+                list(siblings), query, current_rev_kref,
+            )
+            if ranked:
+                top = ranked[0]
+                picked = {s.get("kref") for s in llm_result}
+                if (
+                    top.get("kref") not in picked
+                    and float(top.get("_score", 0.0)) >= self.sibling_strong_score
+                ):
+                    llm_result = llm_result + [top]
             logger.info(
                 "LLM sibling reranker: %d/%d selected (query: %.60s)",
                 len(llm_result), len(siblings), query,
             )
             return llm_result
 
-        # LLM returned None — no relevant siblings identified.  Return
-        # empty so only the primary revision is used.  Dumping all siblings
-        # unfiltered would be noisy and defeat the purpose of reranking.
-        logger.info(
-            "LLM sibling reranker returned None, skipping all %d siblings "
-            "(query: %.60s)",
-            len(siblings), query,
+        # --- Fallback: deterministic ranking (LLM None / error / unavailable) ---
+        ranked = self._rank_siblings_deterministic(
+            siblings, query, current_rev_kref,
         )
-        return []
+        logger.info(
+            "LLM sibling reranker returned None; deterministic fallback kept "
+            "%d/%d siblings (query: %.60s)",
+            len(ranked), len(siblings), query,
+        )
+        return ranked
 
     async def _fetch_sibling_revision_summaries(
         self,
@@ -1968,9 +2145,10 @@ class UniversalMemoryManager:
                         siblings, query, self.sibling_similarity_threshold,
                     )
                 else:
-                    # Mode 2: Server-scored hybrid search (no external API)
+                    # Mode 2: LLM reranker with a deterministic in-process
+                    # fallback (no external API, no ScoreRevisions RPC).
                     siblings = await self._filter_siblings_by_server_search(
-                        siblings, query, item_kref,
+                        siblings, query, item_kref, current_rev_kref,
                     )
 
                 # Clean up internal keys before loading artifacts.

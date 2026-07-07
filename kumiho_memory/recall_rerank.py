@@ -24,17 +24,21 @@ Order of operations in :func:`rerank`:
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from kumiho_memory.evidence_rank import (
     EvidenceRankConfig,
     evidence_badge,
     parse_evidence,
 )
+
+logger = logging.getLogger(__name__)
 
 #: A reranker scores a query against candidate texts and returns one relevance
 #: float per text (higher = more relevant). Backends: a cross-encoder
@@ -76,6 +80,23 @@ class RerankConfig:
     event_proximity_enabled: bool = False
     event_proximity_half_life_days: float = 45.0
     event_proximity_max_boost: float = 0.12
+
+    @classmethod
+    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "RerankConfig":
+        """Build a config from the ``KUMIHO_RECALL_RERANK`` kill switch env var.
+
+        ``KUMIHO_RECALL_RERANK=0``/``false`` disables the deterministic
+        recency + MMR stages (matching the MCP server's convention); every
+        other knob keeps its default. The optional cross-encoder stage is
+        turned on separately by :func:`resolve_reranker_from_env` once a
+        reranker is actually available — so with **no** env vars set this
+        returns a plain :class:`RerankConfig`, i.e. exactly the default
+        behavior.
+        """
+        env = os.environ if env is None else env
+        if str(env.get("KUMIHO_RECALL_RERANK", "")).strip().lower() in ("0", "false"):
+            return cls(recency_enabled=False, mmr_enabled=False)
+        return cls()
 
 
 # ---------------------------------------------------------------------------
@@ -511,3 +532,59 @@ def make_llm_reranker(
         return _parse_llm_scores(raw, len(texts))
 
     return _rerank
+
+
+# ---------------------------------------------------------------------------
+# Shared env-based reranker resolution
+# ---------------------------------------------------------------------------
+
+def resolve_reranker_from_env(
+    adapter: Optional[Any] = None,
+    model: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[Reranker]:
+    """Resolve a :data:`Reranker` from ``KUMIHO_RERANK_*`` env vars, or ``None``.
+
+    Centralizes the reranker wiring that was previously inline in the MCP
+    server so **every** construction path (the MCP server, direct
+    ``KumihoMemoryManager`` construction, benchmark harnesses, SDK users) gets
+    identical behavior. The env conventions mirror the MCP server's:
+
+    * ``KUMIHO_RERANK_CROSS_ENCODER=1`` — local bge cross-encoder via
+      :func:`try_fastembed_reranker` (needs the ``fastembed`` extra).
+    * ``KUMIHO_RERANK_LLM=1`` — the host LLM itself via
+      :func:`make_llm_reranker`, reusing ``adapter`` + ``model`` (no extra
+      model download or API key). The cross-encoder wins if both are set.
+
+    Returns ``None`` when no env var requests a reranker, or when the requested
+    backend is unavailable (``fastembed`` missing, or no ``adapter`` for the
+    LLM path) — logging a warning so the miswire is visible while recall keeps
+    working (every rerank stage no-ops safely). Callers turn the cross-encoder
+    stage on (``RerankConfig.cross_encoder_enabled = True``) only when this
+    returns a reranker.
+    """
+    env = os.environ if env is None else env
+    truthy = ("1", "true", "yes")
+
+    if str(env.get("KUMIHO_RERANK_CROSS_ENCODER", "")).strip().lower() in truthy:
+        reranker = try_fastembed_reranker()
+        if reranker is not None:
+            logger.info("Cross-encoder recall rerank enabled (fastembed)")
+            return reranker
+        logger.warning(
+            "KUMIHO_RERANK_CROSS_ENCODER set but fastembed/model is "
+            "unavailable — install the 'fastembed' extra to enable."
+        )
+
+    if str(env.get("KUMIHO_RERANK_LLM", "")).strip().lower() in truthy:
+        if adapter is not None:
+            logger.info(
+                "LLM recall rerank enabled (host adapter, model=%s)", model or ""
+            )
+            return make_llm_reranker(adapter, model or "")
+        logger.warning(
+            "KUMIHO_RERANK_LLM set but no LLM adapter is configured — set "
+            "ANTHROPIC_API_KEY or OPENAI_API_KEY to enable LLM rerank."
+        )
+
+    return None

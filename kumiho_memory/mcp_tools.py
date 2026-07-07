@@ -191,40 +191,19 @@ def _get_manager():
     try:
         from kumiho_memory.recall_rerank import (
             RerankConfig,
-            make_llm_reranker,
-            try_fastembed_reranker,
+            resolve_reranker_from_env,
         )
+        # Shared env resolution — identical wiring for every construction path
+        # (see resolve_reranker_from_env / RerankConfig.from_env).
+        rerank_config = RerankConfig.from_env()
         if os.environ.get("KUMIHO_RECALL_RERANK", "").strip().lower() in ("0", "false"):
-            rerank_config = RerankConfig(recency_enabled=False, mmr_enabled=False)
             logger.info("Post-recall rerank (recency/MMR) disabled via env")
-        else:
-            rerank_config = RerankConfig()
-
-        _truthy = ("1", "true", "yes")
-        if os.environ.get("KUMIHO_RERANK_CROSS_ENCODER", "").strip().lower() in _truthy:
-            reranker = try_fastembed_reranker()
-            if reranker is not None:
-                rerank_config.cross_encoder_enabled = True
-                logger.info("Cross-encoder recall rerank enabled (fastembed)")
-            else:
-                logger.warning(
-                    "KUMIHO_RERANK_CROSS_ENCODER=1 but fastembed/model is "
-                    "unavailable — install the 'fastembed' extra to enable."
-                )
-        if reranker is None and os.environ.get(
-            "KUMIHO_RERANK_LLM", ""
-        ).strip().lower() in _truthy:
-            adapter = getattr(summarizer, "adapter", None)
-            model = getattr(summarizer, "light_model", "") or ""
-            if adapter is not None:
-                reranker = make_llm_reranker(adapter, model)
-                rerank_config.cross_encoder_enabled = True
-                logger.info("LLM recall rerank enabled (host adapter, model=%s)", model)
-            else:
-                logger.warning(
-                    "KUMIHO_RERANK_LLM=1 but no LLM adapter is configured — set "
-                    "ANTHROPIC_API_KEY or OPENAI_API_KEY to enable LLM rerank."
-                )
+        reranker = resolve_reranker_from_env(
+            adapter=getattr(summarizer, "adapter", None),
+            model=getattr(summarizer, "light_model", "") or "",
+        )
+        if reranker is not None:
+            rerank_config.cross_encoder_enabled = True
     except Exception as exc:
         logger.warning("Post-recall rerank setup failed: %s", exc)
 

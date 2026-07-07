@@ -317,3 +317,64 @@ def test_temporal_priors_capped_jointly():
                        event_proximity_enabled=True, event_proximity_max_boost=0.12)
     out = rerank("q", [m], config=cfg, now=NOW, query_time=NOW)
     assert out[0]["score"] == pytest.approx(0.5 + 0.12)  # capped at 0.12, not 0.24
+
+
+# ---------------- env-based reranker resolution (shared helper) ----------------
+
+import kumiho_memory.recall_rerank as rr_mod
+from kumiho_memory.recall_rerank import resolve_reranker_from_env
+
+
+def test_from_env_default_is_plain_config():
+    cfg = RerankConfig.from_env(env={})
+    assert cfg.recency_enabled and cfg.mmr_enabled
+    assert cfg.cross_encoder_enabled is False
+
+
+def test_from_env_kill_switch_disables_recency_and_mmr():
+    cfg = RerankConfig.from_env(env={"KUMIHO_RECALL_RERANK": "0"})
+    assert not cfg.recency_enabled and not cfg.mmr_enabled
+    assert RerankConfig.from_env(env={"KUMIHO_RECALL_RERANK": "false"}).mmr_enabled is False
+
+
+def test_resolve_reranker_env_unset_returns_none():
+    assert resolve_reranker_from_env(env={}) is None
+
+
+def test_resolve_reranker_cross_encoder_unavailable_is_noop(monkeypatch):
+    # fastembed missing → try_fastembed_reranker returns None → safe no-op.
+    monkeypatch.setattr(rr_mod, "try_fastembed_reranker", lambda *a, **k: None)
+    out = resolve_reranker_from_env(env={"KUMIHO_RERANK_CROSS_ENCODER": "1"})
+    assert out is None
+
+
+def test_resolve_reranker_cross_encoder_mocked(monkeypatch):
+    sentinel = lambda q, texts: [1.0] * len(texts)
+    monkeypatch.setattr(rr_mod, "try_fastembed_reranker", lambda *a, **k: sentinel)
+    out = resolve_reranker_from_env(env={"KUMIHO_RERANK_CROSS_ENCODER": "1"})
+    assert out is sentinel
+
+
+def test_resolve_reranker_llm_path(monkeypatch):
+    adapter = _FakeAdapter('{"scores": [1.0, 0.0]}')
+    out = resolve_reranker_from_env(
+        adapter=adapter, model="m", env={"KUMIHO_RERANK_LLM": "1"},
+    )
+    assert callable(out)
+    assert out("q", ["a", "b"]) == [1.0, 0.0]  # exercises the wired reranker
+
+
+def test_resolve_reranker_llm_without_adapter_is_noop():
+    out = resolve_reranker_from_env(env={"KUMIHO_RERANK_LLM": "1"})
+    assert out is None
+
+
+def test_resolve_reranker_cross_encoder_wins_over_llm(monkeypatch):
+    sentinel = lambda q, texts: [0.5] * len(texts)
+    monkeypatch.setattr(rr_mod, "try_fastembed_reranker", lambda *a, **k: sentinel)
+    adapter = _FakeAdapter('{"scores": [1.0]}')
+    out = resolve_reranker_from_env(
+        adapter=adapter, model="m",
+        env={"KUMIHO_RERANK_CROSS_ENCODER": "1", "KUMIHO_RERANK_LLM": "1"},
+    )
+    assert out is sentinel  # cross-encoder preferred when both set
