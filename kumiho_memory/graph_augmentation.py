@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 
+from kumiho_memory._bounded import run_bounded_in_thread
 from kumiho_memory.summarization import (
     LLMAdapter,
     build_string_array_wrapper_schema,
@@ -55,12 +56,25 @@ class GraphAugmentationConfig:
         "CONTAINS", "CREATED_FROM", "SUPERSEDES", "SUPPORTS",
     ])
     # NOTE: "ABOUT" (memory -> entity anchor, from entity_promotion.py) is
-    # deliberately NOT in the default set. Entity anchors carry no content,
-    # so traversing through them could inject empty stubs into recall
-    # context — a LoCoMo/LongMemEval regression risk. Add it to edge_types
-    # only once a measured multi-hop recall A/B shows it helps. Callers can
-    # opt in explicitly: GraphAugmentationConfig(edge_types=[..., "ABOUT"]).
+    # deliberately NOT in the generic single-hop `edge_types`. Entity anchors
+    # carry no content, so a single ABOUT hop dead-ends at an empty stub.
+    # Entity recall is instead a dedicated 2-hop walk (memory -> anchor
+    # waypoint -> sibling memories) below, gated by `entity_recall`.
     top_k_for_traversal: int = 5
+
+    #: Enable the entity-mediated 2-hop reader: from each recalled memory,
+    #: hop through its entity anchors (ABOUT) to *other* memories about the
+    #: same entities — relational recall vector similarity can't reach. The
+    #: anchors are waypoints only (never returned as results, since they hold
+    #: no content). Off by default: it only pays off once entity promotion
+    #: has populated the graph, and its value should be shown on a measured
+    #: LongMemEval delta before enabling. Turned on together with entity
+    #: promotion by KUMIHO_MEMORY_ONTOLOGY=1.
+    entity_recall: bool = False
+    #: Cap on entity anchors followed per seed memory (fan-out guard).
+    entity_recall_max_entities: int = 6
+    #: Cap on sibling memories pulled in per entity anchor (fan-out guard).
+    entity_recall_max_siblings: int = 5
     max_total: Optional[int] = None  # Defaults to base_limit * 3
     reformulate_queries: bool = True
     traversal_timeout: int = 30  # seconds; daemon thread timeout for gRPC edge traversal
@@ -287,8 +301,17 @@ class GraphAugmentedRecall:
             edge_types=effective_edge_types,
         )
 
+        # --- Stage 3b: Entity-mediated 2-hop reader (opt-in) ---
+        # Reaches memories that share an entity but not vocabulary/embedding
+        # neighborhood — the relational-recall payoff of entity promotion.
+        entity_found = 0
+        if self.config.entity_recall:
+            entity_found = await self._traverse_entity_neighbors(
+                seed_krefs, seen_krefs, augmented,
+            )
+
         # --- Stage 4: Semantic fallback (when no edges found) ---
-        if graph_found == 0 and effective_max_hops >= 1:
+        if (graph_found + entity_found) == 0 and effective_max_hops >= 1:
             logger.debug("No graph edges found, falling back to multi-hop semantic recall")
             from kumiho_memory.context_compose import collect_top_revisions
 
@@ -748,6 +771,111 @@ class GraphAugmentedRecall:
             timeout,
         )
         return 0
+
+    async def _traverse_entity_neighbors(
+        self,
+        seed_krefs: List[str],
+        seen_krefs: set,
+        augmented: List[Dict[str, Any]],
+    ) -> int:
+        """Entity-mediated 2-hop walk: memory → entity anchor → sibling memory.
+
+        Hop 1 follows ``ABOUT`` from each seed memory to its entity anchors;
+        hop 2 follows ``ABOUT`` *into* each anchor to reach the other memories
+        about that entity. Anchors are pure waypoints — they are never
+        appended to results (they carry only ``display_name``), so recall
+        context is enriched with sibling *memories*, never empty stubs. That
+        is the crucial difference from putting ``ABOUT`` in the generic
+        single-hop set, which would surface the anchor itself.
+        """
+        try:
+            import kumiho
+        except ImportError:
+            logger.debug("kumiho SDK not available, skipping entity recall")
+            return 0
+
+        max_entities = self.config.entity_recall_max_entities
+        max_siblings = self.config.entity_recall_max_siblings
+        results: List[Dict[str, Any]] = []
+
+        def _sync_entity_walk() -> int:
+            found = 0
+            for kref_str in seed_krefs:
+                if not kref_str:
+                    continue
+                try:
+                    rev = kumiho.get_revision(kref_str)
+                    # Hop 1: this memory -> entity anchors (memory is source).
+                    anchor_uris: List[str] = []
+                    for edge in rev.get_edges(direction=kumiho.BOTH):
+                        if edge.edge_type != "ABOUT":
+                            continue
+                        if edge.source_kref.uri == kref_str:
+                            anchor_uris.append(edge.target_kref.uri)
+                        if len(anchor_uris) >= max_entities:
+                            break
+                except Exception as exc:
+                    logger.debug("entity recall: edges for %s failed: %s", kref_str, exc)
+                    continue
+
+                # Hop 2: each anchor -> sibling memories (anchor is target).
+                for anchor_uri in anchor_uris:
+                    if not anchor_uri:
+                        continue
+                    try:
+                        anchor_rev = kumiho.get_revision(anchor_uri)
+                        siblings = 0
+                        for edge in anchor_rev.get_edges(direction=kumiho.BOTH):
+                            if edge.edge_type != "ABOUT":
+                                continue
+                            if edge.target_kref.uri != anchor_uri:
+                                continue  # only incoming memory -> anchor
+                            sib_uri = edge.source_kref.uri
+                            if not sib_uri or sib_uri in seen_krefs:
+                                continue
+                            seen_krefs.add(sib_uri)
+                            try:
+                                sib_rev = kumiho.get_revision(sib_uri)
+                                entry = {
+                                    "kref": sib_uri,
+                                    "title": sib_rev.metadata.get("title", ""),
+                                    "summary": sib_rev.metadata.get("summary", ""),
+                                    "content": sib_rev.metadata.get("content", ""),
+                                    "score": 0.0,
+                                    "graph_augmented": True,
+                                    "edge_type": "ABOUT",
+                                    "via_entity": anchor_uri,
+                                    "from_kref": kref_str,
+                                    "hop": 2,
+                                }
+                                ev = sib_rev.metadata.get("evidence_level", "")
+                                if ev:
+                                    entry["evidence_level"] = ev
+                                src = sib_rev.metadata.get("source", "")
+                                if src:
+                                    entry["source"] = src
+                                results.append(entry)
+                                found += 1
+                                siblings += 1
+                            except Exception as exc:
+                                logger.debug("entity recall: sibling %s failed: %s", sib_uri, exc)
+                            if siblings >= max_siblings:
+                                break
+                    except Exception as exc:
+                        logger.debug("entity recall: anchor %s failed: %s", anchor_uri, exc)
+            return found
+
+        found = await run_bounded_in_thread(
+            _sync_entity_walk,
+            timeout=self.config.traversal_timeout,
+            label="entity recall",
+            on_timeout=0,
+            on_error=0,
+        ) or 0
+        if found:
+            augmented.extend(results)
+            logger.info("Entity recall: +%d sibling memories via entity anchors", found)
+        return found
 
 
 # ---------------------------------------------------------------------------

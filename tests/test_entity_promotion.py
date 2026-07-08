@@ -211,8 +211,7 @@ def test_promote_entities_async_wrapper_runs_worker(monkeypatch):
     assert result["edges"] == 2
 
 
-def test_manager_env_kill_switch(monkeypatch):
-    """KUMIHO_MEMORY_ENTITY_PROMOTION=0 disables the default-on wiring."""
+def _build_manager(**kwargs):
     from kumiho_memory.memory_manager import UniversalMemoryManager
     from kumiho_memory.redis_memory import RedisMemoryBuffer
     from fakes import FakeRedis
@@ -224,26 +223,49 @@ def test_manager_env_kill_switch(monkeypatch):
         def reject_credentials(self, text):
             return None
 
-    def build(**kwargs):
-        return UniversalMemoryManager(
-            redis_buffer=RedisMemoryBuffer(client=FakeRedis(), redis_url="redis://test"),
-            summarizer=object(),
-            pii_redactor=StubRedactor(),
-            memory_store=None,
-            **kwargs,
-        )
+    return UniversalMemoryManager(
+        redis_buffer=RedisMemoryBuffer(client=FakeRedis(), redis_url="redis://test"),
+        summarizer=object(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+        **kwargs,
+    )
 
-    monkeypatch.setenv("KUMIHO_MEMORY_ENTITY_PROMOTION", "0")
-    assert build().entity_promotion_config is None
 
+def test_ontology_is_opt_in_and_off_by_default(monkeypatch):
+    monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
     monkeypatch.delenv("KUMIHO_MEMORY_ENTITY_PROMOTION", raising=False)
-    manager = build()
-    assert manager.entity_promotion_config is not None
-    assert manager.entity_promotion_config.enabled
+    # Default: entity promotion off, and entity recall off on the graph config.
+    m = _build_manager(graph_augmentation=True)
+    assert m.entity_promotion_config is None
+    assert m.graph_augmentation_config.entity_recall is False
 
+
+def test_ontology_switch_enables_write_and_read(monkeypatch):
+    monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "1")
+    monkeypatch.delenv("KUMIHO_MEMORY_ENTITY_PROMOTION", raising=False)
+    m = _build_manager(graph_augmentation=True)
+    assert m.entity_promotion_config is not None  # write on
+    assert m.graph_augmentation_config.entity_recall is True  # read on
+
+
+def test_entity_promotion_env_forces_independently(monkeypatch):
+    monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
+    # Force ON without the ontology switch.
+    monkeypatch.setenv("KUMIHO_MEMORY_ENTITY_PROMOTION", "1")
+    assert _build_manager().entity_promotion_config is not None
+    # Force OFF wins even with ontology on.
+    monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "1")
+    monkeypatch.setenv("KUMIHO_MEMORY_ENTITY_PROMOTION", "0")
+    assert _build_manager().entity_promotion_config is None
+
+
+def test_explicit_config_overrides_env(monkeypatch):
+    monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
+    monkeypatch.delenv("KUMIHO_MEMORY_ENTITY_PROMOTION", raising=False)
     custom = EntityPromotionConfig(max_entities=2)
-    assert build(entity_promotion=custom).entity_promotion_config is custom
-    assert build(entity_promotion=False).entity_promotion_config is None
+    assert _build_manager(entity_promotion=custom).entity_promotion_config is custom
+    assert _build_manager(entity_promotion=False).entity_promotion_config is None
 
 
 def test_real_sdk_exposes_methods_entity_promotion_calls():

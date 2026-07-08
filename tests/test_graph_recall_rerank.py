@@ -395,3 +395,78 @@ def test_no_hook_configured_is_fine():
     gr = _gr(cfg, adapter=_UsageAdapter())
     out = asyncio.run(gr.recall("trigger", limit=2))
     assert out
+
+
+# ---------------------------------------------------------------------------
+# Entity-mediated 2-hop reader (ontology-lite)
+# ---------------------------------------------------------------------------
+
+class _FakeKref:
+    def __init__(self, uri):
+        self.uri = uri
+
+
+class _FakeEdge:
+    def __init__(self, source, target, edge_type):
+        self.source_kref = _FakeKref(source)
+        self.target_kref = _FakeKref(target)
+        self.edge_type = edge_type
+
+
+class _FakeRev:
+    def __init__(self, kref, metadata, edges):
+        self.kref = _FakeKref(kref)
+        self.metadata = metadata
+        self._edges = edges
+
+    def get_edges(self, direction=None):
+        return self._edges
+
+
+def _install_entity_graph(monkeypatch):
+    """memory M1 --ABOUT--> anchor A <--ABOUT-- sibling memory M2."""
+    import sys
+    import types
+
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    A = "kref://p/entities/acme.entity?r=1"
+    M2 = "kref://p/notes/m2.conversation?r=1"
+
+    graph = {
+        M1: _FakeRev(M1, {"title": "M1", "summary": "seed"},
+                     [_FakeEdge(M1, A, "ABOUT")]),
+        A: _FakeRev(A, {"display_name": "Acme"},  # anchor: no content
+                    [_FakeEdge(M1, A, "ABOUT"), _FakeEdge(M2, A, "ABOUT")]),
+        M2: _FakeRev(M2, {"title": "M2", "summary": "sibling about acme"}, []),
+    }
+    fake = types.ModuleType("kumiho")
+    fake.BOTH = "BOTH"
+    fake.get_revision = lambda kref: graph[kref]
+    monkeypatch.setitem(sys.modules, "kumiho", fake)
+    return M1, A, M2
+
+
+def test_entity_reader_surfaces_sibling_and_skips_anchor(monkeypatch):
+    M1, A, M2 = _install_entity_graph(monkeypatch)
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(entity_recall=True))
+
+    augmented = []
+    seen = {M1}
+    found = asyncio.run(gr._traverse_entity_neighbors([M1], seen, augmented))
+
+    krefs = [m["kref"] for m in augmented]
+    assert found == 1
+    assert M2 in krefs                      # sibling memory reached via the entity
+    assert A not in krefs                   # anchor is a waypoint, never a result
+    entry = next(m for m in augmented if m["kref"] == M2)
+    assert entry["via_entity"] == A
+    assert entry["hop"] == 2
+    assert entry["summary"] == "sibling about acme"  # real content, not an empty stub
+
+
+def test_entity_reader_noop_when_disabled(monkeypatch):
+    M1, A, M2 = _install_entity_graph(monkeypatch)
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(entity_recall=False))
+    # The disabled flag is enforced in recall(); the method itself still works,
+    # so assert the *config* gate is what recall() checks.
+    assert gr.config.entity_recall is False

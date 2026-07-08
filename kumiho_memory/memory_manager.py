@@ -231,18 +231,34 @@ class UniversalMemoryManager:
         elif not graph_augmentation:
             graph_augmentation = None
         self.graph_augmentation_config = graph_augmentation
-        # Entity promotion: extracted entities become first-class `entity`
-        # Items with ABOUT edges (see entity_promotion.py). Same wiring
-        # idiom as graph_augmentation — True for defaults, config for
-        # control, falsy to disable — plus an env kill-switch.
-        if os.getenv("KUMIHO_MEMORY_ENTITY_PROMOTION", "1").strip() == "0":
+
+        # Ontology (write-time entity promotion + entity-mediated 2-hop
+        # recall) is opt-in groundwork: OFF by default so a store pays nothing
+        # to build a graph nothing reads. KUMIHO_MEMORY_ONTOLOGY=1 turns on
+        # BOTH the write (promotion) and the read (entity recall) together, so
+        # the feature only costs when it can also deliver — and its value gets
+        # gated on a measured LongMemEval delta before it's flipped on.
+        ontology_on = os.getenv("KUMIHO_MEMORY_ONTOLOGY", "0").strip() == "1"
+
+        # entity_promotion: the True default sentinel follows the ontology
+        # switch; KUMIHO_MEMORY_ENTITY_PROMOTION=1/0 forces it on/off
+        # independently; an explicit config/False always overrides.
+        ep_env = os.getenv("KUMIHO_MEMORY_ENTITY_PROMOTION", "").strip()
+        if ep_env == "0":
             entity_promotion = None
-        if entity_promotion is True:
+        elif entity_promotion is True:
             from kumiho_memory.entity_promotion import EntityPromotionConfig
-            entity_promotion = EntityPromotionConfig()
+            entity_promotion = (
+                EntityPromotionConfig() if (ontology_on or ep_env == "1") else None
+            )
         elif not entity_promotion:
             entity_promotion = None
         self.entity_promotion_config = entity_promotion
+
+        # Light up the entity-mediated reader when ontology is on (only
+        # meaningful when graph augmentation itself is active).
+        if self.graph_augmentation_config is not None and ontology_on:
+            self.graph_augmentation_config.entity_recall = True
         self._graph_recall: Optional[Any] = None  # lazy GraphAugmentedRecall
         self.recall_mode = recall_mode
         self.sibling_strong_score = sibling_strong_score
