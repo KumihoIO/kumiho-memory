@@ -6,8 +6,14 @@ import types
 import grpc
 import pytest
 
-from kumiho_memory.ontology import OntologySchema, _sync_decompose
+from kumiho_memory.ontology import (
+    OntologySchema,
+    _mentions,
+    _sync_decompose,
+    _word_tokens,
+)
 from kumiho_memory.relations import _jaccard, _tokens, link_supersedes
+from kumiho_memory.summarization import _decision_item_schema, build_summary_schema_mode
 
 
 class _RpcErr(grpc.RpcError):
@@ -197,6 +203,57 @@ def test_jaccard_is_corpus_independent():
     b = _tokens("Use Upstash for the event bus streams")
     assert _jaccard(a, b) > 0.6  # same subject
     assert _jaccard(_tokens("hiring plan"), _tokens("redis migration")) == 0.0
+
+
+def test_mentions_is_token_match_not_substring():
+    # Short / ambiguous names must not match inside longer words.
+    assert not _mentions(_word_tokens("AI"), _word_tokens("the plan was finalized"))
+    assert not _mentions(_word_tokens("IT"), _word_tokens("the credit was applied"))
+    assert not _mentions(_word_tokens("US"), _word_tokens("we discussed the census"))
+    # Korean: "김" must not match the fused token "김치" (Hangul is space-free).
+    assert not _mentions(_word_tokens("김"), _word_tokens("김치를 먹었다"))
+    # Real mentions match on token boundaries.
+    assert _mentions(_word_tokens("Redis"), _word_tokens("we adopted Redis today"))
+    assert _mentions(_word_tokens("Redis Cluster"), _word_tokens("use Redis Cluster now"))
+    # Multi-word name must be contiguous.
+    assert not _mentions(_word_tokens("Redis Cluster"), _word_tokens("Redis runs the cluster"))
+
+
+def test_based_on_schema_gated_by_ontology(monkeypatch):
+    # Default (ontology off): the decision schema is byte-identical to the
+    # pre-ontology release — no `based_on`, so the default recall path can't
+    # shift because a graph feature exists.
+    monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
+    dec_off = _decision_item_schema()
+    assert "based_on" not in dec_off["properties"]
+    assert "based_on" not in dec_off["required"]
+    assert "based_on" not in repr(build_summary_schema_mode())
+
+    monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "1")
+    dec_on = _decision_item_schema()
+    assert "based_on" in dec_on["properties"]
+    assert "based_on" in dec_on["required"]  # strict schema requires all props
+
+
+def test_about_edge_for_participant_only_entity(monkeypatch):
+    # A fact naming an entity that appears ONLY as an event participant (absent
+    # from classification.entities) must still get its ABOUT edge — entities are
+    # materialized before fact/decision linking regardless of source order.
+    project = _Project("P")
+    conv = _Rev("kref://P/x/mem.conversation?r=1")
+    _install_kumiho(monkeypatch, project, conv)
+    summary = {
+        "classification": {"entities": []},
+        "knowledge": {
+            "facts": [{"claim": "Anthropic approved the migration", "certainty": "high"}],
+            "decisions": [], "actions": [], "open_questions": [],
+        },
+        "events": [{"event": "Kickoff", "participants": ["Anthropic"]}],
+    }
+    _sync_decompose(conv.kref.uri, summary, "P", OntologySchema())
+    edges = _all_edges(project, conv)
+    assert any(et == "ABOUT" and "anthropic.entity" in t and ".fact" in s
+               for (s, et, t) in edges), edges
 
 
 class _MaterializerStub:

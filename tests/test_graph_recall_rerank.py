@@ -470,3 +470,74 @@ def test_entity_reader_noop_when_disabled(monkeypatch):
     # The disabled flag is enforced in recall(); the method itself still works,
     # so assert the *config* gate is what recall() checks.
     assert gr.config.entity_recall is False
+
+
+def _install_graph(monkeypatch, graph, on_get=None):
+    import sys
+    import types
+
+    def _get(kref):
+        if on_get is not None:
+            on_get(kref)
+        return graph[kref]
+
+    fake = types.ModuleType("kumiho")
+    fake.BOTH = "BOTH"
+    fake.get_revision = _get
+    monkeypatch.setitem(sys.modules, "kumiho", fake)
+
+
+def test_entity_sibling_is_scoreless_and_follows_involves(monkeypatch):
+    # Siblings must be score-less placeholders so recall_rerank never evidence-
+    # boosts them into evicting a genuine hit; and hop-2 must follow INVOLVES so
+    # event nodes (which carry event_date) about the entity are reachable.
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    A = "kref://p/entities/acme.entity?r=1"
+    M2 = "kref://p/notes/m2.conversation?r=1"
+    E = "kref://p/events/launch.event?r=1"
+    _install_graph(monkeypatch, {
+        M1: _FakeRev(M1, {"title": "M1", "summary": "seed"}, [_FakeEdge(M1, A, "ABOUT")]),
+        A: _FakeRev(A, {"display_name": "Acme"}, [
+            _FakeEdge(M1, A, "ABOUT"), _FakeEdge(M2, A, "ABOUT"),
+            _FakeEdge(E, A, "INVOLVES"),
+        ]),
+        M2: _FakeRev(M2, {"title": "M2", "summary": "sib",
+                          "evidence_level": "official", "source": "wiki"}, []),
+        E: _FakeRev(E, {"title": "Launch", "summary": "launched",
+                        "event_date": "2026-01-01"}, []),
+    })
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(entity_recall=True))
+    augmented = []
+    found = asyncio.run(gr._traverse_entity_neighbors([M1], {M1}, augmented))
+
+    krefs = {m["kref"] for m in augmented}
+    assert found == 2
+    assert M2 in krefs and E in krefs            # ABOUT sibling + INVOLVES event
+    for entry in augmented:
+        assert entry.get("score") is None        # score-less: not evidence-reweighted
+        assert "evidence_level" not in entry     # hub neighbour's grade not copied
+        assert "source" not in entry
+    assert next(m for m in augmented if m["kref"] == E)["edge_type"] == "INVOLVES"
+
+
+def test_entity_walk_dedups_shared_anchor_across_seeds(monkeypatch):
+    # A hub shared by two seeds is expanded once, not per seed (fan-out guard).
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    M3 = "kref://p/notes/m3.conversation?r=1"
+    A = "kref://p/entities/acme.entity?r=1"
+    M2 = "kref://p/notes/m2.conversation?r=1"
+    a_fetches = {"n": 0}
+    _install_graph(monkeypatch, {
+        M1: _FakeRev(M1, {"title": "M1"}, [_FakeEdge(M1, A, "ABOUT")]),
+        M3: _FakeRev(M3, {"title": "M3"}, [_FakeEdge(M3, A, "ABOUT")]),
+        A: _FakeRev(A, {"display_name": "Acme"}, [
+            _FakeEdge(M1, A, "ABOUT"), _FakeEdge(M3, A, "ABOUT"),
+            _FakeEdge(M2, A, "ABOUT"),
+        ]),
+        M2: _FakeRev(M2, {"title": "M2", "summary": "sib"}, []),
+    }, on_get=lambda kref: a_fetches.__setitem__("n", a_fetches["n"] + (kref == A)))
+
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(entity_recall=True))
+    augmented = []
+    asyncio.run(gr._traverse_entity_neighbors([M1, M3], {M1, M3}, augmented))
+    assert a_fetches["n"] == 1                    # shared hub expanded exactly once

@@ -994,34 +994,34 @@ class UniversalMemoryManager:
             # kref, so queued-for-retry stores are skipped (like SUPPORTS
             # edges above, replay has no enrichment mechanism).
             stored_kref = (store_result or {}).get("revision_kref", "")
-            # Write-time graph enrichment, fire-and-forget off the consolidation
-            # critical path (same idiom as _background_assess): bounded +
-            # best-effort, so it must not delay the store. On a persistent loop
-            # (the MCP-server runtime) it completes; a one-shot asyncio.run may
-            # drop it — acceptable for enrichment.
+            # Write-time graph enrichment. This is `await`ed, not fired off with
+            # create_task: the MCP runtime dispatches consolidation via
+            # asyncio.run (mcp_tools.tool_memory_consolidate), a one-shot loop
+            # that cancels pending tasks on teardown — so a detached task's graph
+            # writes would land nondeterministically or not at all. Both calls
+            # are internally bounded (run_bounded_in_thread) and best-effort, and
+            # both branches are reached ONLY on the opt-in path (ontology on, or
+            # entity promotion explicitly configured), so the default store pays
+            # nothing and only the opt-in path takes the bounded latency.
             if stored_kref and self.ontology_enabled:
                 # Full schema-driven decomposition: entities + facts + decisions
                 # + events + actions + questions, wired by typed edges. Subsumes
                 # plain entity promotion.
                 from kumiho_memory.ontology import decompose_and_link
 
-                asyncio.create_task(
-                    decompose_and_link(
-                        stored_kref, summary_result, project_name=self.project,
-                    )
+                await decompose_and_link(
+                    stored_kref, summary_result, project_name=self.project,
                 )
             elif stored_kref and entities_list and self.entity_promotion_config:
                 # Lighter entity-only mode: identity-keyed dedup + direct
                 # kind="entity" search value, even without full decomposition.
                 from kumiho_memory.entity_promotion import promote_entities
 
-                asyncio.create_task(
-                    promote_entities(
-                        stored_kref,
-                        [str(e) for e in entities_list],
-                        project_name=self.project,
-                        config=self.entity_promotion_config,
-                    )
+                await promote_entities(
+                    stored_kref,
+                    [str(e) for e in entities_list],
+                    project_name=self.project,
+                    config=self.entity_promotion_config,
                 )
 
         await self.redis_buffer.clear_session(self.project, session_id)

@@ -75,6 +75,12 @@ class GraphAugmentationConfig:
     entity_recall_max_entities: int = 6
     #: Cap on sibling memories pulled in per entity anchor (fan-out guard).
     entity_recall_max_siblings: int = 5
+    #: Global budget on anchor expansions across ALL seeds (a shared hub is
+    #: expanded once, not per seed) so a dense graph can't blow up the walk.
+    entity_recall_max_anchor_fetches: int = 24
+    #: Cap slots reserved for the (score-less) 2-hop siblings when the merged
+    #: result set overflows, so the walk's payload isn't always trimmed first.
+    entity_recall_reserve: int = 3
     max_total: Optional[int] = None  # Defaults to base_limit * 3
     reformulate_queries: bool = True
     traversal_timeout: int = 30  # seconds; daemon thread timeout for gRPC edge traversal
@@ -309,9 +315,16 @@ class GraphAugmentedRecall:
             entity_found = await self._traverse_entity_neighbors(
                 seed_krefs, seen_krefs, augmented,
             )
+            if entity_found:
+                logger.debug("entity recall surfaced %d sibling node(s)", entity_found)
 
-        # --- Stage 4: Semantic fallback (when no edges found) ---
-        if (graph_found + entity_found) == 0 and effective_max_hops >= 1:
+        # --- Stage 4: Semantic fallback (when no real edges found) ---
+        # Gate on graph_found ONLY. entity_found must NOT suppress this: the
+        # 2-hop siblings are score-less placeholders that trail and get trimmed
+        # first, so counting them as "found" would drop the real, scored
+        # fallback hits and leave strictly fewer/worse results than with the
+        # feature off (a non-monotonic regression).
+        if graph_found == 0 and effective_max_hops >= 1:
             logger.debug("No graph edges found, falling back to multi-hop semantic recall")
             from kumiho_memory.context_compose import collect_top_revisions
 
@@ -368,7 +381,22 @@ class GraphAugmentedRecall:
         cap = max_total or self.config.max_total or (base_limit * 3)
         if len(augmented) > cap:
             logger.info("Capping augmented memories from %d to %d", len(augmented), cap)
-            augmented = augmented[:cap]
+            reserve = self.config.entity_recall_reserve if self.config.entity_recall else 0
+            if reserve > 0:
+                # Never evict a scored base hit, but reserve a few tail slots for
+                # the score-less 2-hop siblings so the (expensive) entity walk's
+                # payload isn't crowded out entirely by the other edge entries.
+                # Default path (entity_recall off) keeps the exact head-slice.
+                base = [m for m in augmented if not m.get("graph_augmented")]
+                sib = [m for m in augmented
+                       if m.get("graph_augmented") and m.get("score") is None]
+                edges = [m for m in augmented
+                         if m.get("graph_augmented") and m.get("score") is not None]
+                keep_sib = sib[:reserve]
+                room = max(0, cap - len(base) - len(keep_sib))
+                augmented = (base + edges[:room] + keep_sib)[:cap]
+            else:
+                augmented = augmented[:cap]
 
         return augmented
 
@@ -796,13 +824,18 @@ class GraphAugmentedRecall:
 
         max_entities = self.config.entity_recall_max_entities
         max_siblings = self.config.entity_recall_max_siblings
+        max_anchor_fetches = self.config.entity_recall_max_anchor_fetches
         results: List[Dict[str, Any]] = []
 
         def _sync_entity_walk() -> int:
             found = 0
+            visited_anchors: set = set()  # a shared hub is expanded once, not per seed
+            anchor_fetches = 0            # global fan-out budget across all seeds
             for kref_str in seed_krefs:
                 if not kref_str:
                     continue
+                if anchor_fetches >= max_anchor_fetches:
+                    break
                 try:
                     rev = kumiho.get_revision(kref_str)
                     # Hop 1: this memory -> entity anchors (memory is source).
@@ -818,42 +851,50 @@ class GraphAugmentedRecall:
                     logger.debug("entity recall: edges for %s failed: %s", kref_str, exc)
                     continue
 
-                # Hop 2: each anchor -> sibling memories (anchor is target).
+                # Hop 2: each anchor -> sibling nodes (anchor is target).
                 for anchor_uri in anchor_uris:
-                    if not anchor_uri:
-                        continue
+                    if not anchor_uri or anchor_uri in visited_anchors:
+                        continue  # dedup shared hubs across seeds
+                    visited_anchors.add(anchor_uri)
+                    if anchor_fetches >= max_anchor_fetches:
+                        break
+                    anchor_fetches += 1
                     try:
                         anchor_rev = kumiho.get_revision(anchor_uri)
                         siblings = 0
                         for edge in anchor_rev.get_edges(direction=kumiho.BOTH):
-                            if edge.edge_type != "ABOUT":
+                            # Reach siblings via ABOUT (memories, facts, decisions,
+                            # actions) AND INVOLVES (event nodes, which carry the
+                            # distilled event_date) — both point *into* the anchor.
+                            if edge.edge_type not in ("ABOUT", "INVOLVES"):
                                 continue
                             if edge.target_kref.uri != anchor_uri:
-                                continue  # only incoming memory -> anchor
+                                continue  # only incoming node -> anchor
                             sib_uri = edge.source_kref.uri
                             if not sib_uri or sib_uri in seen_krefs:
                                 continue
                             seen_krefs.add(sib_uri)
                             try:
                                 sib_rev = kumiho.get_revision(sib_uri)
+                                # Score-less placeholder: this node's relevance to
+                                # the actual query was never measured. Omitting
+                                # `score` (not score=0.0) makes recall_rerank treat
+                                # it as unscored, so it trails the scored hits and
+                                # is never evidence-reweighted into evicting one.
+                                # For the same reason no evidence_level/source is
+                                # copied — that belongs to a matched hit, not a hub
+                                # neighbour.
                                 entry = {
                                     "kref": sib_uri,
                                     "title": sib_rev.metadata.get("title", ""),
                                     "summary": sib_rev.metadata.get("summary", ""),
                                     "content": sib_rev.metadata.get("content", ""),
-                                    "score": 0.0,
                                     "graph_augmented": True,
-                                    "edge_type": "ABOUT",
+                                    "edge_type": edge.edge_type,
                                     "via_entity": anchor_uri,
                                     "from_kref": kref_str,
                                     "hop": 2,
                                 }
-                                ev = sib_rev.metadata.get("evidence_level", "")
-                                if ev:
-                                    entry["evidence_level"] = ev
-                                src = sib_rev.metadata.get("source", "")
-                                if src:
-                                    entry["source"] = src
                                 results.append(entry)
                                 found += 1
                                 siblings += 1

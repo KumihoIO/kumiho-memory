@@ -42,6 +42,7 @@ bounded daemon thread (``_bounded.run_bounded_in_thread``).
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -50,6 +51,31 @@ from kumiho._text import slugify
 from ._bounded import run_bounded_in_thread
 
 logger = logging.getLogger(__name__)
+
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _word_tokens(text: str) -> List[str]:
+    return _WORD_RE.findall(text.casefold())
+
+
+def _mentions(name_tokens: List[str], text_tokens: List[str]) -> bool:
+    """True if *name_tokens* occurs as a contiguous run inside *text_tokens*.
+
+    Token equality — not substring — so short, ambiguous names ("AI", "IT",
+    "US") and space-free scripts don't draw false ABOUT edges: Hangul fuses
+    particles onto a token, so the token "김치" never matches the name token
+    "김". Conservative for CJK (it can miss a real mention when a morpheme is
+    glued on) rather than inventing wrong edges — a real tokenizer (the repo's
+    ko-dic) would recover those; tracked as follow-up.
+    """
+    n = len(name_tokens)
+    if n == 0 or n > len(text_tokens):
+        return False
+    for i in range(len(text_tokens) - n + 1):
+        if text_tokens[i:i + n] == name_tokens:
+            return True
+    return False
 
 
 @dataclass
@@ -177,6 +203,7 @@ def _sync_decompose(
     # --- Entities (deduped hubs; name -> anchor) ---
     entity_anchors: Dict[str, Any] = {}  # slug -> anchor rev
     entity_display: Dict[str, str] = {}  # slug -> display name
+    entity_tokens: Dict[str, List[str]] = {}  # slug -> name word-tokens
 
     def _ensure_entity(name: str) -> Optional[str]:
         name = (name or "").strip()
@@ -192,18 +219,29 @@ def _sync_decompose(
                 return None
             entity_anchors[slug] = anchor
             entity_display[slug] = name
+            entity_tokens[slug] = _word_tokens(name)
             stats["entities"] += 1
         return slug
 
     classification = summary.get("classification") or {}
     for name in (classification.get("entities") or [])[: schema.max_per_kind]:
         _ensure_entity(str(name))
+    # Materialize event participants up-front too. The events loop runs *after*
+    # fact/decision ABOUT-linking below, so a fact naming a participant-only
+    # entity (one absent from classification.entities) would otherwise never get
+    # its ABOUT edge. The entity hub set must be order-independent.
+    for ev in (summary.get("events") or [])[: schema.max_per_kind]:
+        for part in (ev.get("participants") or []):
+            _ensure_entity(str(part))
 
     def _link_about(source_rev, text: str) -> None:
-        """ABOUT edges: an entity is mentioned if its name appears in *text*."""
-        low = text.casefold()
+        """ABOUT edges: draw one when an entity's *name tokens* occur as a
+        contiguous run in *text* — token equality, not substring (see
+        :func:`_mentions`), so ambiguous short names and space-free scripts
+        don't spawn false edges."""
+        toks = _word_tokens(text)
         for slug, anchor in entity_anchors.items():
-            if entity_display[slug].casefold() in low:
+            if _mentions(entity_tokens[slug], toks):
                 if m.edge(source_rev, anchor, schema.about_edge, {"entity": slug}):
                     stats["edges"] += 1
 
