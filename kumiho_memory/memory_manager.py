@@ -974,19 +974,24 @@ class UniversalMemoryManager:
             # edges above, replay has no enrichment mechanism).
             stored_kref = (store_result or {}).get("revision_kref", "")
             if stored_kref and entities_list and self.entity_promotion_config:
-                try:
-                    from kumiho_memory.entity_promotion import promote_entities
+                # Fire-and-forget off the consolidation critical path (same
+                # idiom as _background_assess above): promotion is already
+                # bounded + best-effort, so it must not delay the store. On a
+                # persistent loop (the MCP-server runtime) it completes; a
+                # one-shot asyncio.run may drop it — acceptable for
+                # enrichment. The entity Items it writes have standalone value
+                # (identity-keyed dedup, direct kind="entity" search) even
+                # while ABOUT traversal stays gated out of default recall.
+                from kumiho_memory.entity_promotion import promote_entities
 
-                    await promote_entities(
+                asyncio.create_task(
+                    promote_entities(
                         stored_kref,
                         [str(e) for e in entities_list],
                         project_name=self.project,
                         config=self.entity_promotion_config,
                     )
-                except Exception as exc:  # noqa: BLE001 - enrichment only
-                    logger.debug(
-                        "entity promotion failed for %s: %s", stored_kref, exc
-                    )
+                )
 
         await self.redis_buffer.clear_session(self.project, session_id)
 
