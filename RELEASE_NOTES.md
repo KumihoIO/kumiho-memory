@@ -1,5 +1,53 @@
 # Release Notes — kumiho-memory
 
+## v0.9.0
+
+**Release Date:** 2026-07-08
+
+Consolidates the full cognitive-recall pipeline into the SDK and recovers the
+LoCoMo regression that the shipped v0.8.1 LLM-only sibling reranker had
+introduced. The benchmark harness is now a thin shim that delegates to the SDK,
+so the recall behavior that is measured is the recall behavior that ships.
+
+### Added
+
+- Cognitive recall now lives entirely in the SDK: `recall_memories(graph_augmented=True)`,
+  `compose_context`, and `two_pass_rerank` are first-class APIs on
+  `UniversalMemoryManager` (previously duplicated inside the benchmark harness).
+- Graph-augmented recall: multi-query reformulation → edge traversal → sibling
+  enrichment, followed by the rerank stack
+  (cross-encoder → evidence → recency → event-proximity → MMR).
+- Opt-in cross-encoder reranking (bge-reranker via fastembed), gated on
+  `KUMIHO_RERANK_CROSS_ENCODER=1`.
+
+### Fixed
+
+- **Multi-hop recall regression.** The cross-encoder and widen-then-trim step are
+  now applied **per sub-query** (per reformulated angle) rather than post-merge,
+  so each angle keeps its best evidence instead of being averaged away. On the
+  LoCoMo `conv-26` sample this moved multi-hop from **0.19 → 0.40** F1.
+- **Sibling reranking now keeps a cosine-embedding fallback** instead of the
+  v0.8.1 LLM-only replacement, which had regressed single- and multi-hop
+  retrieval. The LLM signal refines ranking; the embedding signal guarantees the
+  right sibling is never dropped.
+- Reformulation fallback no longer demotes already-recalled items or loses query
+  angles when a sub-query returns nothing.
+
+### Measured
+
+Full 10-conversation LoCoMo (token-F1, gpt-4o answer, clean backend):
+
+| category | F1 | vs Mem0 |
+|---|---|---|
+| single-hop | 0.449 | +0.062 |
+| multi-hop | 0.393 | **+0.107** (#1) |
+| temporal | 0.530 | **+0.041** (#1) |
+| open-domain | 0.313 | −0.164 |
+| **5-cat** | **0.564** | restores the 0.565 record |
+
+LoCoMo-Plus cognitive judge accuracy holds at **93.3%** parity (no crown-jewel
+regression from the standard-LoCoMo recovery).
+
 ## v0.8.2
 
 **Release Date:** 2026-07-06
