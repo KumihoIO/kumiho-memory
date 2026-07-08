@@ -79,6 +79,12 @@ def build_summary_schema_mode() -> Dict[str, Any]:
                     "items": _strict_object_schema({
                         "decision": {"type": "string"},
                         "reason": {"type": "string"},
+                        # Indices into the `facts` array this decision rests on
+                        # (empty if none). Drives decision --DEPENDS_ON--> fact.
+                        "based_on": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        },
                     }),
                 },
                 "actions": {
@@ -1141,7 +1147,7 @@ class MemorySummarizer:
             "  ],\n"
             '  "knowledge": {\n'
             '    "facts": [{"claim": "Specific factual claim with concrete detail", "certainty": "low | medium | high"}],\n'
-            '    "decisions": [{"decision": "...", "reason": "..."}],\n'
+            '    "decisions": [{"decision": "...", "reason": "...", "based_on": [0]}],\n'
             '    "actions": [{"task": "...", "status": "open | done | blocked"}],\n'
             '    "open_questions": ["..."]\n'
             "  },\n"

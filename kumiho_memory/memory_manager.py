@@ -259,6 +259,11 @@ class UniversalMemoryManager:
         # meaningful when graph augmentation itself is active).
         if self.graph_augmentation_config is not None and ontology_on:
             self.graph_augmentation_config.entity_recall = True
+
+        # When ontology is on, consolidation decomposes the whole conversation
+        # into a typed graph (entities + facts + decisions + events + ...),
+        # which subsumes plain entity promotion.
+        self.ontology_enabled = ontology_on
         self._graph_recall: Optional[Any] = None  # lazy GraphAugmentedRecall
         self.recall_mode = recall_mode
         self.sibling_strong_score = sibling_strong_score
@@ -989,15 +994,25 @@ class UniversalMemoryManager:
             # kref, so queued-for-retry stores are skipped (like SUPPORTS
             # edges above, replay has no enrichment mechanism).
             stored_kref = (store_result or {}).get("revision_kref", "")
-            if stored_kref and entities_list and self.entity_promotion_config:
-                # Fire-and-forget off the consolidation critical path (same
-                # idiom as _background_assess above): promotion is already
-                # bounded + best-effort, so it must not delay the store. On a
-                # persistent loop (the MCP-server runtime) it completes; a
-                # one-shot asyncio.run may drop it — acceptable for
-                # enrichment. The entity Items it writes have standalone value
-                # (identity-keyed dedup, direct kind="entity" search) even
-                # while ABOUT traversal stays gated out of default recall.
+            # Write-time graph enrichment, fire-and-forget off the consolidation
+            # critical path (same idiom as _background_assess): bounded +
+            # best-effort, so it must not delay the store. On a persistent loop
+            # (the MCP-server runtime) it completes; a one-shot asyncio.run may
+            # drop it — acceptable for enrichment.
+            if stored_kref and self.ontology_enabled:
+                # Full schema-driven decomposition: entities + facts + decisions
+                # + events + actions + questions, wired by typed edges. Subsumes
+                # plain entity promotion.
+                from kumiho_memory.ontology import decompose_and_link
+
+                asyncio.create_task(
+                    decompose_and_link(
+                        stored_kref, summary_result, project_name=self.project,
+                    )
+                )
+            elif stored_kref and entities_list and self.entity_promotion_config:
+                # Lighter entity-only mode: identity-keyed dedup + direct
+                # kind="entity" search value, even without full decomposition.
                 from kumiho_memory.entity_promotion import promote_entities
 
                 asyncio.create_task(

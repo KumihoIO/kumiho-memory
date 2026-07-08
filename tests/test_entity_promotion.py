@@ -239,6 +239,7 @@ def test_ontology_is_opt_in_and_off_by_default(monkeypatch):
     m = _build_manager(graph_augmentation=True)
     assert m.entity_promotion_config is None
     assert m.graph_augmentation_config.entity_recall is False
+    assert m.ontology_enabled is False
 
 
 def test_ontology_switch_enables_write_and_read(monkeypatch):
@@ -247,6 +248,7 @@ def test_ontology_switch_enables_write_and_read(monkeypatch):
     m = _build_manager(graph_augmentation=True)
     assert m.entity_promotion_config is not None  # write on
     assert m.graph_augmentation_config.entity_recall is True  # read on
+    assert m.ontology_enabled is True  # full decomposition on
 
 
 def test_entity_promotion_env_forces_independently(monkeypatch):
