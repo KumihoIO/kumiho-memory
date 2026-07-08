@@ -53,6 +53,10 @@ class GraphAugmentationConfig:
     edge_types: List[str] = field(default_factory=lambda: [
         "DERIVED_FROM", "DEPENDS_ON", "REFERENCED",
         "CONTAINS", "CREATED_FROM", "SUPERSEDES", "SUPPORTS",
+        # memory -> entity anchor (entity_promotion.py). Traversed both
+        # ways this hops memory -> entity -> sibling memories about the
+        # same entity — relational recall vector similarity can't see.
+        "ABOUT",
     ])
     top_k_for_traversal: int = 5
     max_total: Optional[int] = None  # Defaults to base_limit * 3

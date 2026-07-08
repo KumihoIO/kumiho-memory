@@ -183,6 +183,7 @@ class UniversalMemoryManager:
         retry_queue: Optional[RetryQueue] = None,
         store_max_retries: int = 3,
         graph_augmentation: Optional[Any] = None,
+        entity_promotion: Optional[Any] = True,
         recall_mode: str = "summarized",
         sibling_strong_score: float = _SIBLING_STRONG_SCORE,
         sibling_char_budget: int = _SIBLING_CHAR_BUDGET,
@@ -232,6 +233,18 @@ class UniversalMemoryManager:
         elif not graph_augmentation:
             graph_augmentation = None
         self.graph_augmentation_config = graph_augmentation
+        # Entity promotion: extracted entities become first-class `entity`
+        # Items with ABOUT edges (see entity_promotion.py). Same wiring
+        # idiom as graph_augmentation — True for defaults, config for
+        # control, falsy to disable — plus an env kill-switch.
+        if os.getenv("KUMIHO_MEMORY_ENTITY_PROMOTION", "1").strip() == "0":
+            entity_promotion = None
+        if entity_promotion is True:
+            from kumiho_memory.entity_promotion import EntityPromotionConfig
+            entity_promotion = EntityPromotionConfig()
+        elif not entity_promotion:
+            entity_promotion = None
+        self.entity_promotion_config = entity_promotion
         self._graph_recall: Optional[Any] = None  # lazy GraphAugmentedRecall
         self.recall_mode = recall_mode
         self.sibling_strong_score = sibling_strong_score
@@ -976,6 +989,26 @@ class UniversalMemoryManager:
                 payload["stack_revisions"] = stack_revisions
 
             store_result = await self._store_with_retry(**payload)
+
+            # Promote extracted entities to first-class `entity` Items with
+            # ABOUT edges from the stored revision. Requires the revision
+            # kref, so queued-for-retry stores are skipped (like SUPPORTS
+            # edges above, replay has no enrichment mechanism).
+            stored_kref = (store_result or {}).get("revision_kref", "")
+            if stored_kref and entities_list and self.entity_promotion_config:
+                try:
+                    from kumiho_memory.entity_promotion import promote_entities
+
+                    await promote_entities(
+                        stored_kref,
+                        [str(e) for e in entities_list],
+                        project_name=self.project,
+                        config=self.entity_promotion_config,
+                    )
+                except Exception as exc:  # noqa: BLE001 - enrichment only
+                    logger.debug(
+                        "entity promotion failed for %s: %s", stored_kref, exc
+                    )
 
         await self.redis_buffer.clear_session(self.project, session_id)
 
