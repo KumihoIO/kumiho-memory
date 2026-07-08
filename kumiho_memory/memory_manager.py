@@ -11,8 +11,6 @@ import mimetypes
 import os
 import re
 import shutil
-import threading
-import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -550,11 +548,12 @@ class UniversalMemoryManager:
         evidence chains are an enrichment, never a store blocker.  Returns
         the number of edges created.
 
-        The synchronous gRPC calls can hang indefinitely on Windows (see
-        graph_augmentation.py edge creation), so they run in a daemon
-        thread polled against a deadline instead of ``asyncio.to_thread``
-        — a hung RPC must not strand a shared executor thread.
+        Runs the synchronous gRPC calls in a bounded daemon thread (see
+        ``_bounded.run_bounded_in_thread``): a hung RPC must not strand a
+        shared executor thread.
         """
+        from kumiho_memory._bounded import run_bounded_in_thread
+
         def _sync_create() -> int:
             import kumiho
 
@@ -576,34 +575,13 @@ class UniversalMemoryManager:
                     )
             return created
 
-        result: List[int] = []
-        done_event = threading.Event()
-
-        def _worker() -> None:
-            try:
-                result.append(_sync_create())
-            except Exception as exc:
-                logger.debug(
-                    "SUPPORTS edge creation failed for %s: %s",
-                    revision_kref, exc,
-                )
-            finally:
-                done_event.set()
-
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-
-        deadline = time.monotonic() + timeout
-        while not done_event.is_set():
-            if time.monotonic() >= deadline:
-                logger.debug(
-                    "SUPPORTS edge creation timed out after %.0fs for %s",
-                    timeout, revision_kref,
-                )
-                return 0
-            await asyncio.sleep(0.05)
-
-        created = result[0] if result else 0
+        created = await run_bounded_in_thread(
+            _sync_create,
+            timeout=timeout,
+            label=f"SUPPORTS edges ({revision_kref})",
+            on_timeout=0,
+            on_error=0,
+        ) or 0
         if created:
             logger.debug(
                 "Created %d SUPPORTS edge(s) from %s", created, revision_kref,

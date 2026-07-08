@@ -16,47 +16,61 @@ This module promotes each extracted entity to an Item of kind
   of the entity name, and creation is get-or-create, so re-encounters
   resolve to the same node instead of minting variants. Unlike revision
   stacking (which keys on a search-score threshold), this dedup does not
-  depend on corpus-wide ranking stability.
+  depend on corpus-wide ranking stability. The slug is Unicode-aware
+  (Korean/CJK names survive) and hash-suffixed on truncation so two long
+  names sharing a prefix can't collide into one entity.
 - **Anchor revision** — each entity Item carries a single anchor revision
-  (r1) holding ``display_name`` (the first raw surface form). ``ABOUT``
-  edges from memory revisions always target the anchor so traversal has
-  one stable hub per entity.
-- **``ABOUT`` edges** — memory revision → entity anchor. Recall traversal
-  (graph_augmentation) walks these both ways: memory → entity → sibling
-  memories about the same entity, which is multi-hop signal that pure
-  vector similarity misses.
+  (r1) holding ``display_name``. ``ABOUT`` edges always target the anchor,
+  so traversal has one stable hub per entity. Anchor creation is
+  serialized per-slug within the process to avoid two concurrent
+  promotions minting two anchors.
+- **``ABOUT`` edges** — memory revision → entity anchor.
 
 The flattened ``entities`` metadata string is still written by the
 consolidation path — the server aggregates it into item ``_search_text``
 (fulltext prospect indexing), so removing it would regress text recall.
 
 Everything here is best-effort enrichment: failures are logged and
-swallowed, never blocking a store. The synchronous gRPC calls run in a
-daemon thread polled against a deadline (see graph_augmentation.py for
-the Windows-hang rationale).
+swallowed, never blocking a store, and the blocking SDK calls run in a
+bounded daemon thread (see ``_bounded.run_bounded_in_thread``).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import re
 import threading
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+from kumiho._text import slugify
+
+from ._bounded import run_bounded_in_thread
 
 logger = logging.getLogger(__name__)
 
-_SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
-_MAX_SLUG_LEN = 48
+# Per-slug locks serialize anchor get-or-create across the daemon threads a
+# single process spawns, so concurrent promotions of the same *new* entity
+# don't each create an anchor. (Cross-process races still need server-side
+# get-or-create — tracked as a follow-up.)
+_anchor_locks_guard = threading.Lock()
+_anchor_locks: Dict[str, threading.Lock] = {}
+
+# Cache resolved Project handles by name to avoid a ListProjects per store.
+_project_cache: Dict[str, Any] = {}
 
 
 def _slugify_entity(name: str) -> str:
-    """Deterministic slug used as the entity Item name (identity key)."""
-    base = name.lower().strip()
-    base = _SLUG_PATTERN.sub("-", base).strip("-")
-    return base[:_MAX_SLUG_LEN].strip("-")
+    """Deterministic, Unicode-aware slug used as the entity Item name."""
+    return slugify(name, hash_on_truncate=True)
+
+
+def _anchor_lock(slug: str) -> threading.Lock:
+    with _anchor_locks_guard:
+        lock = _anchor_locks.get(slug)
+        if lock is None:
+            lock = threading.Lock()
+            _anchor_locks[slug] = lock
+        return lock
 
 
 @dataclass
@@ -75,11 +89,34 @@ class EntityPromotionConfig:
     #: extraction from fanning out into dozens of writes.
     max_entities: int = 8
 
-    #: Deadline for the whole promotion batch (daemon-thread poll).
-    timeout: float = 60.0
+    #: Deadline for the whole promotion batch (daemon-thread poll). Kept
+    #: modest since this runs on the consolidation path.
+    timeout: float = 15.0
 
-    #: Extra metadata stamped on every ABOUT edge.
-    edge_metadata: Dict[str, str] = field(default_factory=dict)
+
+def _resolve_project(project_name: str):
+    import kumiho
+
+    cached = _project_cache.get(project_name)
+    if cached is not None:
+        return cached
+    project = kumiho.get_project(project_name)
+    if project is not None:
+        _project_cache[project_name] = project
+    return project
+
+
+def _get_or_create_entity_item(project, space_path: str, slug: str):
+    """create-or-get an ``entity`` Item (mirrors mcp_server._get_or_create_item,
+    kept local to avoid importing the heavy mcp_server module)."""
+    import grpc
+
+    try:
+        return project.create_item(slug, "entity", parent_path=space_path)
+    except grpc.RpcError as exc:
+        if exc.code() != grpc.StatusCode.ALREADY_EXISTS:
+            raise
+        return project.get_item(slug, "entity", parent_path=space_path)
 
 
 def _sync_promote(
@@ -95,7 +132,7 @@ def _sync_promote(
     import grpc
     import kumiho
 
-    project = kumiho.get_project(project_name)
+    project = _resolve_project(project_name)
     if project is None:
         logger.debug("entity promotion: project %s not found", project_name)
         return (0, 0)
@@ -130,22 +167,19 @@ def _sync_promote(
     edges = 0
     for slug, raw_name in seen.items():
         try:
-            try:
-                item = project.create_item(slug, "entity", parent_path=space_path)
-            except grpc.RpcError as exc:
-                if exc.code() != grpc.StatusCode.ALREADY_EXISTS:
-                    raise
-                item = project.get_item(slug, "entity", parent_path=space_path)
+            item = _get_or_create_entity_item(project, space_path, slug)
 
-            anchor = item.get_latest_revision()
-            if anchor is None:
-                anchor = item.create_revision(
-                    metadata={"display_name": raw_name, "promoted_from": revision_kref}
-                )
+            # Serialize anchor creation per slug so concurrent promotions of
+            # the same new entity converge on one anchor revision.
+            with _anchor_lock(slug):
+                anchor = item.get_latest_revision()
+                if anchor is None:
+                    anchor = item.create_revision(
+                        metadata={"display_name": raw_name, "promoted_from": revision_kref}
+                    )
             touched += 1
 
-            edge_metadata = {"entity": slug, **config.edge_metadata}
-            source_rev.create_edge(anchor, config.edge_type, metadata=edge_metadata)
+            source_rev.create_edge(anchor, config.edge_type, metadata={"entity": slug})
             edges += 1
         except Exception as exc:  # noqa: BLE001 - per-entity failures never block the rest
             logger.debug(
@@ -163,40 +197,22 @@ async def promote_entities(
 ) -> Dict[str, Any]:
     """Promote *entity_names* to entity Items linked from *revision_kref*.
 
-    Best-effort and bounded: runs the blocking SDK calls in a daemon
-    thread polled against ``config.timeout`` so a hung RPC cannot strand
-    the event loop or a shared executor thread.
+    Best-effort and bounded: runs the blocking SDK calls in a daemon thread
+    polled against ``config.timeout`` so a hung RPC cannot strand the event
+    loop or a shared executor thread.
     """
     cfg = config or EntityPromotionConfig()
     if not cfg.enabled or not entity_names or not revision_kref:
         return {"entities": 0, "edges": 0}
 
-    result: List[Tuple[int, int]] = []
-    done_event = threading.Event()
-
-    def _worker() -> None:
-        try:
-            result.append(
-                _sync_promote(revision_kref, list(entity_names), project_name, cfg)
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("entity promotion failed for %s: %s", revision_kref, exc)
-        finally:
-            done_event.set()
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-
-    deadline = time.monotonic() + cfg.timeout
-    while not done_event.is_set():
-        if time.monotonic() >= deadline:
-            logger.debug(
-                "entity promotion timed out after %.0fs for %s", cfg.timeout, revision_kref
-            )
-            return {"entities": 0, "edges": 0, "timed_out": True}
-        await asyncio.sleep(0.05)
-
-    touched, edges = result[0] if result else (0, 0)
+    outcome = await run_bounded_in_thread(
+        lambda: _sync_promote(revision_kref, list(entity_names), project_name, cfg),
+        timeout=cfg.timeout,
+        label=f"entity promotion ({revision_kref})",
+        on_timeout=(0, 0),
+        on_error=(0, 0),
+    )
+    touched, edges = outcome or (0, 0)
     if touched:
         logger.debug(
             "entity promotion: %d entities, %d ABOUT edges from %s",

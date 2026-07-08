@@ -53,11 +53,13 @@ class GraphAugmentationConfig:
     edge_types: List[str] = field(default_factory=lambda: [
         "DERIVED_FROM", "DEPENDS_ON", "REFERENCED",
         "CONTAINS", "CREATED_FROM", "SUPERSEDES", "SUPPORTS",
-        # memory -> entity anchor (entity_promotion.py). Traversed both
-        # ways this hops memory -> entity -> sibling memories about the
-        # same entity — relational recall vector similarity can't see.
-        "ABOUT",
     ])
+    # NOTE: "ABOUT" (memory -> entity anchor, from entity_promotion.py) is
+    # deliberately NOT in the default set. Entity anchors carry no content,
+    # so traversing through them could inject empty stubs into recall
+    # context — a LoCoMo/LongMemEval regression risk. Add it to edge_types
+    # only once a measured multi-hop recall A/B shows it helps. Callers can
+    # opt in explicitly: GraphAugmentationConfig(edge_types=[..., "ABOUT"]).
     top_k_for_traversal: int = 5
     max_total: Optional[int] = None  # Defaults to base_limit * 3
     reformulate_queries: bool = True

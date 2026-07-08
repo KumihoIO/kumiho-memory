@@ -7,12 +7,23 @@ import types
 import grpc
 import pytest
 
+from kumiho_memory import entity_promotion
 from kumiho_memory.entity_promotion import (
     EntityPromotionConfig,
     _slugify_entity,
     _sync_promote,
     promote_entities,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_module_caches():
+    # entity_promotion caches resolved projects and per-slug locks in module
+    # globals; clear them so fakes don't leak across tests.
+    entity_promotion._project_cache.clear()
+    with entity_promotion._anchor_locks_guard:
+        entity_promotion._anchor_locks.clear()
+    yield
 
 
 class FakeRpcError(grpc.RpcError):
@@ -82,7 +93,24 @@ def test_slugify_entity_is_deterministic_identity_key():
     assert _slugify_entity("  ACME Corp. ") == "acme-corp"
     assert _slugify_entity("anthropic ai") == "anthropic-ai"
     assert _slugify_entity("") == ""
-    assert len(_slugify_entity("x" * 200)) <= 48
+
+
+def test_slugify_entity_preserves_non_ascii():
+    # Korean/CJK entity names must NOT collapse to "" (they'd be dropped).
+    assert _slugify_entity("김철수") == "김철수"
+    assert _slugify_entity("株式会社") == "株式会社"
+    # Mixed script keeps both.
+    assert _slugify_entity("OpenAI 오픈에이아이") == "openai-오픈에이아이"
+
+
+def test_slugify_entity_hash_suffix_avoids_long_name_collision():
+    # Two distinct names sharing a 48-char prefix must NOT collide into one
+    # entity — a wrong merge is irreversible (kref identity is permanent).
+    a = "x" * 60 + "-alpha"
+    b = "x" * 60 + "-beta"
+    sa, sb = _slugify_entity(a), _slugify_entity(b)
+    assert sa != sb
+    assert len(sa) <= 48 and len(sb) <= 48
 
 
 def test_sync_promote_creates_items_and_about_edges(monkeypatch):
@@ -216,6 +244,24 @@ def test_manager_env_kill_switch(monkeypatch):
     custom = EntityPromotionConfig(max_entities=2)
     assert build(entity_promotion=custom).entity_promotion_config is custom
     assert build(entity_promotion=False).entity_promotion_config is None
+
+
+def test_real_sdk_exposes_methods_entity_promotion_calls():
+    """Guards against the mocked-suite blind spot: if the real SDK renames
+    or reshapes these, the feature silently no-ops in production. Assert the
+    contract against the actual classes (no server needed)."""
+    import kumiho
+    from kumiho.project import Project
+    from kumiho.item import Item
+    from kumiho.revision import Revision
+
+    assert hasattr(kumiho, "get_project")
+    assert hasattr(kumiho, "get_revision")
+    for method in ("create_space", "create_item", "get_item"):
+        assert callable(getattr(Project, method, None)), f"Project.{method} missing"
+    for method in ("get_latest_revision", "create_revision"):
+        assert callable(getattr(Item, method, None)), f"Item.{method} missing"
+    assert callable(getattr(Revision, "create_edge", None)), "Revision.create_edge missing"
 
 
 if __name__ == "__main__":
