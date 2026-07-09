@@ -691,15 +691,52 @@ def test_bridge_skips_hub_entities(monkeypatch):
 
     gr = GraphAugmentedRecall(config=GraphAugmentationConfig(
         entity_recall=True, entity_bridge_hub_degree_max=5,
+        entity_bridge_max_results=1,
     ))
     augmented = []
     found = asyncio.run(gr._entity_bridge_join(
         [[(M1, 0.8)], [(M2, 0.6)]], {M1, M2}, augmented,
     ))
     krefs = [m["kref"] for m in augmented]
-    assert F_x in krefs          # discriminative bridge surfaced
-    assert F_hub not in krefs    # hub entity skipped entirely
-    assert found == len(krefs)
+    # With budget 1 the discriminative bridge wins the slot; the hub is
+    # deferred (preference, not a hard skip) and the budget is spent first.
+    assert krefs == [F_x]
+    assert found == 1
+
+
+def test_hub_fallback_when_no_discriminative_bridge(monkeypatch):
+    # In a 2-speaker corpus the speaker hub IS the join key (a hard skip
+    # measured multi-hop -0.078 on conv-26). When no low-degree bridge
+    # exists, deferred hubs must fill the budget.
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    M2 = "kref://p/notes/m2.conversation?r=1"
+    H = "kref://p/entities/speaker.entity?r=1"
+    F_hub = "kref://p/facts/speaker-fact.fact?r=1"
+    extra = [f"kref://p/notes/y{i}.conversation?r=1" for i in range(5)]
+    hub_edges = [_FakeEdge(M1, H, "ABOUT"), _FakeEdge(M2, H, "ABOUT"),
+                 _FakeEdge(F_hub, H, "ABOUT")] + [
+                 _FakeEdge(e, H, "ABOUT") for e in extra]     # 8 incoming
+    graph = {
+        M1: _FakeRev(M1, {"title": "M1"}, [_FakeEdge(M1, H, "ABOUT")]),
+        M2: _FakeRev(M2, {"title": "M2"}, [_FakeEdge(M2, H, "ABOUT")]),
+        H: _FakeRev(H, {"display_name": "Speaker"}, hub_edges),
+        F_hub: _FakeRev(F_hub, {"title": "Speaker fact",
+                                "summary": "speaker did a thing"}, []),
+    }
+    for e in extra:
+        graph[e] = _FakeRev(e, {"title": "y"}, [])
+    _install_graph(monkeypatch, graph)
+
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(
+        entity_recall=True, entity_bridge_hub_degree_max=5,
+        entity_bridge_max_results=1,
+    ))
+    augmented = []
+    found = asyncio.run(gr._entity_bridge_join(
+        [[(M1, 0.8)], [(M2, 0.6)]], {M1, M2}, augmented,
+    ))
+    assert found == 1
+    assert augmented[0]["kref"] == F_hub    # hub used as fallback, not lost
 
 
 def test_sibling_reserve_rides_on_top_and_never_evicts_edges(monkeypatch):

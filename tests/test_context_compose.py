@@ -89,6 +89,24 @@ def test_top_k_caps_the_pool_and_zero_means_unlimited():
     assert len(unlimited.split("\n\n")) == 6
 
 
+def test_bridge_evidence_rides_on_top_of_the_cap():
+    # Entity-bridge join evidence is ADDITIVE: it must never displace the
+    # top-K base revisions (measured: displacement cost open-domain −0.107
+    # on conv-26), and it survives the cut even when its score trails.
+    mems = [_mem(f"m{i}", f"s{i}", score=1.0 - i * 0.1) for i in range(6)]
+    bridge = _mem("bridge-fact", "joined evidence", score=0.05)
+    bridge["bridge"] = True
+    out = compose_context(mems + [bridge], top_k=5)
+    blocks = out.split("\n\n")
+    assert len(blocks) == 6                      # 5 base + 1 additive bridge
+    assert blocks[:5] == [f"m{i}: s{i}" for i in range(5)]  # base untouched
+    assert blocks[5] == "bridge-fact: joined evidence"
+    # Without bridges the historical head-slice is byte-identical.
+    assert compose_context(mems, top_k=5).split("\n\n") == [
+        f"m{i}: s{i}" for i in range(5)
+    ]
+
+
 def test_top_k_none_uses_module_default():
     n = DEFAULT_CONTEXT_TOP_K + 5
     mems = [_mem(f"m{i}", f"s{i}", score=1.0) for i in range(n)]

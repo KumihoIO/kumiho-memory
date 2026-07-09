@@ -144,6 +144,9 @@ def compose_context(
                 "summary": mem.get("summary", ""),
                 "content": mem.get("content", ""),
                 "_score": _score_of(mem.get("score", 0.0)),
+                # Entity-bridge join evidence (graph_augmentation) — kept so
+                # the top-K cut below can treat it as additive context.
+                "bridge": bool(mem.get("bridge")),
             })
 
     # --- Global ranking by score (best revisions first) ---
@@ -154,9 +157,16 @@ def compose_context(
         all_revisions.sort(key=lambda r: r.get("_score", 0.0), reverse=True)
 
     # --- Apply global top-K cap (0 = unlimited) ---
+    # Entity-bridge join evidence rides ON TOP of the cap (max +2): a bridge
+    # fact is *additive* multi-hop evidence and must never displace the top-K
+    # base revisions a direct answer needs (measured on conv-26: scored
+    # bridge facts displacing base hits cost open-domain −0.107). Without
+    # bridges this is the exact historical head-slice.
     effective_top_k = DEFAULT_CONTEXT_TOP_K if top_k is None else top_k
     if effective_top_k > 0 and len(all_revisions) > effective_top_k:
-        all_revisions = all_revisions[:effective_top_k]
+        bridge_revs = [r for r in all_revisions if r.get("bridge")][:2]
+        regular_revs = [r for r in all_revisions if not r.get("bridge")]
+        all_revisions = regular_revs[:effective_top_k] + bridge_revs
 
     # --- Build text from surviving revisions ---
     texts: List[str] = []

@@ -929,8 +929,44 @@ class GraphAugmentedRecall:
             bridges.sort(reverse=True)
 
             found = 0
-            # Hubs get skipped below, so scan a few more ranked bridges than
-            # the old top-3; the found/max_results cap still bounds the work.
+
+            def _surface(link_score: float, anchor: str,
+                         candidates: List[Tuple[int, str, str]]) -> None:
+                nonlocal found
+                candidates.sort(key=lambda c: c[0])
+                for _prio, src, etype in candidates[:2]:  # <=2 nodes/bridge
+                    if found >= max_results:
+                        return
+                    seen_krefs.add(src)
+                    try:
+                        src_rev = kumiho.get_revision(src)
+                        results.append({
+                            "kref": src,
+                            "title": src_rev.metadata.get("title", ""),
+                            "summary": src_rev.metadata.get("summary", ""),
+                            "content": src_rev.metadata.get("content", ""),
+                            # Real score, inherited from the weaker angle:
+                            # this is measured relevance by proxy, not the
+                            # unmeasured placeholder of the generic walk.
+                            "score": round(link_score * factor, 6),
+                            "graph_augmented": True,
+                            "bridge": True,
+                            "edge_type": etype,
+                            "via_entity": anchor,
+                            "hop": 2,
+                        })
+                        found += 1
+                    except Exception as exc:
+                        logger.debug(
+                            "entity bridge: node %s failed: %s", src, exc,
+                        )
+
+            # Discriminative (low-degree) bridges surface first; hub anchors
+            # are DEFERRED, not dropped. In a speaker-centric corpus (a
+            # 2-person chat) the hub IS the join key — a hard skip cost
+            # multi-hop −0.078 on conv-26, while in multi-entity corpora the
+            # discriminative bridges are the signal. Preference covers both.
+            deferred: List[Tuple[float, str, List[Tuple[int, str, str]]]] = []
             for link_score, anchor in bridges[:8]:
                 if found >= max_results:
                     break
@@ -951,44 +987,19 @@ class GraphAugmentedRecall:
                             (kind_priority.get(_kind(src), 3), src, edge.edge_type),
                         )
                     if incoming > hub_max:
-                        # Ubiquitous entity (speaker-style): bridges every
-                        # angle pair, its facts are generic — not a join.
-                        logger.debug(
-                            "entity bridge: %s skipped as hub (%d incoming)",
-                            anchor, incoming,
-                        )
+                        deferred.append((link_score, anchor, candidates))
                         continue
-                    candidates.sort(key=lambda c: c[0])
-                    for _prio, src, etype in candidates[:2]:  # <=2 nodes/bridge
-                        if found >= max_results:
-                            break
-                        seen_krefs.add(src)
-                        try:
-                            src_rev = kumiho.get_revision(src)
-                            results.append({
-                                "kref": src,
-                                "title": src_rev.metadata.get("title", ""),
-                                "summary": src_rev.metadata.get("summary", ""),
-                                "content": src_rev.metadata.get("content", ""),
-                                # Real score, inherited from the weaker angle:
-                                # this is measured relevance by proxy, not the
-                                # unmeasured placeholder of the generic walk.
-                                "score": round(link_score * factor, 6),
-                                "graph_augmented": True,
-                                "bridge": True,
-                                "edge_type": etype,
-                                "via_entity": anchor,
-                                "hop": 2,
-                            })
-                            found += 1
-                        except Exception as exc:
-                            logger.debug(
-                                "entity bridge: node %s failed: %s", src, exc,
-                            )
+                    _surface(link_score, anchor, candidates)
                 except Exception as exc:
                     logger.debug(
                         "entity bridge: anchor %s failed: %s", anchor, exc,
                     )
+            # Hub fallback: fill any remaining budget from the deferred hubs
+            # (edge candidates were already collected during the degree scan).
+            for link_score, anchor, candidates in deferred:
+                if found >= max_results:
+                    break
+                _surface(link_score, anchor, candidates)
             return found
 
         found = await run_bounded_in_thread(
