@@ -219,20 +219,52 @@ def test_mentions_is_token_match_not_substring():
     assert not _mentions(_word_tokens("Redis Cluster"), _word_tokens("Redis runs the cluster"))
 
 
-def test_based_on_schema_gated_by_ontology(monkeypatch):
-    # Default (ontology off): the decision schema is byte-identical to the
-    # pre-ontology release — no `based_on`, so the default recall path can't
-    # shift because a graph feature exists.
+def test_summary_schema_is_identical_in_both_ontology_modes(monkeypatch):
+    # The summarizer schema must be byte-identical whether the ontology is on
+    # or off — an ontology-gated `based_on` was tried and MEASURED to shift
+    # every ontology-on consolidation's structured output (weaker base
+    # recall). DEPENDS_ON is derived post-hoc by token overlap instead.
     monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
     dec_off = _decision_item_schema()
-    assert "based_on" not in dec_off["properties"]
-    assert "based_on" not in dec_off["required"]
-    assert "based_on" not in repr(build_summary_schema_mode())
+    schema_off = repr(build_summary_schema_mode())
 
     monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "1")
     dec_on = _decision_item_schema()
-    assert "based_on" in dec_on["properties"]
-    assert "based_on" in dec_on["required"]  # strict schema requires all props
+    schema_on = repr(build_summary_schema_mode())
+
+    assert dec_off == dec_on
+    assert schema_off == schema_on                      # byte-identical
+    assert "based_on" not in schema_on                  # in EITHER mode
+    assert sorted(dec_on["properties"]) == ["decision", "reason"]
+
+
+def test_depends_on_derived_by_overlap_without_based_on():
+    # With based_on gone from the schema, the grounding fact is recovered by
+    # token overlap against the same consolidation's facts (top-1, >=0.4).
+    from kumiho_memory.relations import link_depends_on_by_overlap
+
+    edges = []
+
+    class M:
+        def edge(self, s, t, et, md=None):
+            edges.append((s, t, et, md))
+            return True
+
+    facts = [
+        ("F_A", "a", "Acme pet insurance covers Max's vet bills"),
+        ("F_B", "b", "Caroline enjoys gardening on weekends"),
+    ]
+    n = link_depends_on_by_overlap(
+        M(), "D",
+        "Keep Max on Acme pet insurance (reason: vet bills expensive)", facts,
+    )
+    assert n == 1
+    assert edges[0][1] == "F_A"                 # the overlapping fact wins
+    assert edges[0][2] == "DEPENDS_ON"
+
+    edges.clear()                               # nothing above threshold
+    n = link_depends_on_by_overlap(M(), "D", "Ship the new landing page", facts)
+    assert n == 0 and edges == []
 
 
 def test_about_edge_for_participant_only_entity(monkeypatch):

@@ -34,26 +34,18 @@ def _json_schema_mode(name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _ontology_fields_on() -> bool:
-    """Whether ontology-only extraction fields (e.g. decision ``based_on``) are
-    emitted. Gated by ``KUMIHO_MEMORY_ONTOLOGY`` so that with the feature OFF
-    the summary schema + prompt are byte-identical to the pre-ontology release
-    — the default recall path must not shift because a graph feature exists."""
-    return os.getenv("KUMIHO_MEMORY_ONTOLOGY", "0").strip() == "1"
-
-
 def _decision_item_schema() -> Dict[str, Any]:
+    # Deliberately byte-identical in BOTH ontology modes. An ontology-gated
+    # `based_on` field was tried and measured: `_strict_object_schema` makes
+    # every property required, so emitting it forced a different structured
+    # output (hence different summaries/embeddings and weaker base recall)
+    # for every ontology-on consolidation. decision--DEPENDS_ON-->fact is
+    # now derived post-hoc by token overlap in ontology.py instead, so the
+    # summarizer schema + prompt never vary with the ontology switch.
     props: Dict[str, Any] = {
         "decision": {"type": "string"},
         "reason": {"type": "string"},
     }
-    if _ontology_fields_on():
-        # Indices into the `facts` array this decision rests on (empty if none);
-        # drives decision --DEPENDS_ON--> fact. `_strict_object_schema` makes
-        # every property *required*, so adding this unconditionally would force
-        # the model to emit it on every decision even with ontology off — a
-        # different structured output, hence different embeddings and recall.
-        props["based_on"] = {"type": "array", "items": {"type": "integer"}}
     return _strict_object_schema(props)
 
 
@@ -1161,11 +1153,8 @@ class MemorySummarizer:
             "  ],\n"
             '  "knowledge": {\n'
             '    "facts": [{"claim": "Specific factual claim with concrete detail", "certainty": "low | medium | high"}],\n'
-            # `based_on` only when ontology is on — keep the default prompt intact.
-            + ('    "decisions": [{"decision": "...", "reason": "...", "based_on": [0]}],\n'
-               if _ontology_fields_on()
-               else '    "decisions": [{"decision": "...", "reason": "..."}],\n')
-            + '    "actions": [{"task": "...", "status": "open | done | blocked"}],\n'
+            '    "decisions": [{"decision": "...", "reason": "..."}],\n'
+            '    "actions": [{"task": "...", "status": "open | done | blocked"}],\n'
             '    "open_questions": ["..."]\n'
             "  },\n"
             '  "classification": {\n'

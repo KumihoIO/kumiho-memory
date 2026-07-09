@@ -54,6 +54,42 @@ def link_depends_on(
     return edges
 
 
+def link_depends_on_by_overlap(
+    m: Any,
+    decision_anchor: Any,
+    decision_text: str,
+    fact_entries: List[Any],
+    threshold: float = 0.4,
+    edge_type: str = "DEPENDS_ON",
+) -> int:
+    """Post-hoc grounding when the summarizer emits no ``based_on`` indices.
+
+    The summary schema deliberately omits ``based_on`` in both ontology modes
+    (emitting it forced a different structured output on every consolidation —
+    measured as a base-recall regression), so the grounding fact is recovered
+    the same corpus-independent way SUPERSEDES is: token overlap, scoped to
+    the *same consolidation's* facts. Links the single best fact at/above
+    *threshold*. ``fact_entries`` are ``(anchor, slug, claim)`` tuples.
+    """
+    d_tokens = _tokens(decision_text)
+    if not d_tokens:
+        return 0
+    best = None
+    best_overlap = 0.0
+    for anchor, _slug, claim in fact_entries:
+        if anchor is None:
+            continue
+        overlap = _jaccard(d_tokens, _tokens(claim))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best = anchor
+    if best is not None and best_overlap >= threshold:
+        if m.edge(decision_anchor, best, edge_type,
+                  {"overlap": f"{best_overlap:.2f}"}):
+            return 1
+    return 0
+
+
 def link_supersedes(
     m: Any,
     kind: str,

@@ -288,7 +288,7 @@ def _sync_decompose(
         _link_about(anchor, f"{text} {reason}")
         based_on = [int(i) for i in (dec.get("based_on") or [])
                     if isinstance(i, (int, float))]
-        decision_entries.append((anchor, slug, text, based_on))
+        decision_entries.append((anchor, slug, text, body, based_on))
 
     # --- Events (participants -> INVOLVES entity) ---
     for ev in (summary.get("events") or [])[: schema.max_per_kind]:
@@ -352,12 +352,22 @@ def _sync_decompose(
         if m.edge(conv_rev, anchor, schema.about_edge, {"entity": slug}):
             stats["edges"] += 1
 
-    # --- Relational edges (DEPENDS_ON via emitted indices, SUPERSEDES via
+    # --- Relational edges (DEPENDS_ON via token overlap, SUPERSEDES via
     #     subject overlap) ---
-    from .relations import link_depends_on, link_supersedes
+    from .relations import link_depends_on, link_depends_on_by_overlap, link_supersedes
 
-    for anchor, slug, text, based_on in decision_entries:
-        stats["edges"] += link_depends_on(m, anchor, based_on, fact_anchors)
+    for anchor, slug, text, body, based_on in decision_entries:
+        if based_on:
+            # Explicit indices (external callers may still supply them).
+            stats["edges"] += link_depends_on(m, anchor, based_on, fact_anchors)
+        else:
+            # The summarizer schema omits based_on in BOTH ontology modes
+            # (emitting it shifted every consolidation's structured output —
+            # measured base-recall regression), so ground the decision by
+            # token overlap against this consolidation's facts instead.
+            stats["edges"] += link_depends_on_by_overlap(
+                m, anchor, body, fact_entries,
+            )
         stats["edges"] += link_supersedes(
             m, "decision", schema.decisions_space, slug, anchor, text, project_name,
         )
