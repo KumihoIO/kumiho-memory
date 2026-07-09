@@ -89,6 +89,7 @@ def compose_context(
     mode: str = "summarized",
     top_k: Optional[int] = None,
     char_limit: int = DEFAULT_REVISION_CHAR_LIMIT,
+    fact_budget: int = 2,
 ) -> str:
     """Build answering-LLM context text from recalled memories.
 
@@ -147,6 +148,8 @@ def compose_context(
                 # Entity-bridge join evidence (graph_augmentation) — kept so
                 # the top-K cut below can treat it as additive context.
                 "bridge": bool(mem.get("bridge")),
+                # Fact-recall leg entries get the same additive treatment.
+                "fact_recall": bool(mem.get("fact_recall")),
             })
 
     # --- Global ranking by score (best revisions first) ---
@@ -165,8 +168,15 @@ def compose_context(
     effective_top_k = DEFAULT_CONTEXT_TOP_K if top_k is None else top_k
     if effective_top_k > 0 and len(all_revisions) > effective_top_k:
         bridge_revs = [r for r in all_revisions if r.get("bridge")][:2]
-        regular_revs = [r for r in all_revisions if not r.get("bridge")]
-        all_revisions = regular_revs[:effective_top_k] + bridge_revs
+        # Fact-recall evidence is additive on the same terms as bridges (its
+        # own budget, ``fact_budget`` = the caller's fact_recall_max_results):
+        # an answer-shaped claim augments the context, it must never evict
+        # the conversations that ground it.
+        fact_revs = [r for r in all_revisions
+                     if r.get("fact_recall") and not r.get("bridge")][:fact_budget]
+        regular_revs = [r for r in all_revisions
+                        if not r.get("bridge") and not r.get("fact_recall")]
+        all_revisions = regular_revs[:effective_top_k] + bridge_revs + fact_revs
 
     # --- Build text from surviving revisions ---
     texts: List[str] = []

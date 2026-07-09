@@ -187,3 +187,51 @@ def test_manager_compose_context_defaults_to_recall_mode():
     assert mgr.compose_context(mems) == "RAWCONTENT"
     # Explicit mode overrides the manager's recall_mode.
     assert mgr.compose_context(mems, mode="summarized") == "a: sa"
+
+
+def test_fact_recall_evidence_rides_on_top_of_the_cap():
+    # Fact-recall entries are additive on the same terms as bridge evidence:
+    # their own +2 budget after the top-K head slice, never displacing it.
+    mems = [_mem(f"m{i}", f"s{i}", score=1.0 - i * 0.1) for i in range(6)]
+    facts = []
+    for i in range(3):                                # 3 offered, budget keeps 2
+        f = _mem(f"fact{i}", f"claim{i}", score=0.05)
+        f["fact_recall"] = True
+        facts.append(f)
+    out = compose_context(mems + facts, top_k=5)
+    blocks = out.split("\n\n")
+    assert len(blocks) == 7                           # 5 base + 2 additive facts
+    assert blocks[:5] == [f"m{i}: s{i}" for i in range(5)]   # base untouched
+    assert blocks[5] == "fact0: claim0" and blocks[6] == "fact1: claim1"
+
+
+def test_bridge_and_fact_budgets_are_independent():
+    # A node that is both bridge and fact-recall counts once (as bridge);
+    # each additive class keeps its own +2 budget on top of the head slice.
+    mems = [_mem(f"m{i}", f"s{i}", score=1.0 - i * 0.1) for i in range(6)]
+    bridge = _mem("bridge-fact", "joined evidence", score=0.05)
+    bridge["bridge"] = True
+    bridge["fact_recall"] = True                      # dual-flagged: bridge wins
+    fact = _mem("fact0", "claim0", score=0.04)
+    fact["fact_recall"] = True
+    out = compose_context(mems + [bridge, fact], top_k=5)
+    blocks = out.split("\n\n")
+    assert len(blocks) == 7                           # 5 base + 1 bridge + 1 fact
+    assert blocks[:5] == [f"m{i}: s{i}" for i in range(5)]
+    assert "bridge-fact: joined evidence" in blocks[5:]
+    assert "fact0: claim0" in blocks[5:]
+
+
+def test_fact_budget_kwarg_mirrors_config():
+    # fact_recall_max_results is documented as mirrored by the composer —
+    # the manager passes it through as ``fact_budget``.
+    mems = [_mem(f"m{i}", f"s{i}", score=1.0 - i * 0.1) for i in range(6)]
+    facts = []
+    for i in range(3):
+        f = _mem(f"fact{i}", f"claim{i}", score=0.05)
+        f["fact_recall"] = True
+        facts.append(f)
+    out = compose_context(mems + facts, top_k=5, fact_budget=3)
+    blocks = out.split("\n\n")
+    assert len(blocks) == 8                           # 5 base + all 3 facts
+    assert blocks[5:] == [f"fact{i}: claim{i}" for i in range(3)]

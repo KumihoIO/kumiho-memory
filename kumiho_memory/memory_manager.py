@@ -259,6 +259,11 @@ class UniversalMemoryManager:
         # meaningful when graph augmentation itself is active).
         if self.graph_augmentation_config is not None and ontology_on:
             self.graph_augmentation_config.entity_recall = True
+            # Fact-recall leg rides the same switch (facts are the ontology's
+            # payload); KUMIHO_MEMORY_FACT_RECALL=0 is the measurement
+            # kill-switch for A/B isolation on top of ontology-on.
+            if os.getenv("KUMIHO_MEMORY_FACT_RECALL", "").strip() != "0":
+                self.graph_augmentation_config.fact_recall = True
 
         # When ontology is on, consolidation decomposes the whole conversation
         # into a typed graph (entities + facts + decisions + events + ...),
@@ -1421,6 +1426,14 @@ class UniversalMemoryManager:
                     target += getattr(
                         self.graph_augmentation_config, "entity_recall_reserve", 0,
                     )
+                if getattr(self.graph_augmentation_config, "fact_recall", False):
+                    # Same on-top mirroring for the fact-recall entries: the
+                    # recall stage appends up to ``fact_recall_max_results``
+                    # after its cap, so the trim target must grow by the same
+                    # amount or this slice would delete exactly them.
+                    target += getattr(
+                        self.graph_augmentation_config, "fact_recall_max_results", 0,
+                    )
                 final_cfg = _dc_replace(
                     self.rerank_config, cross_encoder_enabled=False,
                 )
@@ -1855,12 +1868,20 @@ class UniversalMemoryManager:
         """
         from kumiho_memory.context_compose import compose_context
 
+        fact_budget = 2
+        if self.graph_augmentation_config is not None and getattr(
+            self.graph_augmentation_config, "fact_recall", False,
+        ):
+            fact_budget = getattr(
+                self.graph_augmentation_config, "fact_recall_max_results", 2,
+            )
         return compose_context(
             memories,
             query,
             mode=mode or self.recall_mode,
             top_k=top_k,
             char_limit=char_limit,
+            fact_budget=fact_budget,
         )
 
     def rerank_memories(

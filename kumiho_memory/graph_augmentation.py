@@ -100,6 +100,31 @@ class GraphAugmentationConfig:
     #: (Measured: conv-26 bridge join fired on 105/105 questions before this
     #: filter — the two speaker entities bridged every angle pair.)
     entity_bridge_hub_degree_max: int = 12
+    #: Fact-recall leg: retrieve typed ``fact`` nodes as first-class recall
+    #: candidates alongside conversations. Facts are answer-shaped atomic
+    #: claims, so a single semantic hit often IS the answer a single-hop or
+    #: temporal question needs. Searched once with the ORIGINAL query (not
+    #: the reformulations) via a direct ``kumiho.search`` scoped to the
+    #: project's facts space — the retrieve tool is bypassed on purpose:
+    #: typed nodes carry no published/latest tag, so it would drop them all.
+    #: On servers with the derived-kind fulltext exclusion (kumiho-server#35)
+    #: this reach is vector-only — facts stay out of the lexical corpus but
+    #: remain semantically recallable, exactly the intended division. Entries
+    #: are additive: they ride on top of the recall cap and the context
+    #: top-K (never displacing conversation hits), mirroring the measured
+    #: bridge-evidence policy. Turned on with KUMIHO_MEMORY_ONTOLOGY=1;
+    #: KUMIHO_MEMORY_FACT_RECALL=0 is the measurement kill-switch.
+    fact_recall: bool = False
+    #: Search hits examined per query (top slice of the fact search).
+    fact_recall_limit: int = 3
+    #: Entries appended per recall — also the on-top budget mirrored by the
+    #: manager trim and the context composer.
+    fact_recall_max_results: int = 2
+    #: Fact entries score this × the WEAKEST base hit (axis-relative, not
+    #: the server's raw fused score — a cross-encoder rerank rewrites base
+    #: scores onto a different scale), so a fact never outranks any
+    #: conversation on any score axis.
+    fact_recall_score_factor: float = 0.9
     max_total: Optional[int] = None  # Defaults to base_limit * 3
     reformulate_queries: bool = True
     traversal_timeout: int = 30  # seconds; daemon thread timeout for gRPC edge traversal
@@ -353,6 +378,23 @@ class GraphAugmentedRecall:
                     bridge_found,
                 )
 
+        # --- Stage 3c: Fact-recall leg (opt-in, first-class facts) ---
+        # Semantic retrieval of typed fact nodes with the ORIGINAL query.
+        # Runs after the bridge join so bridges claim seen_krefs first (their
+        # two-angle evidence outranks a single-query match on the same node),
+        # and before the score-less 2-hop walk for the same reason. Skipped
+        # for scoped recalls: facts carry no space/type back-pointer, so a
+        # space_paths- or memory_types-filtered call must not surface claims
+        # distilled from conversations the caller excluded.
+        if self.config.fact_recall and not space_paths and not memory_types:
+            fact_found = await self._fact_recall_leg(
+                query, seen_krefs, augmented,
+            )
+            if fact_found:
+                logger.info(
+                    "Fact recall surfaced %d fact node(s)", fact_found,
+                )
+
         # --- Stage 3d: Entity-mediated 2-hop reader (opt-in) ---
         # Reaches memories that share an entity but not vocabulary/embedding
         # neighborhood — the relational-recall payoff of entity promotion.
@@ -428,7 +470,10 @@ class GraphAugmentedRecall:
         if len(augmented) > cap:
             logger.info("Capping augmented memories from %d to %d", len(augmented), cap)
             reserve = self.config.entity_recall_reserve if self.config.entity_recall else 0
-            if reserve > 0:
+            fact_max = (
+                self.config.fact_recall_max_results if self.config.fact_recall else 0
+            )
+            if reserve > 0 or fact_max > 0:
                 # The sibling reserve rides ON TOP of the cap instead of inside
                 # it: base + edge-traversal entries keep exactly the slots they
                 # get with entity recall off (edges are the measured multi-hop
@@ -442,14 +487,22 @@ class GraphAugmentedRecall:
                 base = [m for m in augmented if not m.get("graph_augmented")]
                 sib = [m for m in augmented
                        if m.get("graph_augmented") and m.get("score") is None]
+                # Fact-recall entries get their own on-top budget: they carry
+                # real scores but must neither displace edges/bridges from
+                # the room nor be displaced by them (both are additive
+                # payloads with independently measured policies).
+                facts = [m for m in augmented
+                         if m.get("graph_augmented") and m.get("score") is not None
+                         and m.get("fact_recall")]
                 edges = [m for m in augmented
-                         if m.get("graph_augmented") and m.get("score") is not None]
+                         if m.get("graph_augmented") and m.get("score") is not None
+                         and not m.get("fact_recall")]
                 # Bridges carry a real inherited score; plain traversal entries
                 # are 0.0 placeholders. Stable sort keeps the 0.0 group in
                 # arrival order while bridges jump ahead of it in the room.
                 edges.sort(key=lambda m: m.get("score") or 0.0, reverse=True)
                 room = max(0, cap - len(base))
-                augmented = base + edges[:room] + sib[:reserve]
+                augmented = base + edges[:room] + facts[:fact_max] + sib[:reserve]
             else:
                 augmented = augmented[:cap]
 
@@ -1010,6 +1063,113 @@ class GraphAugmentedRecall:
             on_error=0,
         ) or 0
         if found:
+            augmented.extend(results)
+        return found
+
+    async def _fact_recall_leg(
+        self,
+        query: str,
+        seen_krefs: set,
+        augmented: List[Dict[str, Any]],
+    ) -> int:
+        """Surface typed ``fact`` nodes as first-class semantic candidates.
+
+        One direct ``kumiho.search`` with the original query, scoped to the
+        project's facts space and kind-filtered to ``fact``. Direct search —
+        not the retrieve tool — because typed nodes carry no published/latest
+        tag and the tool silently drops untagged items. Entries score
+        ``fact_recall_score_factor`` × the WEAKEST base hit — relative to
+        the base axis, not the server's, because a cross-encoder rerank
+        rewrites base scores onto a different scale and a raw fused score
+        would then sort every fact above every conversation. Facts share one
+        trailing score (stable sorts keep their search order) and are
+        flagged ``fact_recall`` so the cap here and the context composer
+        keep them additive (they never evict or outrank conversation hits).
+        """
+        try:
+            import kumiho
+        except ImportError:
+            logger.debug("kumiho SDK not available, skipping fact recall")
+            return 0
+
+        # Scope from the recalled memories themselves: fact nodes live in
+        # the same project's dedicated facts space (ontology.py).
+        project = ""
+        for m in augmented:
+            kref = m.get("kref", "")
+            if kref.startswith("kref://"):
+                project = kref[len("kref://"):].split("/", 1)[0]
+                break
+        if not project:
+            return 0
+
+        base_scores = [
+            m.get("score") or 0.0
+            for m in augmented if not m.get("graph_augmented")
+        ]
+        floor = min(base_scores) if base_scores else 0.0
+        fact_score = round(floor * self.config.fact_recall_score_factor, 6)
+        max_results = self.config.fact_recall_max_results
+        limit = self.config.fact_recall_limit
+        # Snapshot for the worker thread: it must not read or mutate the
+        # shared set — a timed-out search would otherwise keep claiming
+        # krefs that never get emitted (poisoning the 2-hop walk after us).
+        known = set(seen_krefs)
+        results: List[Dict[str, Any]] = []
+
+        def _sync_search() -> int:
+            try:
+                hits = kumiho.search(
+                    query,
+                    context=f"{project}/facts",
+                    kind="fact",
+                    include_revision_metadata=True,
+                )
+            except Exception as exc:
+                logger.debug("fact recall search failed: %s", exc)
+                return 0
+            found = 0
+            for r in (hits or [])[:limit]:
+                if found >= max_results:
+                    break
+                item = getattr(r, "item", None)
+                if item is None:
+                    continue
+                try:
+                    rev = item.get_latest_revision()
+                except Exception:
+                    continue
+                if rev is None:
+                    continue
+                kref = getattr(getattr(rev, "kref", None), "uri", "") or ""
+                if not kref or kref in known:
+                    continue
+                meta = getattr(rev, "metadata", {}) or {}
+                known.add(kref)
+                results.append({
+                    "kref": kref,
+                    "title": meta.get("title", ""),
+                    "summary": meta.get("summary", "") or meta.get("claim", ""),
+                    "content": meta.get("claim", ""),
+                    "score": fact_score,
+                    "graph_augmented": True,
+                    "fact_recall": True,
+                    "hop": 1,
+                })
+                found += 1
+            return found
+
+        found = await run_bounded_in_thread(
+            _sync_search,
+            timeout=self.config.traversal_timeout,
+            label="fact recall",
+            on_timeout=0,
+            on_error=0,
+        ) or 0
+        if found:
+            # Claim krefs only for entries that actually get emitted — after
+            # the bounded wait, never from the abandonable worker thread.
+            seen_krefs.update(e["kref"] for e in results)
             augmented.extend(results)
         return found
 

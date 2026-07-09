@@ -290,3 +290,23 @@ def test_real_sdk_exposes_methods_entity_promotion_calls():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_fact_recall_follows_ontology_switch(monkeypatch):
+    monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "1")
+    monkeypatch.delenv("KUMIHO_MEMORY_FACT_RECALL", raising=False)
+    m = _build_manager(graph_augmentation=True)
+    assert m.graph_augmentation_config.fact_recall is True
+
+    # Kill-switch: ontology stays on, the fact leg alone turns off (A/B).
+    monkeypatch.setenv("KUMIHO_MEMORY_FACT_RECALL", "0")
+    m = _build_manager(graph_augmentation=True)
+    assert m.graph_augmentation_config.entity_recall is True
+    assert m.graph_augmentation_config.fact_recall is False
+
+
+def test_fact_recall_off_without_ontology(monkeypatch):
+    monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
+    monkeypatch.delenv("KUMIHO_MEMORY_FACT_RECALL", raising=False)
+    m = _build_manager(graph_augmentation=True)
+    assert m.graph_augmentation_config.fact_recall is False
