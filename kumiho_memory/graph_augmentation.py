@@ -382,13 +382,15 @@ class GraphAugmentedRecall:
         # Semantic retrieval of typed fact nodes with the ORIGINAL query.
         # Runs after the bridge join so bridges claim seen_krefs first (their
         # two-angle evidence outranks a single-query match on the same node),
-        # and before the score-less 2-hop walk for the same reason. Skipped
-        # for scoped recalls: facts carry no space/type back-pointer, so a
-        # space_paths- or memory_types-filtered call must not surface claims
-        # distilled from conversations the caller excluded.
-        if self.config.fact_recall and not space_paths and not memory_types:
+        # and before the score-less 2-hop walk for the same reason.
+        # space_paths does NOT disable the leg — facts are project-level
+        # distillations, so a space-scoped call still augments from the SAME
+        # project's facts space (derived from the scope; cross-project
+        # isolation holds). memory_types does disable it: fact nodes carry
+        # no memory_type, so a type-filtered call must not surface them.
+        if self.config.fact_recall and not memory_types:
             fact_found = await self._fact_recall_leg(
-                query, seen_krefs, augmented,
+                query, seen_krefs, augmented, space_paths=space_paths,
             )
             if fact_found:
                 logger.info(
@@ -1071,6 +1073,7 @@ class GraphAugmentedRecall:
         query: str,
         seen_krefs: set,
         augmented: List[Dict[str, Any]],
+        space_paths: Optional[List[str]] = None,
     ) -> int:
         """Surface typed ``fact`` nodes as first-class semantic candidates.
 
@@ -1092,14 +1095,22 @@ class GraphAugmentedRecall:
             logger.debug("kumiho SDK not available, skipping fact recall")
             return 0
 
-        # Scope from the recalled memories themselves: fact nodes live in
-        # the same project's dedicated facts space (ontology.py).
+        # Scope: fact nodes live in the project's dedicated facts space
+        # (ontology.py). Derive the project from the caller's space_paths
+        # when given (a scoped call stays inside its own project), else from
+        # the recalled memories themselves.
         project = ""
-        for m in augmented:
-            kref = m.get("kref", "")
-            if kref.startswith("kref://"):
-                project = kref[len("kref://"):].split("/", 1)[0]
+        for sp in space_paths or []:
+            head = sp.lstrip("/").split("/", 1)[0].strip()
+            if head:
+                project = head
                 break
+        if not project:
+            for m in augmented:
+                kref = m.get("kref", "")
+                if kref.startswith("kref://"):
+                    project = kref[len("kref://"):].split("/", 1)[0]
+                    break
         if not project:
             return 0
 

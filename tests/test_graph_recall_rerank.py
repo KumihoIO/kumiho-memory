@@ -938,10 +938,10 @@ def test_fact_recall_off_is_inert(monkeypatch):
     assert [m["kref"] for m in out] == base_krefs
 
 
-def test_fact_recall_skipped_for_scoped_recalls(monkeypatch):
-    # space_paths / memory_types scope the whole recall; facts carry no
-    # space/type back-pointer, so the leg must not surface claims distilled
-    # from conversations the caller excluded.
+def test_fact_recall_space_scoped_call_stays_in_project(monkeypatch):
+    # space_paths must NOT disable the leg (the LoCoMo harness scopes every
+    # recall) — it derives the project from the scope and searches THAT
+    # project's facts space. Cross-project isolation holds.
     base_krefs = [f"kref://p/notes/b{i}.conversation?r=1" for i in range(3)]
     graph = {b: _FakeRev(b, {"title": f"B{i}", "summary": "base"}, [])
              for i, b in enumerate(base_krefs)}
@@ -957,6 +957,29 @@ def test_fact_recall_skipped_for_scoped_recalls(monkeypatch):
     gr = GraphAugmentedRecall(recall_fn=recall_fn,
                               config=GraphAugmentationConfig(fact_recall=True))
     out = asyncio.run(gr.recall("q", limit=3, space_paths=["p/team-shared"]))
+    assert len(calls) == 1                           # leg ran, scoped to p
+    assert calls[0][1]["context"] == "p/facts"
+    assert any(m.get("fact_recall") for m in out)
+
+
+def test_fact_recall_skipped_for_type_filtered_recalls(monkeypatch):
+    # memory_types filters by revision memory_type; fact nodes carry none,
+    # so a type-filtered call must not surface them.
+    base_krefs = [f"kref://p/notes/b{i}.conversation?r=1" for i in range(3)]
+    graph = {b: _FakeRev(b, {"title": f"B{i}", "summary": "base"}, [])
+             for i, b in enumerate(base_krefs)}
+    frev = _FakeRev("kref://p/facts/f0.fact?r=1",
+                    {"title": "F0", "summary": "claim"}, [])
+    calls = []
+    _install_fact_search(monkeypatch, graph, [(frev, 2.0)], calls)
+
+    async def recall_fn(query, *, limit, space_paths=None, memory_types=None):
+        return [{"kref": b, "title": f"B{i}", "summary": "base",
+                 "score": 0.9 - i * 0.1} for i, b in enumerate(base_krefs)]
+
+    gr = GraphAugmentedRecall(recall_fn=recall_fn,
+                              config=GraphAugmentationConfig(fact_recall=True))
+    out = asyncio.run(gr.recall("q", limit=3, memory_types=["decision"]))
     assert calls == []                               # leg never searched
     assert all(not m.get("fact_recall") for m in out)
 
