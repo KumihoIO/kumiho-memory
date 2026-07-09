@@ -91,6 +91,15 @@ class GraphAugmentationConfig:
     #: hit and survives tight context budgets. Active with ``entity_recall``.
     entity_bridge_max_results: int = 4
     entity_bridge_score_factor: float = 0.9
+    #: Skip hub entities in the bridge join: an anchor with more than this
+    #: many incoming ABOUT/INVOLVES edges is a ubiquitous entity (e.g. the
+    #: conversation's speakers, linked from nearly every memory) — every
+    #: angle reaches it, so it "bridges" everything and its facts are
+    #: generic, diluting the join. The discriminative low-degree bridges are
+    #: the ones that actually connect a multi-hop question's sub-facts.
+    #: (Measured: conv-26 bridge join fired on 105/105 questions before this
+    #: filter — the two speaker entities bridged every angle pair.)
+    entity_bridge_hub_degree_max: int = 12
     max_total: Optional[int] = None  # Defaults to base_limit * 3
     reformulate_queries: bool = True
     traversal_timeout: int = 30  # seconds; daemon thread timeout for gRPC edge traversal
@@ -875,6 +884,7 @@ class GraphAugmentedRecall:
 
         factor = self.config.entity_bridge_score_factor
         max_results = self.config.entity_bridge_max_results
+        hub_max = self.config.entity_bridge_hub_degree_max
         results: List[Dict[str, Any]] = []
 
         def _kind(kref: str) -> str:
@@ -919,23 +929,35 @@ class GraphAugmentedRecall:
             bridges.sort(reverse=True)
 
             found = 0
-            for link_score, anchor in bridges[:3]:  # at most 3 bridge entities
+            # Hubs get skipped below, so scan a few more ranked bridges than
+            # the old top-3; the found/max_results cap still bounds the work.
+            for link_score, anchor in bridges[:8]:
                 if found >= max_results:
                     break
                 try:
                     anchor_rev = kumiho.get_revision(anchor)
+                    incoming = 0
                     candidates: List[Tuple[int, str, str]] = []
                     for edge in anchor_rev.get_edges(direction=kumiho.BOTH):
                         if edge.edge_type not in ("ABOUT", "INVOLVES"):
                             continue
                         if edge.target_kref.uri != anchor:
                             continue  # only incoming node -> anchor
+                        incoming += 1
                         src = edge.source_kref.uri
                         if not src or src in seen_krefs:
                             continue
                         candidates.append(
                             (kind_priority.get(_kind(src), 3), src, edge.edge_type),
                         )
+                    if incoming > hub_max:
+                        # Ubiquitous entity (speaker-style): bridges every
+                        # angle pair, its facts are generic — not a join.
+                        logger.debug(
+                            "entity bridge: %s skipped as hub (%d incoming)",
+                            anchor, incoming,
+                        )
+                        continue
                     candidates.sort(key=lambda c: c[0])
                     for _prio, src, etype in candidates[:2]:  # <=2 nodes/bridge
                         if found >= max_results:

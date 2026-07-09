@@ -659,6 +659,49 @@ def test_bridge_prefers_fact_nodes_over_conversations(monkeypatch):
     assert augmented[0]["kref"] == F   # fact beats conversation
 
 
+def test_bridge_skips_hub_entities(monkeypatch):
+    # A speaker-style entity is ABOUT-linked from nearly every memory, so it
+    # "bridges" every angle pair with generic facts. Anchors above the hub
+    # degree cap are skipped; the discriminative low-degree bridge survives.
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    M2 = "kref://p/notes/m2.conversation?r=1"
+    H = "kref://p/entities/speaker.entity?r=1"     # hub (6 incoming > cap 5)
+    X = "kref://p/entities/topic.entity?r=1"       # discriminative (3 incoming)
+    F_hub = "kref://p/facts/generic.fact?r=1"
+    F_x = "kref://p/facts/specific.fact?r=1"
+    extra = [f"kref://p/notes/x{i}.conversation?r=1" for i in range(4)]
+    hub_edges = [_FakeEdge(M1, H, "ABOUT"), _FakeEdge(M2, H, "ABOUT"),
+                 _FakeEdge(F_hub, H, "ABOUT")] + [
+                 _FakeEdge(e, H, "ABOUT") for e in extra]     # 7 incoming
+    graph = {
+        M1: _FakeRev(M1, {"title": "M1"}, [
+            _FakeEdge(M1, H, "ABOUT"), _FakeEdge(M1, X, "ABOUT")]),
+        M2: _FakeRev(M2, {"title": "M2"}, [
+            _FakeEdge(M2, H, "ABOUT"), _FakeEdge(M2, X, "ABOUT")]),
+        H: _FakeRev(H, {"display_name": "Speaker"}, hub_edges),
+        X: _FakeRev(X, {"display_name": "Topic"}, [
+            _FakeEdge(M1, X, "ABOUT"), _FakeEdge(M2, X, "ABOUT"),
+            _FakeEdge(F_x, X, "ABOUT")]),
+        F_hub: _FakeRev(F_hub, {"title": "Generic", "summary": "generic"}, []),
+        F_x: _FakeRev(F_x, {"title": "Specific", "summary": "specific"}, []),
+    }
+    for e in extra:
+        graph[e] = _FakeRev(e, {"title": "x"}, [])
+    _install_graph(monkeypatch, graph)
+
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(
+        entity_recall=True, entity_bridge_hub_degree_max=5,
+    ))
+    augmented = []
+    found = asyncio.run(gr._entity_bridge_join(
+        [[(M1, 0.8)], [(M2, 0.6)]], {M1, M2}, augmented,
+    ))
+    krefs = [m["kref"] for m in augmented]
+    assert F_x in krefs          # discriminative bridge surfaced
+    assert F_hub not in krefs    # hub entity skipped entirely
+    assert found == len(krefs)
+
+
 def test_sibling_reserve_rides_on_top_and_never_evicts_edges(monkeypatch):
     # Old in-cap reserve: base(6) + keep_sib(3) left room=0 for edge entries at
     # cap=9 — ON traded the proven edge-traversal payload (the a3c multi-hop
