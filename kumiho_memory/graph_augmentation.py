@@ -313,7 +313,7 @@ class GraphAugmentedRecall:
         entity_found = 0
         if self.config.entity_recall:
             entity_found = await self._traverse_entity_neighbors(
-                seed_krefs, seen_krefs, augmented,
+                seed_krefs, seen_krefs, augmented, query=query,
             )
             if entity_found:
                 logger.debug("entity recall surfaced %d sibling node(s)", entity_found)
@@ -383,18 +383,23 @@ class GraphAugmentedRecall:
             logger.info("Capping augmented memories from %d to %d", len(augmented), cap)
             reserve = self.config.entity_recall_reserve if self.config.entity_recall else 0
             if reserve > 0:
-                # Never evict a scored base hit, but reserve a few tail slots for
-                # the score-less 2-hop siblings so the (expensive) entity walk's
-                # payload isn't crowded out entirely by the other edge entries.
+                # The sibling reserve rides ON TOP of the cap instead of inside
+                # it: base + edge-traversal entries keep exactly the slots they
+                # get with entity recall off (edges are the measured multi-hop
+                # signal — LoCoMo conv-26 showed the old in-cap reserve evicted
+                # ALL edge entries whenever base filled, trading the proven
+                # edge payload for unproven siblings), and up to ``reserve``
+                # score-less siblings are appended after. ON output is a strict
+                # superset of the OFF output by construction; the manager-side
+                # trim extends its target by the same reserve (memory_manager).
                 # Default path (entity_recall off) keeps the exact head-slice.
                 base = [m for m in augmented if not m.get("graph_augmented")]
                 sib = [m for m in augmented
                        if m.get("graph_augmented") and m.get("score") is None]
                 edges = [m for m in augmented
                          if m.get("graph_augmented") and m.get("score") is not None]
-                keep_sib = sib[:reserve]
-                room = max(0, cap - len(base) - len(keep_sib))
-                augmented = (base + edges[:room] + keep_sib)[:cap]
+                room = max(0, cap - len(base))
+                augmented = base + edges[:room] + sib[:reserve]
             else:
                 augmented = augmented[:cap]
 
@@ -805,6 +810,7 @@ class GraphAugmentedRecall:
         seed_krefs: List[str],
         seen_krefs: set,
         augmented: List[Dict[str, Any]],
+        query: str = "",
     ) -> int:
         """Entity-mediated 2-hop walk: memory → entity anchor → sibling memory.
 
@@ -914,6 +920,23 @@ class GraphAugmentedRecall:
             on_error=0,
         ) or 0
         if found:
+            # Order siblings by lexical overlap with the query so the cap's
+            # sibling reserve keeps the MOST relevant ones — walk order is
+            # seed × anchor × edge arrival, arbitrary w.r.t. the question.
+            # Ordering only: the entries stay score-less, so they still trail
+            # scored hits and are never evidence-reweighted (see the
+            # placeholder note above).
+            if query:
+                from kumiho_memory.recall_rerank import _jaccard, _tokens
+
+                q_tokens = _tokens(query)
+                results.sort(
+                    key=lambda m: _jaccard(
+                        q_tokens,
+                        _tokens(f"{m.get('title', '')} {m.get('summary', '')}"),
+                    ),
+                    reverse=True,
+                )
             augmented.extend(results)
             logger.info("Entity recall: +%d sibling memories via entity anchors", found)
         return found

@@ -541,3 +541,81 @@ def test_entity_walk_dedups_shared_anchor_across_seeds(monkeypatch):
     augmented = []
     asyncio.run(gr._traverse_entity_neighbors([M1, M3], {M1, M3}, augmented))
     assert a_fetches["n"] == 1                    # shared hub expanded exactly once
+
+
+def test_entity_siblings_ordered_by_query_relevance(monkeypatch):
+    # The cap's sibling reserve keeps ``sib[:reserve]``; walk arrival order is
+    # seed × anchor × edge order — arbitrary w.r.t. the question — so siblings
+    # must be sorted by lexical overlap with the query before being appended,
+    # or the reserve keeps arbitrary ones and the relevant sibling is trimmed.
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    A = "kref://p/entities/acme.entity?r=1"
+    S_off = "kref://p/notes/offtopic.conversation?r=1"
+    S_hit = "kref://p/notes/hit.conversation?r=1"
+    _install_graph(monkeypatch, {
+        M1: _FakeRev(M1, {"title": "M1"}, [_FakeEdge(M1, A, "ABOUT")]),
+        A: _FakeRev(A, {"display_name": "Acme"}, [
+            _FakeEdge(M1, A, "ABOUT"),
+            _FakeEdge(S_off, A, "ABOUT"),   # arrives FIRST, irrelevant
+            _FakeEdge(S_hit, A, "ABOUT"),   # arrives second, matches the query
+        ]),
+        S_off: _FakeRev(S_off, {"title": "Gardening",
+                                "summary": "tomato plants and soil"}, []),
+        S_hit: _FakeRev(S_hit, {"title": "Acme funding",
+                                "summary": "acme raised a funding round"}, []),
+    })
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(entity_recall=True))
+    augmented = []
+    asyncio.run(gr._traverse_entity_neighbors(
+        [M1], {M1}, augmented, query="when did acme raise its funding round?",
+    ))
+    assert [m["kref"] for m in augmented] == [S_hit, S_off]  # relevance first
+    # Ordering only — entries stay score-less (evidence-inversion fix intact).
+    assert all(m.get("score") is None for m in augmented)
+
+
+def test_sibling_reserve_rides_on_top_and_never_evicts_edges(monkeypatch):
+    # Old in-cap reserve: base(6) + keep_sib(3) left room=0 for edge entries at
+    # cap=9 — ON traded the proven edge-traversal payload (the a3c multi-hop
+    # weapon) for unproven siblings. New behavior: edges keep exactly their
+    # OFF-equivalent room (cap - base) and the sibling reserve rides ON TOP,
+    # so the ON output is a strict superset of the OFF output.
+    base_krefs = [f"kref://p/notes/b{i}.conversation?r=1" for i in range(6)]
+    edge_krefs = [f"kref://p/notes/e{i}.conversation?r=1" for i in range(3)]
+    A = "kref://p/entities/acme.entity?r=1"
+    sib_krefs = [f"kref://p/notes/s{i}.conversation?r=1" for i in range(2)]
+
+    graph = {}
+    for i, b in enumerate(base_krefs):
+        edges = []
+        if i < 3:  # first three seeds each have one structural edge
+            edges.append(_FakeEdge(b, edge_krefs[i], "DERIVED_FROM"))
+        if i == 0:  # first seed also links the entity anchor
+            edges.append(_FakeEdge(b, A, "ABOUT"))
+        graph[b] = _FakeRev(b, {"title": f"B{i}", "summary": "base"}, edges)
+    for i, e in enumerate(edge_krefs):
+        graph[e] = _FakeRev(e, {"title": f"E{i}", "summary": "edge hit"}, [])
+    graph[A] = _FakeRev(A, {"display_name": "Acme"}, [
+        _FakeEdge(base_krefs[0], A, "ABOUT"),
+        _FakeEdge(sib_krefs[0], A, "ABOUT"),
+        _FakeEdge(sib_krefs[1], A, "ABOUT"),
+    ])
+    for i, s in enumerate(sib_krefs):
+        graph[s] = _FakeRev(s, {"title": f"S{i}", "summary": "sibling"}, [])
+    _install_graph(monkeypatch, graph)
+
+    async def recall_fn(query, *, limit, space_paths=None, memory_types=None):
+        return [{"kref": b, "title": f"B{i}", "summary": "base",
+                 "score": 0.9 - i * 0.1} for i, b in enumerate(base_krefs)]
+
+    gr = GraphAugmentedRecall(
+        recall_fn=recall_fn,
+        config=GraphAugmentationConfig(entity_recall=True),
+    )
+    out = asyncio.run(gr.recall("acme question", limit=3))  # cap = 9
+
+    krefs = [m["kref"] for m in out]
+    assert all(e in krefs for e in edge_krefs)     # edges NOT evicted (old bug)
+    assert all(s in krefs for s in sib_krefs)      # siblings ride on top
+    assert len(out) == 6 + 3 + 2                   # base + edges + reserve-capped sibs
+    assert krefs[:6] == base_krefs                 # scored base hits stay first

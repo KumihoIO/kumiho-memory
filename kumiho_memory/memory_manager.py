@@ -1411,6 +1411,16 @@ class UniversalMemoryManager:
                 from dataclasses import replace as _dc_replace
                 from kumiho_memory.recall_rerank import rerank
                 target = self.graph_augmentation_config.max_total or (limit * 3)
+                if getattr(self.graph_augmentation_config, "entity_recall", False):
+                    # The recall stage appends up to ``entity_recall_reserve``
+                    # score-less entity siblings ON TOP of its cap; mirror that
+                    # here so the trailing siblings survive this trim too
+                    # (rerank keeps unscored entries last, so without the
+                    # extension this [:target] slice would delete exactly
+                    # them).
+                    target += getattr(
+                        self.graph_augmentation_config, "entity_recall_reserve", 0,
+                    )
                 final_cfg = _dc_replace(
                     self.rerank_config, cross_encoder_enabled=False,
                 )
