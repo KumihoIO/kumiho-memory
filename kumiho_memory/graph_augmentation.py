@@ -25,7 +25,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Union
 
 from kumiho_memory._bounded import run_bounded_in_thread
 from kumiho_memory.summarization import (
@@ -81,6 +81,16 @@ class GraphAugmentationConfig:
     #: Cap slots reserved for the (score-less) 2-hop siblings when the merged
     #: result set overflows, so the walk's payload isn't always trimmed first.
     entity_recall_reserve: int = 3
+    #: Entity-bridge join (multi-hop): when two or more reformulated angles
+    #: have hits ABOUT the same entity, that entity is a *bridge* and its
+    #: fact/event nodes are surfaced with a REAL inherited score
+    #: (``factor x`` the weaker linking angle's score) — the typed-graph JOIN
+    #: that vector recall cannot express. Unlike the one-sided score-less
+    #: siblings of the generic walk, a bridge's relevance is vouched for by
+    #: BOTH measured angles, so it competes for context like a first-class
+    #: hit and survives tight context budgets. Active with ``entity_recall``.
+    entity_bridge_max_results: int = 4
+    entity_bridge_score_factor: float = 0.9
     max_total: Optional[int] = None  # Defaults to base_limit * 3
     reformulate_queries: bool = True
     traversal_timeout: int = 30  # seconds; daemon thread timeout for gRPC edge traversal
@@ -254,6 +264,17 @@ class GraphAugmentedRecall:
                 ),
             )
 
+        # Per-angle top hits for the entity-bridge join (Stage 3c): angle
+        # attribution must be captured here — the merge above collapses it.
+        angle_hits: List[List[Tuple[str, float]]] = []
+        for result in recall_results:
+            if isinstance(result, BaseException):
+                continue
+            hits = [(m.get("kref", ""), float(m.get("score") or 0.0))
+                    for m in result[:3] if m.get("kref")]
+            if hits:
+                angle_hits.append(hits)
+
         if not memories:
             return memories
 
@@ -307,7 +328,23 @@ class GraphAugmentedRecall:
             edge_types=effective_edge_types,
         )
 
-        # --- Stage 3b: Entity-mediated 2-hop reader (opt-in) ---
+        # --- Stage 3b: Entity-bridge join (opt-in, multi-hop) ---
+        # The JOIN the typed graph enables: an entity reached (ABOUT) from two
+        # or more angles' top hits connects the question's sub-facts. Its
+        # fact/event nodes carry a real inherited score, so they land at the
+        # top of context — this runs BEFORE the generic walk so bridges also
+        # claim seen_krefs first.
+        if self.config.entity_recall and len(angle_hits) >= 2:
+            bridge_found = await self._entity_bridge_join(
+                angle_hits, seen_krefs, augmented,
+            )
+            if bridge_found:
+                logger.info(
+                    "Entity bridge join surfaced %d connecting node(s)",
+                    bridge_found,
+                )
+
+        # --- Stage 3d: Entity-mediated 2-hop reader (opt-in) ---
         # Reaches memories that share an entity but not vocabulary/embedding
         # neighborhood — the relational-recall payoff of entity promotion.
         entity_found = 0
@@ -398,6 +435,10 @@ class GraphAugmentedRecall:
                        if m.get("graph_augmented") and m.get("score") is None]
                 edges = [m for m in augmented
                          if m.get("graph_augmented") and m.get("score") is not None]
+                # Bridges carry a real inherited score; plain traversal entries
+                # are 0.0 placeholders. Stable sort keeps the 0.0 group in
+                # arrival order while bridges jump ahead of it in the room.
+                edges.sort(key=lambda m: m.get("score") or 0.0, reverse=True)
                 room = max(0, cap - len(base))
                 augmented = base + edges[:room] + sib[:reserve]
             else:
@@ -804,6 +845,140 @@ class GraphAugmentedRecall:
             timeout,
         )
         return 0
+
+    async def _entity_bridge_join(
+        self,
+        angle_hits: List[List[Tuple[str, float]]],
+        seen_krefs: set,
+        augmented: List[Dict[str, Any]],
+    ) -> int:
+        """Typed-graph JOIN for multi-hop: surface the nodes that CONNECT angles.
+
+        A multi-hop question decomposes into angles; the evidence that answers
+        it is the pair of facts linked by a shared entity ("who adopted the
+        dog" ⋈ "where does that person work" join on the person). For every
+        entity anchor reached via ``ABOUT`` from the top hits of two or more
+        DIFFERENT angles, surface that anchor's fact/event nodes with a real
+        inherited score (``entity_bridge_score_factor`` × the weaker linking
+        angle's score). The bridge's relevance is vouched for by both measured
+        angles — unlike the generic walk's one-sided score-less siblings — so
+        these entries compete for context as first-class hits and survive
+        tight context budgets. Fact/event nodes are preferred over whole
+        conversations: they are the terse atomic claims a multi-hop answer
+        actually needs.
+        """
+        try:
+            import kumiho
+        except ImportError:
+            logger.debug("kumiho SDK not available, skipping entity bridge")
+            return 0
+
+        factor = self.config.entity_bridge_score_factor
+        max_results = self.config.entity_bridge_max_results
+        results: List[Dict[str, Any]] = []
+
+        def _kind(kref: str) -> str:
+            head = kref.split("?", 1)[0]
+            return head.rsplit(".", 1)[-1] if "." in head else ""
+
+        # Terse atomic claims first; whole conversations are the fallback.
+        kind_priority = {"fact": 0, "event": 1, "decision": 2}
+
+        def _sync_join() -> int:
+            # anchor kref -> {angle index: best linking score}
+            anchor_angles: Dict[str, Dict[int, float]] = {}
+            for ai, hits in enumerate(angle_hits):
+                for kref_str, score in hits:
+                    if not kref_str:
+                        continue
+                    try:
+                        rev = kumiho.get_revision(kref_str)
+                        for edge in rev.get_edges(direction=kumiho.BOTH):
+                            if edge.edge_type != "ABOUT":
+                                continue
+                            if edge.source_kref.uri != kref_str:
+                                continue  # only outgoing memory -> anchor
+                            anchor = edge.target_kref.uri
+                            best = anchor_angles.setdefault(anchor, {})
+                            if score > best.get(ai, 0.0):
+                                best[ai] = score
+                    except Exception as exc:
+                        logger.debug(
+                            "entity bridge: edges for %s failed: %s", kref_str, exc,
+                        )
+
+            # A bridge = an anchor linked from >=2 distinct angles. Rank by
+            # the WEAKER of its two best angle scores: both sides must be
+            # genuinely relevant for the join to mean anything.
+            bridges: List[Tuple[float, str]] = []
+            for anchor, per_angle in anchor_angles.items():
+                if len(per_angle) < 2:
+                    continue
+                top2 = sorted(per_angle.values(), reverse=True)[:2]
+                bridges.append((top2[1], anchor))
+            bridges.sort(reverse=True)
+
+            found = 0
+            for link_score, anchor in bridges[:3]:  # at most 3 bridge entities
+                if found >= max_results:
+                    break
+                try:
+                    anchor_rev = kumiho.get_revision(anchor)
+                    candidates: List[Tuple[int, str, str]] = []
+                    for edge in anchor_rev.get_edges(direction=kumiho.BOTH):
+                        if edge.edge_type not in ("ABOUT", "INVOLVES"):
+                            continue
+                        if edge.target_kref.uri != anchor:
+                            continue  # only incoming node -> anchor
+                        src = edge.source_kref.uri
+                        if not src or src in seen_krefs:
+                            continue
+                        candidates.append(
+                            (kind_priority.get(_kind(src), 3), src, edge.edge_type),
+                        )
+                    candidates.sort(key=lambda c: c[0])
+                    for _prio, src, etype in candidates[:2]:  # <=2 nodes/bridge
+                        if found >= max_results:
+                            break
+                        seen_krefs.add(src)
+                        try:
+                            src_rev = kumiho.get_revision(src)
+                            results.append({
+                                "kref": src,
+                                "title": src_rev.metadata.get("title", ""),
+                                "summary": src_rev.metadata.get("summary", ""),
+                                "content": src_rev.metadata.get("content", ""),
+                                # Real score, inherited from the weaker angle:
+                                # this is measured relevance by proxy, not the
+                                # unmeasured placeholder of the generic walk.
+                                "score": round(link_score * factor, 6),
+                                "graph_augmented": True,
+                                "bridge": True,
+                                "edge_type": etype,
+                                "via_entity": anchor,
+                                "hop": 2,
+                            })
+                            found += 1
+                        except Exception as exc:
+                            logger.debug(
+                                "entity bridge: node %s failed: %s", src, exc,
+                            )
+                except Exception as exc:
+                    logger.debug(
+                        "entity bridge: anchor %s failed: %s", anchor, exc,
+                    )
+            return found
+
+        found = await run_bounded_in_thread(
+            _sync_join,
+            timeout=self.config.traversal_timeout,
+            label="entity bridge",
+            on_timeout=0,
+            on_error=0,
+        ) or 0
+        if found:
+            augmented.extend(results)
+        return found
 
     async def _traverse_entity_neighbors(
         self,

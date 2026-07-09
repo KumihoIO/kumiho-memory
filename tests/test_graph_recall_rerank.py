@@ -574,6 +574,91 @@ def test_entity_siblings_ordered_by_query_relevance(monkeypatch):
     assert all(m.get("score") is None for m in augmented)
 
 
+def test_entity_bridge_joins_angles_and_scores_connecting_fact(monkeypatch):
+    # Multi-hop = a JOIN: angle-0's hit and angle-1's hit share entity X, so
+    # X's fact node is the connecting evidence. It must surface with a REAL
+    # inherited score (factor x the WEAKER angle) — first-class, not trailing.
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    M2 = "kref://p/notes/m2.conversation?r=1"
+    X = "kref://p/entities/max.entity?r=1"
+    F = "kref://p/facts/works-at-acme.fact?r=1"
+    _install_graph(monkeypatch, {
+        M1: _FakeRev(M1, {"title": "M1"}, [_FakeEdge(M1, X, "ABOUT")]),
+        M2: _FakeRev(M2, {"title": "M2"}, [_FakeEdge(M2, X, "ABOUT")]),
+        X: _FakeRev(X, {"display_name": "Max"}, [
+            _FakeEdge(M1, X, "ABOUT"), _FakeEdge(M2, X, "ABOUT"),
+            _FakeEdge(F, X, "ABOUT"),
+        ]),
+        F: _FakeRev(F, {"title": "Works at Acme",
+                        "summary": "Max works at Acme"}, []),
+    })
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(entity_recall=True))
+    augmented = []
+    found = asyncio.run(gr._entity_bridge_join(
+        [[(M1, 0.8)], [(M2, 0.6)]], {M1, M2}, augmented,
+    ))
+    assert found == 1
+    entry = augmented[0]
+    assert entry["kref"] == F and entry["bridge"] is True
+    assert abs(entry["score"] - 0.6 * 0.9) < 1e-6   # weaker angle x factor
+    assert entry["via_entity"] == X
+
+
+def test_single_angle_entity_is_not_a_bridge(monkeypatch):
+    # Entities reached from only ONE angle carry no join signal — the bridge
+    # pass must surface nothing (the generic score-less walk covers them).
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    M2 = "kref://p/notes/m2.conversation?r=1"
+    X = "kref://p/entities/x.entity?r=1"
+    Y = "kref://p/entities/y.entity?r=1"
+    F = "kref://p/facts/f.fact?r=1"
+    _install_graph(monkeypatch, {
+        M1: _FakeRev(M1, {"title": "M1"}, [_FakeEdge(M1, X, "ABOUT")]),
+        M2: _FakeRev(M2, {"title": "M2"}, [_FakeEdge(M2, Y, "ABOUT")]),
+        X: _FakeRev(X, {"display_name": "X"}, [
+            _FakeEdge(M1, X, "ABOUT"), _FakeEdge(F, X, "ABOUT"),
+        ]),
+        Y: _FakeRev(Y, {"display_name": "Y"}, [_FakeEdge(M2, Y, "ABOUT")]),
+        F: _FakeRev(F, {"title": "F", "summary": "fact"}, []),
+    })
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(entity_recall=True))
+    augmented = []
+    found = asyncio.run(gr._entity_bridge_join(
+        [[(M1, 0.8)], [(M2, 0.6)]], {M1, M2}, augmented,
+    ))
+    assert found == 0 and augmented == []
+
+
+def test_bridge_prefers_fact_nodes_over_conversations(monkeypatch):
+    # A bridge surfaces the terse atomic claim (fact/event) before a whole
+    # conversation — that's the evidence a multi-hop answer actually needs.
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    M2 = "kref://p/notes/m2.conversation?r=1"
+    X = "kref://p/entities/x.entity?r=1"
+    C = "kref://p/notes/other.conversation?r=1"
+    F = "kref://p/facts/claim.fact?r=1"
+    _install_graph(monkeypatch, {
+        M1: _FakeRev(M1, {"title": "M1"}, [_FakeEdge(M1, X, "ABOUT")]),
+        M2: _FakeRev(M2, {"title": "M2"}, [_FakeEdge(M2, X, "ABOUT")]),
+        X: _FakeRev(X, {"display_name": "X"}, [
+            _FakeEdge(M1, X, "ABOUT"), _FakeEdge(M2, X, "ABOUT"),
+            _FakeEdge(C, X, "ABOUT"),   # conversation arrives FIRST
+            _FakeEdge(F, X, "ABOUT"),   # fact arrives second
+        ]),
+        C: _FakeRev(C, {"title": "Chat", "summary": "long chat"}, []),
+        F: _FakeRev(F, {"title": "Claim", "summary": "atomic claim"}, []),
+    })
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(
+        entity_recall=True, entity_bridge_max_results=1,
+    ))
+    augmented = []
+    found = asyncio.run(gr._entity_bridge_join(
+        [[(M1, 0.8)], [(M2, 0.6)]], {M1, M2}, augmented,
+    ))
+    assert found == 1
+    assert augmented[0]["kref"] == F   # fact beats conversation
+
+
 def test_sibling_reserve_rides_on_top_and_never_evicts_edges(monkeypatch):
     # Old in-cap reserve: base(6) + keep_sib(3) left room=0 for edge entries at
     # cap=9 — ON traded the proven edge-traversal payload (the a3c multi-hop
