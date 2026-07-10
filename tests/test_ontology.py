@@ -224,7 +224,7 @@ def test_summary_schema_is_identical_in_both_ontology_modes(monkeypatch):
     # or off — an ontology-gated `based_on` was tried and MEASURED to shift
     # every ontology-on consolidation's structured output (weaker base
     # recall). DEPENDS_ON is derived post-hoc by token overlap instead.
-    monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
+    monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "0")   # explicit opt-out
     dec_off = _decision_item_schema()
     schema_off = repr(build_summary_schema_mode())
 

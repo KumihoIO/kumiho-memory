@@ -232,13 +232,24 @@ def _build_manager(**kwargs):
     )
 
 
-def test_ontology_is_opt_in_and_off_by_default(monkeypatch):
+def test_ontology_is_on_by_default_and_opt_out(monkeypatch):
+    # Flipped to opt-OUT on 2026-07-10: paired same-corpus measurements put
+    # the ontology read stack at +0.042 and the fact leg at +0.054, with the
+    # base summary byte-identical — the default should be the better system.
     monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
     monkeypatch.delenv("KUMIHO_MEMORY_ENTITY_PROMOTION", raising=False)
-    # Default: entity promotion off, and entity recall off on the graph config.
+    m = _build_manager(graph_augmentation=True)
+    assert m.entity_promotion_config is not None   # write on by default
+    assert m.graph_augmentation_config.entity_recall is True   # read on
+    assert m.graph_augmentation_config.fact_recall is True
+    assert m.ontology_enabled is True
+
+    # Explicit opt-out turns the whole ontology off.
+    monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "0")
     m = _build_manager(graph_augmentation=True)
     assert m.entity_promotion_config is None
     assert m.graph_augmentation_config.entity_recall is False
+    assert m.graph_augmentation_config.fact_recall is False
     assert m.ontology_enabled is False
 
 
@@ -252,8 +263,8 @@ def test_ontology_switch_enables_write_and_read(monkeypatch):
 
 
 def test_entity_promotion_env_forces_independently(monkeypatch):
-    monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
-    # Force ON without the ontology switch.
+    # Force ON while the ontology is opted out.
+    monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "0")
     monkeypatch.setenv("KUMIHO_MEMORY_ENTITY_PROMOTION", "1")
     assert _build_manager().entity_promotion_config is not None
     # Force OFF wins even with ontology on.
@@ -305,8 +316,8 @@ def test_fact_recall_follows_ontology_switch(monkeypatch):
     assert m.graph_augmentation_config.fact_recall is False
 
 
-def test_fact_recall_off_without_ontology(monkeypatch):
-    monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
+def test_fact_recall_off_when_ontology_opted_out(monkeypatch):
+    monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "0")
     monkeypatch.delenv("KUMIHO_MEMORY_FACT_RECALL", raising=False)
     m = _build_manager(graph_augmentation=True)
     assert m.graph_augmentation_config.fact_recall is False

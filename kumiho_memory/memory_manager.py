@@ -232,13 +232,16 @@ class UniversalMemoryManager:
             graph_augmentation = None
         self.graph_augmentation_config = graph_augmentation
 
-        # Ontology (write-time entity promotion + entity-mediated 2-hop
-        # recall) is opt-in groundwork: OFF by default so a store pays nothing
-        # to build a graph nothing reads. KUMIHO_MEMORY_ONTOLOGY=1 turns on
-        # BOTH the write (promotion) and the read (entity recall) together, so
-        # the feature only costs when it can also deliver — and its value gets
-        # gated on a measured LongMemEval delta before it's flipped on.
-        ontology_on = os.getenv("KUMIHO_MEMORY_ONTOLOGY", "0").strip() == "1"
+        # Ontology (write-time typed decomposition + structure-aware recall)
+        # is ON by default — opt OUT with KUMIHO_MEMORY_ONTOLOGY=0. The flip
+        # from opt-in was decided 2026-07-10 on paired same-corpus evidence:
+        # the ontology read stack contributes +0.042 overall and the
+        # fact-recall leg +0.054 (all five LoCoMo categories up, 23W/4L),
+        # with the write side measured byte-identical on the base summary.
+        # The switch still controls BOTH the write (decomposition) and the
+        # read (entity/fact recall) together, so the graph is only built
+        # when something reads it and vice versa.
+        ontology_on = os.getenv("KUMIHO_MEMORY_ONTOLOGY", "1").strip() != "0"
 
         # entity_promotion: the True default sentinel follows the ontology
         # switch; KUMIHO_MEMORY_ENTITY_PROMOTION=1/0 forces it on/off

@@ -66,10 +66,11 @@ class GraphAugmentationConfig:
     #: hop through its entity anchors (ABOUT) to *other* memories about the
     #: same entities — relational recall vector similarity can't reach. The
     #: anchors are waypoints only (never returned as results, since they hold
-    #: no content). Off by default: it only pays off once entity promotion
-    #: has populated the graph, and its value should be shown on a measured
-    #: LongMemEval delta before enabling. Turned on together with entity
-    #: promotion by KUMIHO_MEMORY_ONTOLOGY=1.
+    #: no content). False at the dataclass level (standalone users opt in
+    #: explicitly); the manager turns it on together with entity promotion
+    #: whenever the ontology is active — which is the DEFAULT since
+    #: 2026-07-10 (opt out with KUMIHO_MEMORY_ONTOLOGY=0), based on paired
+    #: same-corpus measurements showing the ontology read stack at +0.042.
     entity_recall: bool = False
     #: Cap on entity anchors followed per seed memory (fan-out guard).
     entity_recall_max_entities: int = 6
@@ -112,7 +113,8 @@ class GraphAugmentationConfig:
     #: remain semantically recallable, exactly the intended division. Entries
     #: are additive: they ride on top of the recall cap and the context
     #: top-K (never displacing conversation hits), mirroring the measured
-    #: bridge-evidence policy. Turned on with KUMIHO_MEMORY_ONTOLOGY=1;
+    #: bridge-evidence policy. Rides the ontology switch (default ON;
+    #: opt out with KUMIHO_MEMORY_ONTOLOGY=0);
     #: KUMIHO_MEMORY_FACT_RECALL=0 is the measurement kill-switch.
     fact_recall: bool = False
     #: Search hits examined per query (top slice of the fact search).

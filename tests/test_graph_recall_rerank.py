@@ -124,7 +124,11 @@ def test_graph_path_runs_rerank_stack_with_query_time():
     assert [m["title"] for m in out_dormant] == ["far", "near"]
 
 
-def test_graph_path_trims_merged_set_to_max_total():
+def test_graph_path_trims_merged_set_to_max_total(monkeypatch):
+    # Legacy trim contract: with the ontology opted out, no reserve slots
+    # extend the target. (Ontology-on defaults grow the target by the
+    # entity/fact reserves — covered by the reserve tests below.)
+    monkeypatch.setenv("KUMIHO_MEMORY_ONTOLOGY", "0")
     pool = [
         {"kref": f"kref://m{i}", "title": f"m{i}", "summary": "",
          "score": 0.4 + 0.1 * i}
