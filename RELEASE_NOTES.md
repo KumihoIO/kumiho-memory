@@ -1,5 +1,54 @@
 # Release Notes — kumiho-memory
 
+## v0.10.0
+
+**Release Date:** 2026-07-10
+
+The ontology release: every conversation is decomposed into a typed knowledge
+graph (entities, facts, decisions, events, actions, questions) at write time,
+and recall consumes that structure — **on by default**. Decided on paired
+same-corpus evidence: the ontology read stack contributes **+0.042 overall**
+and the typed-fact recall leg **+0.054** with all five LoCoMo categories up
+(23W/172T/4L, sign test p≈2e-4), while the base summary stays byte-identical.
+
+### Added
+
+- **Write-time ontology** (`ontology.py`, `relations.py`): schema-driven
+  decomposition of each consolidation into typed nodes in dedicated spaces
+  (`/facts`, `/decisions`, `/events`, `/entities`, `/actions`, `/questions`)
+  with deterministic edges — `DERIVED_FROM` (provenance), `ABOUT`/`INVOLVES`
+  (token-boundary mention matching, Hangul-aware), `DEPENDS_ON` (same-batch
+  token overlap ≥ 0.4), `SUPERSEDES` (belief update, overlap ≥ 0.6). Zero
+  extra LLM calls; the summarizer schema is byte-identical in both modes.
+- **Entity-bridge join** (multi-hop recall): an entity reached via `ABOUT`
+  from two or more reformulated angles is a bridge; its fact/event nodes
+  surface with a real inherited score (0.9 × the weaker angle). Hub anchors
+  (degree > 12) are deferred, not dropped.
+- **Fact-recall leg**: typed fact nodes retrieved as first-class semantic
+  candidates with the original query, scored relative to the weakest base
+  hit (axis-invariant) and composed additively — they can never displace or
+  outrank conversation evidence.
+- Additive-slot discipline end to end: recall cap, manager trim, and context
+  composition all reserve on-top budgets for structural evidence
+  (`fact_budget` passthrough in `compose_context`).
+
+### Changed
+
+- **BREAKING (behavioral): the ontology is now opt-OUT.**
+  `KUMIHO_MEMORY_ONTOLOGY` defaults to on; set `0` for the legacy pipeline
+  (byte-identical output, asserted by tests). Scripts that relied on
+  "unset means off" must now export `KUMIHO_MEMORY_ONTOLOGY=0`.
+  `KUMIHO_MEMORY_ENTITY_PROMOTION` / `KUMIHO_MEMORY_FACT_RECALL` still force
+  their components independently.
+
+### Requires
+
+- kumiho-server with the derived-kind search hygiene chain (fulltext
+  exclusion + kind-filtered vector pool widening + in-arm fusion filter,
+  server PR#35). Older servers work but leave typed-node pollution in the
+  lexical index and starve the vector leg on large ontology corpora.
+
+
 ## v0.9.0
 
 **Release Date:** 2026-07-08
