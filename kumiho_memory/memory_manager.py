@@ -2224,7 +2224,13 @@ class UniversalMemoryManager:
         ]
         angle_tokens = [t for t in angle_tokens if t]
         for sib in siblings:
-            text = f"{sib.get('title', '')} {sib.get('summary', '')}"
+            # Facts parity with the embedding/LLM rankers: a revision whose
+            # title/summary is off-topic but whose extracted facts hold the
+            # answer must rank on its facts here too.
+            facts = sib.get("facts", "")
+            if isinstance(facts, list):
+                facts = "; ".join(str(x) for x in facts)
+            text = f"{sib.get('title', '')} {sib.get('summary', '')} {facts}"
             sib["_score"] = max(
                 (_token_overlap_score(t, text) for t in angle_tokens),
                 default=0.0,
