@@ -31,6 +31,9 @@ and the typed-fact recall leg **+0.054** with all five LoCoMo categories up
 - Additive-slot discipline end to end: recall cap, manager trim, and context
   composition all reserve on-top budgets for structural evidence
   (`fact_budget` passthrough in `compose_context`).
+- `KUMIHO_MEMORY_REFORMULATE_DRAWS` env knob for multi-draw query
+  reformulation (default 1; higher values were measured to dilute recall on
+  LoCoMo-Plus — leave at 1 unless you have paired evidence for your corpus).
 
 ### Changed
 
