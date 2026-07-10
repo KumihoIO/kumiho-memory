@@ -134,6 +134,15 @@ class GraphAugmentationConfig:
     fact_recall_score_factor: float = 0.9
     max_total: Optional[int] = None  # Defaults to base_limit * 3
     reformulate_queries: bool = True
+    #: Number of independent angle-generation draws per recall. Oblique
+    #: triggers make single-draw reformulation a per-run coin flip (three
+    #: identical LoCoMo-Plus runs: 21/24/23 of 30; union of draws: 27/30) —
+    #: extra draws harvest the union for one small-model call each.
+    #: KUMIHO_MEMORY_REFORMULATE_DRAWS overrides via the manager wiring.
+    reformulate_draws: int = 1
+    #: Cap on total distinct angles kept across draws (each angle costs one
+    #: recall RPC, so this bounds latency).
+    reformulate_max_angles: int = 3
     traversal_timeout: int = 30  # seconds; daemon thread timeout for gRPC edge traversal
     edge_creation_timeout: int = 60  # seconds; daemon thread timeout for edge creation
 
@@ -688,7 +697,16 @@ class GraphAugmentedRecall:
     # ------------------------------------------------------------------
 
     async def _reformulate_query(self, query: str) -> List[str]:
-        """Generate 2-3 alternative search queries via the LLM adapter."""
+        """Generate alternative search queries via the LLM adapter.
+
+        With ``reformulate_draws`` > 1 the generation runs multiple times and
+        the union of angles (deduped, capped at ``reformulate_max_angles``)
+        is used. Measured motive (LoCoMo-Plus, 2026-07-10): for obliquely
+        phrased triggers, single-draw angle generation is a per-run coin
+        flip — three identical runs oscillated 21/24/23 of 30, while the
+        UNION of their draws passed 27/30. Multi-draw harvests that union
+        inside one run at the cost of one extra small-model call per draw.
+        """
         system = (
             "You generate alternative memory search queries. "
             "Given a conversational message, produce 2-3 short search queries "
@@ -699,27 +717,38 @@ class GraphAugmentedRecall:
             "- Related situations or consequences\n"
             "Return ONLY the queries, one per line, no numbering or bullets."
         )
-        try:
-            raw = await self.adapter.chat(
-                messages=[{"role": "user", "content": query}],
-                model=self.model,
-                system=system,
-                max_tokens=100,
-            )
-            self._report_llm_usage("recall_reformulation")
-            queries = [
-                line.strip().lstrip("0123456789.-) ")
-                for line in raw.splitlines()
-                if line.strip()
-            ]
-            logger.info(
-                "Multi-query reformulation: %d queries from trigger",
-                len(queries),
-            )
-            return queries[:3]
-        except Exception as e:
-            logger.warning("Query reformulation failed: %s", e)
-            return []
+        draws = max(1, int(getattr(self.config, "reformulate_draws", 1)))
+        max_angles = int(getattr(self.config, "reformulate_max_angles", 3))
+        seen: set = set()
+        queries: List[str] = []
+        for _draw in range(draws):
+            try:
+                raw = await self.adapter.chat(
+                    messages=[{"role": "user", "content": query}],
+                    model=self.model,
+                    system=system,
+                    max_tokens=100,
+                )
+                self._report_llm_usage("recall_reformulation")
+            except Exception as e:
+                logger.warning("Query reformulation failed: %s", e)
+                continue
+            for line in raw.splitlines():
+                q = line.strip().lstrip("0123456789.-) ")
+                if not q:
+                    continue
+                key = " ".join(q.lower().split())
+                if key in seen:
+                    continue
+                seen.add(key)
+                queries.append(q)
+            if len(queries) >= max_angles:
+                break
+        logger.info(
+            "Multi-query reformulation: %d queries from trigger (%d draw%s)",
+            min(len(queries), max_angles), draws, "s" if draws > 1 else "",
+        )
+        return queries[:max_angles]
 
     async def _generate_implication_queries(
         self,

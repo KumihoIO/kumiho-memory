@@ -268,6 +268,17 @@ class UniversalMemoryManager:
             if os.getenv("KUMIHO_MEMORY_FACT_RECALL", "").strip() != "0":
                 self.graph_augmentation_config.fact_recall = True
 
+        # Multi-draw reformulation override (angle-union harvesting for
+        # oblique triggers). Applies whenever graph augmentation is active.
+        draws_env = os.getenv("KUMIHO_MEMORY_REFORMULATE_DRAWS", "").strip()
+        if draws_env.isdigit() and self.graph_augmentation_config is not None:
+            draws = max(1, int(draws_env))
+            self.graph_augmentation_config.reformulate_draws = draws
+            self.graph_augmentation_config.reformulate_max_angles = max(
+                self.graph_augmentation_config.reformulate_max_angles,
+                2 * draws + 1,
+            )
+
         # When ontology is on, consolidation decomposes the whole conversation
         # into a typed graph (entities + facts + decisions + events + ...),
         # which subsumes plain entity promotion.
@@ -1995,6 +2006,13 @@ class UniversalMemoryManager:
             # profile-style retrieval that direct single-hop / temporal
             # questions need.
             f = sib.get("facts", "")
+            imp = sib.get("implications", "")
+            if isinstance(imp, list):
+                imp = "; ".join(str(x) for x in imp)
+            if imp:
+                # Prospective-indexing parity: implications are the write-time
+                # answers to oblique future triggers — score on them too.
+                f = f"{f}; {imp}" if f else imp
             if isinstance(f, (list, tuple)):
                 f = "; ".join(
                     x.get("claim", str(x)) if isinstance(x, dict) else str(x)
@@ -2230,7 +2248,10 @@ class UniversalMemoryManager:
             facts = sib.get("facts", "")
             if isinstance(facts, list):
                 facts = "; ".join(str(x) for x in facts)
-            text = f"{sib.get('title', '')} {sib.get('summary', '')} {facts}"
+            imp = sib.get("implications", "")
+            if isinstance(imp, list):
+                imp = "; ".join(str(x) for x in imp)
+            text = f"{sib.get('title', '')} {sib.get('summary', '')} {facts} {imp}"
             sib["_score"] = max(
                 (_token_overlap_score(t, text) for t in angle_tokens),
                 default=0.0,

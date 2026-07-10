@@ -166,17 +166,27 @@ def compose_context(
     # bridge facts displacing base hits cost open-domain −0.107). Without
     # bridges this is the exact historical head-slice.
     effective_top_k = DEFAULT_CONTEXT_TOP_K if top_k is None else top_k
-    if effective_top_k > 0 and len(all_revisions) > effective_top_k:
-        bridge_revs = [r for r in all_revisions if r.get("bridge")][:2]
-        # Fact-recall evidence is additive on the same terms as bridges (its
-        # own budget, ``fact_budget`` = the caller's fact_recall_max_results):
-        # an answer-shaped claim augments the context, it must never evict
-        # the conversations that ground it.
-        fact_revs = [r for r in all_revisions
-                     if r.get("fact_recall") and not r.get("bridge")][:fact_budget]
-        regular_revs = [r for r in all_revisions
-                        if not r.get("bridge") and not r.get("fact_recall")]
-        all_revisions = regular_revs[:effective_top_k] + bridge_revs + fact_revs
+    # Additive partition runs UNCONDITIONALLY: conversations own the head of
+    # the context; bridge and fact evidence is appended after, never
+    # interleaved. This used to run only when the top-K cut fired — with
+    # top_k=0 (unlimited) the global score sort let bridge/fact one-liners
+    # outrank whole conversations and push the grounding session out of the
+    # answering model's attention (measured: LoCoMo-Plus 500-char contexts
+    # led by typed one-liners while the answer's session block trailed).
+    bridge_revs = [r for r in all_revisions if r.get("bridge")]
+    # Fact-recall evidence is additive on the same terms as bridges (its
+    # own budget, ``fact_budget`` = the caller's fact_recall_max_results):
+    # an answer-shaped claim augments the context, it must never evict
+    # the conversations that ground it.
+    fact_revs = [r for r in all_revisions
+                 if r.get("fact_recall") and not r.get("bridge")]
+    regular_revs = [r for r in all_revisions
+                    if not r.get("bridge") and not r.get("fact_recall")]
+    if effective_top_k > 0:
+        regular_revs = regular_revs[:effective_top_k]
+        bridge_revs = bridge_revs[:2]
+        fact_revs = fact_revs[:fact_budget]
+    all_revisions = regular_revs + bridge_revs + fact_revs
 
     # --- Build text from surviving revisions ---
     texts: List[str] = []
