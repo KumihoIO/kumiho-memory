@@ -24,10 +24,14 @@ Order of operations in :func:`rerank`:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 import math
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -403,6 +407,83 @@ def rerank(
 
 
 # ---------------------------------------------------------------------------
+# Async offload — keep cross-encoder inference off the event loop
+# ---------------------------------------------------------------------------
+
+#: Dedicated single-worker executor for cross-encoder reranks.  ONE worker on
+#: purpose: inferences stay serialized exactly as they were when :func:`rerank`
+#: ran inline (identical results, identical CPU profile, no ONNX thread
+#: oversubscription) — the only change is that the event loop is free while a
+#: rerank runs, so concurrent recalls can overlap their network I/O (measured
+#: 2026-07-10: inline CE collapsed a concurrency-4 harness to ~1 effective).
+_RERANK_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_RERANK_EXECUTOR_LOCK = threading.Lock()
+
+
+def _rerank_executor() -> ThreadPoolExecutor:
+    global _RERANK_EXECUTOR
+    with _RERANK_EXECUTOR_LOCK:
+        if _RERANK_EXECUTOR is None:
+            _RERANK_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="kumiho-rerank",
+            )
+        return _RERANK_EXECUTOR
+
+
+async def rerank_async(
+    query: str,
+    memories: List[Dict[str, Any]],
+    *,
+    evidence_config: Optional[EvidenceRankConfig] = None,
+    config: Optional[RerankConfig] = None,
+    reranker: Optional[Reranker] = None,
+    limit: Optional[int] = None,
+    now: Optional[datetime] = None,
+    query_time: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """:func:`rerank`, offloaded to a worker thread when it would block.
+
+    The fastembed cross-encoder stage is CPU-bound model inference; called
+    inline from async recall code it blocks the event loop and serializes
+    every concurrent recall.  This wrapper runs the *unchanged* sync
+    :func:`rerank` on a dedicated single-worker executor when the reranker is
+    tagged offload-safe (``_kumiho_offload_safe``, set by
+    :func:`try_fastembed_reranker`), and inline otherwise.  Inline covers two
+    deliberate cases: (a) the cross-encoder is dormant — the deterministic
+    priors are microseconds and a thread hop would only add latency; (b) the
+    reranker is the LLM backend or a user callable — the LLM reranker drives
+    the manager's shared async client, and driving that client from a second
+    event loop on the worker thread corrupts httpx's loop-bound connection
+    pool, so it keeps its pre-0.10.1 inline behavior.  Results are
+    byte-identical to the sync call, including the in-place mutation of
+    ``memories``.
+    """
+    cfg = config or RerankConfig()
+    call = functools.partial(
+        rerank,
+        query,
+        memories,
+        evidence_config=evidence_config,
+        config=cfg,
+        reranker=reranker,
+        limit=limit,
+        now=now,
+        query_time=query_time,
+    )
+    offload = (
+        cfg.cross_encoder_enabled
+        and reranker is not None
+        and bool(memories)
+        and getattr(reranker, "_kumiho_offload_safe", False)
+    )
+    if not offload:
+        return call()
+    return await asyncio.get_running_loop().run_in_executor(
+        _rerank_executor(), call,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Two-pass focused rerank — re-score with embeddings over title+summary only
 # ---------------------------------------------------------------------------
 
@@ -541,6 +622,13 @@ def try_fastembed_reranker(
     def _rerank(query: str, texts: Sequence[str]) -> Sequence[float]:
         return list(encoder.rerank(query, list(texts)))
 
+    # Pure CPU-bound ONNX inference with no event-loop entanglement — safe for
+    # rerank_async to move onto its worker thread.  Rerankers WITHOUT this tag
+    # (the LLM reranker, arbitrary user callables) stay inline: the LLM
+    # reranker drives the manager's shared async client, and running that from
+    # a second event loop on the worker thread corrupts httpx's loop-bound
+    # connection pool.
+    _rerank._kumiho_offload_safe = True  # type: ignore[attr-defined]
     return _rerank
 
 

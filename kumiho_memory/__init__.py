@@ -1,6 +1,6 @@
 """Kumiho Memory - Universal memory provider for AI agents."""
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 from kumiho_memory.redis_memory import RedisMemoryBuffer, _token_override_var as redis_token_override_var
 from kumiho_memory.memory_manager import (
@@ -59,6 +59,7 @@ from kumiho_memory.context_compose import (
 from kumiho_memory.recall_rerank import (
     RerankConfig,
     rerank,
+    rerank_async,
     two_pass_rerank,
 )
 
@@ -105,6 +106,7 @@ __all__ = [
     "compose_context",
     "RerankConfig",
     "rerank",
+    "rerank_async",
     "two_pass_rerank",
     "SPACE_CLASSES",
     "SpaceProfile",

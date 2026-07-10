@@ -1,5 +1,38 @@
 # Release Notes — kumiho-memory
 
+## v0.10.1
+
+**Release Date:** 2026-07-10
+
+### Fixed
+
+- **The fastembed cross-encoder rerank no longer blocks the event loop.** The
+  opt-in cross-encoder stage (`KUMIHO_RERANK_CROSS_ENCODER=1`) is CPU-bound
+  ONNX inference; invoked inline from the async recall paths it froze the loop
+  and serialized every concurrent recall (measured on the 2026-07-10
+  full-LoCoMo run: a concurrency-4 harness degraded to ~1 effective). Recall
+  paths now await the new `rerank_async`, which runs the unchanged sync
+  `rerank` on a dedicated single-worker executor — inference stays serialized
+  (identical results and CPU profile), but concurrent recalls overlap the rest
+  of their pipeline again. `rerank` itself is untouched and remains the sync
+  API.
+
+### Added
+
+- `rerank_async` — public async wrapper around `rerank`. Offloads to the
+  worker thread only for rerankers tagged `_kumiho_offload_safe` (set by
+  `try_fastembed_reranker`); everything else runs inline: dormant configs
+  (the deterministic priors are microseconds — no thread-hop overhead) and
+  the LLM reranker / user callables (`KUMIHO_RERANK_LLM=1` drives the
+  manager's shared async client, which must not be driven from a second
+  event loop — it keeps its pre-0.10.1 inline behavior).
+
+### Known limitations
+
+- Sibling embedding filtering (`_filter_siblings_by_embedding`) still calls a
+  blocking `embed()` on the event loop when an embedding adapter is
+  configured — pre-existing, tracked as the next offload candidate.
+
 ## v0.10.0
 
 **Release Date:** 2026-07-10

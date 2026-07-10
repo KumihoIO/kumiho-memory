@@ -1054,3 +1054,40 @@ def test_fact_recall_unscoped_keeps_top_slice_semantics(monkeypatch):
     assert found == 2                                  # max_results, from top-3
     entries = [m["kref"] for m in augmented if m.get("fact_recall")]
     assert entries == [revs[0].kref.uri, revs[1].kref.uri]
+
+
+# ---------------------------------------------------------------------------
+# v0.10.1 regression guard — async recall paths must route through rerank_async
+# ---------------------------------------------------------------------------
+
+
+def test_async_recall_paths_route_through_rerank_async(monkeypatch):
+    # Both async recall paths must await rerank_async: a silent revert to the
+    # sync rerank() call would reintroduce the event-loop-blocking bug with a
+    # fully green suite, because results are byte-identical by design.  The
+    # call sites import rerank_async lazily inside the function body, so
+    # patching the module attribute is visible at call time.
+    import kumiho_memory.recall_rerank as rr
+
+    calls = []
+    real = rr.rerank_async
+
+    async def recording(*a, **kw):
+        calls.append(1)
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(rr, "rerank_async", recording)
+
+    pool = [{"title": "a", "summary": "", "score": 0.5}]
+    mgr, _ = _make_manager_with_retrieve(pool)
+
+    async def _identity(mems, q):
+        return mems
+
+    monkeypatch.setattr(mgr, "_enrich_with_siblings", _identity)
+
+    asyncio.run(mgr._graph_base_recall("q", limit=2))
+    assert len(calls) == 1  # per-sub-query path
+
+    asyncio.run(mgr._base_recall("q", limit=2))
+    assert len(calls) == 2  # plain path

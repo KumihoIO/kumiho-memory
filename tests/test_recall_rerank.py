@@ -378,3 +378,131 @@ def test_resolve_reranker_cross_encoder_wins_over_llm(monkeypatch):
         env={"KUMIHO_RERANK_CROSS_ENCODER": "1", "KUMIHO_RERANK_LLM": "1"},
     )
     assert out is sentinel  # cross-encoder preferred when both set
+
+
+# ---------------- rerank_async (event-loop offload) ----------------
+
+
+def _ce_memories():
+    return [
+        _mem(title="a", summary="alpha", score=0.2),
+        _mem(title="b", summary="bravo", score=0.9),
+        _mem(title="c", summary="charlie", score=0.5),
+    ]
+
+
+def test_rerank_async_matches_sync_with_cross_encoder():
+    import asyncio
+    import copy
+
+    from kumiho_memory.recall_rerank import rerank_async
+
+    reranker = lambda q, texts: [float(len(t)) for t in texts]
+    reranker._kumiho_offload_safe = True  # exercise the executor path
+    cfg = RerankConfig(cross_encoder_enabled=True, recency_enabled=False)
+
+    sync_in = _ce_memories()
+    async_in = copy.deepcopy(sync_in)
+    sync_out = rerank("q", sync_in, config=cfg, reranker=reranker, now=NOW)
+    async_out = asyncio.run(
+        rerank_async("q", async_in, config=cfg, reranker=reranker, now=NOW)
+    )
+    assert async_out == sync_out
+    assert async_out is async_in  # in-place semantics preserved through the thread
+
+
+def test_rerank_async_inline_when_cross_encoder_dormant():
+    import asyncio
+    import copy
+
+    import kumiho_memory.recall_rerank as rr
+
+    sync_in = _ce_memories()
+    async_in = copy.deepcopy(sync_in)
+    cfg = RerankConfig(recency_enabled=False)  # cross_encoder_enabled=False
+    sync_out = rerank("q", sync_in, config=cfg, now=NOW)
+    async_out = asyncio.run(rerank_async_call(rr, "q", async_in, cfg))
+    assert async_out == sync_out
+
+
+async def rerank_async_call(rr, query, memories, cfg):
+    return await rr.rerank_async(query, memories, config=cfg, now=NOW)
+
+
+def test_rerank_async_does_not_block_event_loop():
+    import asyncio
+    import time
+
+    from kumiho_memory.recall_rerank import rerank_async
+
+    def slow_reranker(q, texts):
+        time.sleep(0.3)  # simulates CPU-bound cross-encoder inference
+        return [1.0] * len(texts)
+
+    slow_reranker._kumiho_offload_safe = True
+
+    cfg = RerankConfig(cross_encoder_enabled=True, recency_enabled=False)
+
+    async def scenario():
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        t = asyncio.ensure_future(ticker())
+        try:
+            await rerank_async(
+                "q", _ce_memories(), config=cfg, reranker=slow_reranker, now=NOW,
+            )
+        finally:
+            t.cancel()
+        return ticks
+
+    # Inline execution would freeze the loop for the full 0.3s (ticks == 0);
+    # the executor offload must leave it running.
+    assert asyncio.run(scenario()) >= 3
+
+
+def test_rerank_async_thread_routing_by_offload_tag(monkeypatch):
+    # The executor hop must happen EXACTLY when the reranker is tagged
+    # offload-safe: dormant configs and untagged rerankers (the LLM backend,
+    # user callables — they may drive loop-bound clients) stay on the caller's
+    # thread; the tagged fastembed cross-encoder moves off it.
+    import asyncio
+    import threading
+
+    import kumiho_memory.recall_rerank as rr
+
+    seen = {}
+    real_rerank = rr.rerank
+
+    def recording_rerank(*a, **kw):
+        seen["thread"] = threading.get_ident()
+        return real_rerank(*a, **kw)
+
+    monkeypatch.setattr(rr, "rerank", recording_rerank)
+    caller = threading.get_ident()
+
+    ce = lambda q, texts: [1.0] * len(texts)
+    dormant = RerankConfig(recency_enabled=False)
+    enabled = RerankConfig(cross_encoder_enabled=True, recency_enabled=False)
+
+    # (a) dormant cross-encoder -> inline, no thread hop
+    asyncio.run(rr.rerank_async("q", _ce_memories(), config=dormant, now=NOW))
+    assert seen["thread"] == caller
+
+    # (b) enabled but untagged reranker (LLM-like) -> still inline
+    asyncio.run(
+        rr.rerank_async("q", _ce_memories(), config=enabled, reranker=ce, now=NOW)
+    )
+    assert seen["thread"] == caller
+
+    # (c) enabled + tagged -> offloaded to the worker thread
+    ce._kumiho_offload_safe = True
+    asyncio.run(
+        rr.rerank_async("q", _ce_memories(), config=enabled, reranker=ce, now=NOW)
+    )
+    assert seen["thread"] != caller

@@ -1501,8 +1501,11 @@ class UniversalMemoryManager:
         )
         if not memories:
             return memories
-        from kumiho_memory.recall_rerank import rerank
-        memories = rerank(
+        # rerank_async: the cross-encoder stage is CPU-bound inference —
+        # awaited off-loop so concurrent sub-query recalls keep overlapping
+        # their network I/O instead of serializing behind it.
+        from kumiho_memory.recall_rerank import rerank_async
+        memories = await rerank_async(
             query,
             memories,
             evidence_config=self.evidence_rank_config,
@@ -1672,9 +1675,10 @@ class UniversalMemoryManager:
         # Post-recall rerank on the plain path: cross-encoder (optional) +
         # evidence prior + recency prior + MMR diversity, applied once.  The
         # graph path applies its own evidence weighting inside
-        # GraphAugmentedRecall (before its caps) — never both.
-        from kumiho_memory.recall_rerank import rerank
-        memories = rerank(
+        # GraphAugmentedRecall (before its caps) — never both.  Awaited via
+        # rerank_async so the CPU-bound cross-encoder never blocks the loop.
+        from kumiho_memory.recall_rerank import rerank_async
+        memories = await rerank_async(
             query,
             memories,
             evidence_config=self.evidence_rank_config,
