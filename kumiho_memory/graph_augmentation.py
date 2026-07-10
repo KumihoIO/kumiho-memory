@@ -119,6 +119,11 @@ class GraphAugmentationConfig:
     fact_recall: bool = False
     #: Search hits examined per query (top slice of the fact search).
     fact_recall_limit: int = 3
+    #: Deeper scan window for space-scoped calls: the shared facts space
+    #: mixes every source space's facts, so provenance filtering needs to
+    #: look past the top slice to find in-scope candidates (still admits at
+    #: most ``fact_recall_limit`` accepted facts).
+    fact_recall_scan_limit: int = 24
     #: Entries appended per recall — also the on-top budget mirrored by the
     #: manager trim and the context composer.
     fact_recall_max_results: int = 2
@@ -1124,11 +1129,44 @@ class GraphAugmentedRecall:
         fact_score = round(floor * self.config.fact_recall_score_factor, 6)
         max_results = self.config.fact_recall_max_results
         limit = self.config.fact_recall_limit
+        # Provenance scope: the project's facts space is SHARED across every
+        # source space (multi-user projects, multi-corpus benchmarks — a
+        # LoCoMo-Plus project measured 2,511 mixed facts), so a space-scoped
+        # call must only accept facts whose DERIVED_FROM source conversation
+        # lives inside the caller's space_paths. Without this, the top-slice
+        # is diluted by other spaces' facts: both misses in the 2026-07-10
+        # Plus regression check had their exact answer stored as a fact that
+        # cross-space crowding kept out of the slice.
+        space_prefixes = tuple(
+            "kref://" + sp.strip().lstrip("/").rstrip("/") + "/"
+            for sp in (space_paths or []) if sp and sp.strip("/")
+        )
+        scan_limit = limit if not space_prefixes else max(
+            limit, self.config.fact_recall_scan_limit,
+        )
         # Snapshot for the worker thread: it must not read or mutate the
         # shared set — a timed-out search would otherwise keep claiming
         # krefs that never get emitted (poisoning the 2-hop walk after us).
         known = set(seen_krefs)
         results: List[Dict[str, Any]] = []
+
+        def _from_caller_space(rev) -> bool:
+            """True when the fact's source conversation is inside the scope."""
+            if not space_prefixes:
+                return True
+            try:
+                for edge in rev.get_edges(direction=kumiho.BOTH):
+                    if edge.edge_type != "DERIVED_FROM":
+                        continue
+                    src = getattr(getattr(edge, "source_kref", None), "uri", "")
+                    if src != getattr(getattr(rev, "kref", None), "uri", ""):
+                        continue  # only the fact's own outgoing provenance
+                    target = getattr(getattr(edge, "target_kref", None), "uri", "")
+                    if target.startswith(space_prefixes):
+                        return True
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("fact provenance check failed: %s", exc)
+            return False
 
         def _sync_search() -> int:
             try:
@@ -1142,8 +1180,14 @@ class GraphAugmentedRecall:
                 logger.debug("fact recall search failed: %s", exc)
                 return 0
             found = 0
-            for r in (hits or [])[:limit]:
+            accepted_in_slice = 0
+            for r in (hits or [])[:scan_limit]:
                 if found >= max_results:
+                    break
+                # Keep the historical semantics for unscoped calls: only the
+                # top ``limit`` hits compete. Scoped calls scan deeper, but
+                # still admit at most ``limit`` provenance-accepted facts.
+                if accepted_in_slice >= limit:
                     break
                 item = getattr(r, "item", None)
                 if item is None:
@@ -1154,6 +1198,9 @@ class GraphAugmentedRecall:
                     continue
                 if rev is None:
                     continue
+                if not _from_caller_space(rev):
+                    continue
+                accepted_in_slice += 1
                 kref = getattr(getattr(rev, "kref", None), "uri", "") or ""
                 if not kref or kref in known:
                     continue

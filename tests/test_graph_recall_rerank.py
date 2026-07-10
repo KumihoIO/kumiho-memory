@@ -950,7 +950,9 @@ def test_fact_recall_space_scoped_call_stays_in_project(monkeypatch):
     graph = {b: _FakeRev(b, {"title": f"B{i}", "summary": "base"}, [])
              for i, b in enumerate(base_krefs)}
     F = "kref://p/facts/f0.fact?r=1"
-    frev = _FakeRev(F, {"title": "F0", "summary": "claim"}, [])
+    SRC = "kref://p/team-shared/mem.conversation?r=1"
+    frev = _FakeRev(F, {"title": "F0", "summary": "claim"},
+                    [_FakeEdge(F, SRC, "DERIVED_FROM")])
     calls = []
     _install_fact_search(monkeypatch, graph, [(frev, 2.0)], calls)
 
@@ -1005,3 +1007,50 @@ def test_fact_score_trails_weakest_base_hit(monkeypatch):
     assert len(fact_entries) == 2
     assert all(abs(m["score"] - 0.4 * 0.9) < 1e-6 for m in fact_entries)
     assert [m["kref"] for m in fact_entries] == [r.kref.uri for r in revs]
+
+
+def test_fact_recall_provenance_filter_rejects_cross_space_facts(monkeypatch):
+    # The project facts space is SHARED across source spaces; a space-scoped
+    # call must only admit facts whose DERIVED_FROM source conversation lives
+    # inside the caller's scope — and must scan past the top slice to find
+    # them (2026-07-10 Plus autopsy: both recall misses had their answer
+    # stored as a fact that cross-space crowding kept out of the top-3).
+    ALIEN_SRC = "kref://p/other-user/mem.conversation?r=1"
+    MY_SRC = "kref://p/team-shared/mem.conversation?r=1"
+    aliens = []
+    for i in range(5):                                # top slice all alien
+        k = f"kref://p/facts/alien{i}.fact?r=1"
+        aliens.append(_FakeRev(k, {"title": f"A{i}", "summary": f"alien {i}"},
+                               [_FakeEdge(k, ALIEN_SRC, "DERIVED_FROM")]))
+    MINE = "kref://p/facts/mine.fact?r=1"
+    mine = _FakeRev(MINE, {"title": "Mine", "summary": "my claim"},
+                    [_FakeEdge(MINE, MY_SRC, "DERIVED_FROM")])
+    hits = [(a, 3.0 - i * 0.1) for i, a in enumerate(aliens)] + [(mine, 1.0)]
+    _install_fact_search(monkeypatch, {}, hits)
+
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(fact_recall=True))
+    M1 = "kref://p/team-shared/m1.conversation?r=1"
+    augmented = [{"kref": M1, "title": "M1", "score": 0.9}]
+    found = asyncio.run(gr._fact_recall_leg(
+        "q", {M1}, augmented, space_paths=["p/team-shared"],
+    ))
+    assert found == 1
+    entries = [m for m in augmented if m.get("fact_recall")]
+    assert [m["kref"] for m in entries] == [MINE]     # aliens all rejected
+
+
+def test_fact_recall_unscoped_keeps_top_slice_semantics(monkeypatch):
+    # Without space_paths there is no provenance filter and only the top
+    # ``fact_recall_limit`` hits compete — the historical behavior.
+    revs = []
+    for i in range(5):
+        k = f"kref://p/facts/f{i}.fact?r=1"
+        revs.append(_FakeRev(k, {"title": f"F{i}", "summary": f"c{i}"}, []))
+    _install_fact_search(monkeypatch, {}, [(r, 2.0) for r in revs])
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(fact_recall=True))
+    M1 = "kref://p/notes/m1.conversation?r=1"
+    augmented = [{"kref": M1, "title": "M1", "score": 0.9}]
+    found = asyncio.run(gr._fact_recall_leg("q", {M1}, augmented))
+    assert found == 2                                  # max_results, from top-3
+    entries = [m["kref"] for m in augmented if m.get("fact_recall")]
+    assert entries == [revs[0].kref.uri, revs[1].kref.uri]
