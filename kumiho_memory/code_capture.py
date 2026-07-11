@@ -292,9 +292,19 @@ _SYSTEM_PROMPT = (
     "A decision is NOT a restatement of what changed (git already knows), a "
     "mechanical rename, or the mere existence of a bug. Zero decisions is a "
     "valid answer — never invent one. Emit 0-3 decisions per commit. "
+    "When one commit makes SEVERAL distinct choices (e.g. a mechanism AND a "
+    "guard/limit on it AND a scope restriction), emit each as its own "
+    "decision — do not collapse them into one shallow summary. "
+    "Each decision's title and decision text must name the concrete choice "
+    "(e.g. 'single-worker executor', not 'asynchronous processing'). "
+    "anchors.file MUST come from the commit's changed-file list; mark "
+    "role='primary' on the file where the decided behavior is DEFINED "
+    "(the mechanism's home), 'touched' for call sites and tests. "
     "evidence.text MUST be quoted verbatim from the commit message or code "
-    "comments in the diff. anchors.file MUST come from the commit's changed-"
-    "file list. Write everything in English."
+    "comments in the diff, and MUST carry the WHY — prefer sentences with "
+    "measurements, review findings, incidents, or 'because...' reasoning "
+    "over sentences that merely restate the new behavior. "
+    "Write everything in English."
 )
 
 
