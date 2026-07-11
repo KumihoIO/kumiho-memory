@@ -1922,6 +1922,45 @@ class UniversalMemoryManager:
 
         return two_pass_rerank(query, memories, self.embedding_adapter)
 
+    async def code_why(
+        self,
+        question: Optional[str] = None,
+        *,
+        file: Optional[str] = None,
+        line: Optional[int] = None,
+        commit: Optional[str] = None,
+        repo: Optional[str] = None,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        """Ask why code is the way it is (Decision Memory, opt-in).
+
+        Thin delegation into the code-decision domain — everything is lazy
+        and gated behind ``KUMIHO_MEMORY_CODE=1`` so the conversation paths
+        carry zero new imports or behavior when the domain is off.  Code
+        decisions live in a dedicated ``{project}-code`` kumiho project
+        (physical isolation from conversation recall); see
+        ``docs/DECISION_MEMORY_DESIGN.md``.
+        """
+        from kumiho_memory.code_decisions import (
+            code_memory_enabled, config_from_env, resolve_project_name,
+        )
+
+        if not code_memory_enabled():
+            return {
+                "decisions": [], "context": "",
+                "error": "code memory is disabled (set KUMIHO_MEMORY_CODE=1)",
+            }
+        from kumiho_memory.code_query import why
+
+        cfg = config_from_env()
+        return await why(
+            question,
+            file=file, line=line, commit=commit, repo=repo, limit=limit,
+            project_name=resolve_project_name(self.project, cfg),
+            config=cfg,
+            reranker=self.reranker,
+        )
+
     async def _fetch_revision_metadata(
         self, kref: str, load_artifacts: bool = True,
     ) -> Dict[str, Any]:

@@ -1322,3 +1322,78 @@ MEMORY_TOOL_HANDLERS: Dict[str, Any] = {
     "kumiho_memory_dream_state": tool_memory_dream_state,
     "kumiho_memory_space_profile": tool_memory_space_profile,
 }
+
+
+# ---------------------------------------------------------------------------
+# Code Decision Memory (opt-in: KUMIHO_MEMORY_CODE=1)
+# ---------------------------------------------------------------------------
+# Registered only when the gate is on — with the gate off this module is
+# byte-identical in behavior to the pre-code-domain version (the conversation
+# domain's release safety pin; see docs/DECISION_MEMORY_DESIGN.md §5.5).
+
+
+def tool_code_why(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Recall captured code decisions ("why is this code the way it is?")."""
+    manager = _get_manager()
+    return asyncio.run(
+        manager.code_why(
+            args.get("question"),
+            file=args.get("file"),
+            line=args.get("line"),
+            commit=args.get("commit"),
+            repo=args.get("repo"),
+            limit=args.get("limit", 5),
+        )
+    )
+
+
+_CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
+    {
+        "name": "kumiho_code_why",
+        "description": (
+            "Ask why code is the way it is — recall captured decisions "
+            "anchored to a file/line/commit, with their rationale and "
+            "evidence chain (measurements, review findings). Provide a "
+            "question, a repo-relative file path, or both."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "Natural-language why-question.",
+                },
+                "file": {
+                    "type": "string",
+                    "description": "Repo-relative path (forward slashes).",
+                },
+                "line": {
+                    "type": "integer",
+                    "description": "Line number inside `file` (boosts, never filters).",
+                },
+                "commit": {
+                    "type": "string",
+                    "description": "Commit hash prefix to boost.",
+                },
+                "repo": {
+                    "type": "string",
+                    "description": "Repo identifier; defaults to the configured repo.",
+                },
+                "limit": {"type": "integer", "default": 5},
+            },
+            "anyOf": [{"required": ["file"]}, {"required": ["question"]}],
+        },
+    },
+]
+
+
+def _register_code_memory_tools() -> None:
+    from kumiho_memory.code_decisions import code_memory_enabled
+
+    if not code_memory_enabled():
+        return
+    MEMORY_TOOLS.extend(_CODE_MEMORY_TOOLS)
+    MEMORY_TOOL_HANDLERS["kumiho_code_why"] = tool_code_why
+
+
+_register_code_memory_tools()
