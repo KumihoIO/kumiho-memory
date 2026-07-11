@@ -548,3 +548,28 @@ def test_compose_commit_answers_unchanged_by_session_fields():
     text = compose_why_context([d])
     assert "origin: session" not in text
     assert "discussed in:" not in text
+
+
+def test_supersedes_survives_edge_cap_after_session_enrichment(monkeypatch):
+    """Session enrichment can grow a decision past MAX_EDGES_PER_DECISION
+    MOTIVATED_BY edges.  The SUPERSEDES edge must still reach superseded_by —
+    the priority sort has to run BEFORE the cap, not after (hard req 5)."""
+    from kumiho_memory.code_query import _sync_expand_chain, MAX_EDGES_PER_DECISION
+
+    me = _Rev("kref://c/d/old", {"title": "Old way"})
+    newer = _Rev("kref://c/d/new", {"title": "New way"})
+    # Many MOTIVATED_BY edges FIRST, the SUPERSEDES edge LAST — so a
+    # slice-before-sort would evict it before the priority sort sees it.
+    edges = []
+    revs = {me.kref.uri: me, newer.kref.uri: newer}
+    for i in range(MAX_EDGES_PER_DECISION + 5):
+        ev_uri = f"kref://c/e/{i}"
+        revs[ev_uri] = _Rev(ev_uri, {"statement": f"ev{i}", "evidence_kind": "constraint"})
+        edges.append(_Edge("MOTIVATED_BY", me.kref.uri, ev_uri, {}))
+    edges.append(_Edge("SUPERSEDES", newer.kref.uri, me.kref.uri, {}))
+    me._edges = edges
+
+    fake = _fake_kumiho(_Project("p", {}), revs, {})
+    monkeypatch.setitem(sys.modules, "kumiho", fake)
+    chain = _sync_expand_chain(me.kref.uri, max_fetch=5)
+    assert chain["superseded_by"] == {"kref": newer.kref.uri, "title": "New way"}

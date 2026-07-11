@@ -732,6 +732,7 @@ def correlate(
     candidate: Dict[str, Any],
     session_ts: Any,
     trace: Optional[List[str]] = None,
+    session_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """ENRICH target or ``None`` (-> standalone).  Wrong-merge is
     unrecoverable, wrong-split is stitchable — lexical similarity alone can
@@ -762,6 +763,20 @@ def correlate(
             continue
         seen.add((uri, pool))
         meta = getattr(rev, "metadata", {}) or {}
+        # Never enrich onto a RETIRED decision, and never self-correlate onto
+        # this session's OWN decisions.  Both matter on the --force path: the
+        # pre-pass deprecates this session's origin=session decisions, and an
+        # anchored one is then rediscovered via its own IMPLEMENTED_IN edge —
+        # with lex ~1.0 (it is literally itself) it would win the ENRICH
+        # branch, which never un-deprecates, stranding the decision retired
+        # forever.  Filtering here forces it back to the standalone branch,
+        # where undeprecate_item restores it.
+        if str(meta.get("status", "")) == "deprecated":
+            _t(f"skip {meta.get('title', '')[:40]!r}: target is deprecated")
+            continue
+        if session_id and str(meta.get("session_id", "")) == session_id:
+            _t(f"skip {meta.get('title', '')[:40]!r}: same-session (no self-enrich)")
+            continue
         lex = _jaccard(cand_tokens, _tokens(_lex_text(meta)))
         tag = f"{correlation} {meta.get('title', '')[:40]!r} lex={lex:.2f}"
         if correlation == "sha":
@@ -1054,10 +1069,17 @@ def _sync_write_session(
     session_line: str,
     stats: SessionMineStats,
     force: bool = False,
+    mark_complete: bool = True,
 ) -> None:
     """Stages [6]-[9] for one session.  Crash-safe: the marker revision is
     the very last write; a partial failure leaves the session unmarked and
-    the next run retries (all writes are get-or-create / existence-checked)."""
+    the next run retries (all writes are get-or-create / existence-checked).
+
+    ``mark_complete=False`` (an LLM chunk failed to structure) writes the
+    decisions that DID extract but withholds the marker, so the session is
+    not recorded as processed and the next run re-mines the failed chunk —
+    a missing LLM result is a failure, never a zero-decision verdict (the
+    commit-ingest principle, applied to chunks)."""
     import kumiho
 
     from kumiho_memory.code_capture import _create_edge_once
@@ -1091,7 +1113,8 @@ def _sync_write_session(
         atoms = _evidence_atoms(cand, session_id)
 
         trace: List[str] = [f"candidate {str(cand.get('title', ''))[:50]!r}"]
-        target = correlate(project, config, repo, cand, settled_ts, trace=trace)
+        target = correlate(project, config, repo, cand, settled_ts,
+                           trace=trace, session_id=session_id)
         stats.correlation_trace.extend(trace)
         if target is not None:
             # --- ENRICH: additive only.  No new revision on the target, no
@@ -1174,13 +1197,26 @@ def _sync_write_session(
             stats.decisions_created += 1
         _bridge(decision_rev, conversation_kref, session_id, stats)
 
-    # [9] marker LAST: session node + provenance edges
+    # [9] marker LAST: session node + provenance edges.  Withheld entirely
+    # when a chunk failed to structure — no marker means the next run
+    # re-mines (successful decisions already written converge idempotently).
+    if not mark_complete:
+        return
     slug = session_slug(repo, session_id)
     marker_item = get_or_create_item(
         project, slug, KIND_SESSION, f"/{project_name}/{config.sessions_space}",
     )
     marker_rev = marker_item.get_latest_revision()
-    if marker_rev is None or force:
+    # Reaching this write means a real (re-)mining pass ran — the complete-
+    # marker skip returns before here.  A delta-triggered re-mine (marker
+    # present, not force) MUST refresh the marker, or its stale message_count
+    # keeps tripping the delta threshold and every subsequent mine re-pays
+    # full LLM cost forever.  Rewrite whenever the recorded count is stale.
+    recorded_mc = (
+        str((getattr(marker_rev, "metadata", {}) or {}).get("message_count", ""))
+        if marker_rev is not None else ""
+    )
+    if marker_rev is None or force or recorded_mc != str(message_count):
         marker_rev = write_revision(marker_item, {
             "repo": repo,
             "session_id": session_id,
@@ -1366,8 +1402,10 @@ async def mine_session(
 
     # --- [4] structure (concurrency 2)
     sem = asyncio.Semaphore(2)
+    chunk_failed = False
 
     async def _run_chunk(packet: str) -> List[Dict[str, Any]]:
+        nonlocal chunk_failed
         async with sem:
             try:
                 out = await _structure_chunk(adapter, model, packet, config)
@@ -1375,6 +1413,7 @@ async def mine_session(
                 return out
             except Exception as exc:  # noqa: BLE001
                 stats.errors.append(f"structuring failed: {exc}")
+                chunk_failed = True
                 return []
 
     chunk_results = await asyncio.gather(*(_run_chunk(p) for p in packets))
@@ -1426,6 +1465,7 @@ async def mine_session(
             message_count=stats.messages_seen,
             source=source, session_last_ts=last_ts,
             session_line=session_line, stats=stats, force=force,
+            mark_complete=not chunk_failed,
         ) or True,
         timeout=config.write_timeout, label="code session write",
         on_timeout=None, on_error=None,

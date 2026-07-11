@@ -1153,3 +1153,125 @@ def test_correlate_lex_uses_full_prose(monkeypatch, tmp_path):
     )
     hit = correlate(project, _cfg(), "repo", cand, "2026-07-11T12:00:00+00:00")
     assert hit is not None and hit["correlation"] == "sha"
+
+
+def test_delta_remine_refreshes_marker_message_count(monkeypatch, tmp_path):
+    """A growth-triggered re-mine MUST rewrite the marker with the new
+    message_count — otherwise the stale count keeps tripping the delta
+    threshold and every subsequent mine re-pays full LLM cost forever."""
+    repo, _sha = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    quote = "defer the bge-m3 migration because the release cycle comes first"
+    base = [_msg("user", "migrate?"), _msg("assistant", quote),
+            _msg("user", "yes, agreed")]
+    adapter = _StubAdapter(_payload([{
+        "title": "Defer the bge-m3 embedding migration",
+        "decision": "defer until after the release cycle",
+        "rationale": "release first", "why_question": "why deferred?",
+        "symbols": [], "files": [], "mentioned_commits": [],
+        "alternatives": [{"option": "now", "verdict": "deferred",
+                          "quote": quote, "quote_en": "", "message_index": 1}],
+        "evidence": [], "settled_by_message": 2,
+        "status_hint": "uncommitted", "confidence": "high",
+    }]))
+    _mine(repo, adapter, messages=base)                       # marker mc=3
+    grown = base + [_msg("user", f"more chatter {i}") for i in range(12)]
+    _mine(repo, adapter, messages=grown)                      # re-mine (mc->15)
+    calls = adapter.calls
+    # third mine of the SAME grown session must now converge to skip
+    stats3 = _mine(repo, adapter, messages=grown)
+    assert stats3.skipped_marker
+    assert adapter.calls == calls                             # zero new LLM
+
+    import kumiho
+    project = kumiho.get_project("p-code")
+    marker = project.get_item(session_slug("repo", "s1"), KIND_SESSION)
+    assert marker.get_latest_revision().metadata["message_count"] == str(len(grown))
+
+
+def test_force_does_not_self_correlate_anchored_session_decision(monkeypatch, tmp_path):
+    """--force pre-pass deprecates this session's decisions; an ANCHORED
+    standalone one must not then rediscover its own deprecated self via its
+    IMPLEMENTED_IN edge and enrich onto it (the ENRICH branch never
+    un-deprecates → permanent retirement).  It must fall back to standalone
+    and be restored."""
+    repo, _sha = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    quote = "we deferred the rewrite because the executor pool is shared"
+    msgs = [_msg("user", "should we rewrite rerank.py?"),
+            _msg("assistant", quote),
+            _msg("user", "yes, decided: keep the single-worker executor")]
+    adapter = _StubAdapter(_payload([{
+        "title": "Keep the single-worker executor in rerank.py",
+        "decision": "keep the dedicated single-worker executor for the rerank",
+        "rationale": "the default executor pool is shared",
+        "why_question": "why keep the single-worker executor?",
+        "symbols": ["rerank_async"], "files": ["rerank.py"],
+        "mentioned_commits": [],
+        "alternatives": [{"option": "rewrite", "verdict": "deferred",
+                          "quote": quote, "quote_en": "", "message_index": 1}],
+        "evidence": [], "settled_by_message": 2,
+        "status_hint": "uncommitted", "confidence": "high",
+    }]))
+    stats = _mine(repo, adapter, messages=msgs)               # anchored standalone
+    assert stats.decisions_created == 1
+
+    stats2 = _mine(repo, adapter, messages=msgs, force=True)
+    # went back to standalone (not enriched onto its deprecated self)
+    assert stats2.decisions_created == 1 and stats2.decisions_enriched == 0
+
+    import kumiho
+    project = kumiho.get_project("p-code")
+    d_item = next(i for (s, k), i in project.items.items()
+                  if k == KIND_DECISION and i.get_latest_revision()
+                  .metadata.get("origin") == "session")
+    assert not d_item.deprecated                              # restored
+    assert d_item.get_latest_revision().metadata["status"] == "active"
+
+
+class _FailingAdapter:
+    """LLM stub whose structuring call always raises."""
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, *, messages, model, system="", max_tokens=1024,
+                   json_mode=False):
+        self.calls += 1
+        raise RuntimeError("model unavailable")
+
+
+def test_chunk_structuring_failure_withholds_marker_for_retry(monkeypatch, tmp_path):
+    """A failed LLM chunk is a FAILURE, not a zero-decision verdict: the
+    session marker is withheld so the next run re-mines instead of
+    permanently skipping the un-judged chunk."""
+    repo, _sha = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    quote = "defer the bge-m3 migration because the release cycle comes first"
+    msgs = [_msg("user", "migrate?"), _msg("assistant", quote),
+            _msg("user", "yes, agreed")]
+
+    stats = _mine(repo, _FailingAdapter(), messages=msgs)
+    assert any("structuring failed" in e for e in stats.errors)
+    assert not stats.skipped_marker
+
+    import kumiho
+    project = kumiho.get_project("p-code")
+    # no complete marker was written -> the session can be retried
+    marker = project.items.get((session_slug("repo", "s1"), KIND_SESSION))
+    assert marker is None or marker.get_latest_revision() is None
+
+    # a subsequent run with a working adapter re-mines and completes
+    good = _StubAdapter(_payload([{
+        "title": "Defer the bge-m3 embedding migration",
+        "decision": "defer until after the release cycle",
+        "rationale": "release first", "why_question": "why deferred?",
+        "symbols": [], "files": [], "mentioned_commits": [],
+        "alternatives": [{"option": "now", "verdict": "deferred",
+                          "quote": quote, "quote_en": "", "message_index": 1}],
+        "evidence": [], "settled_by_message": 2,
+        "status_hint": "uncommitted", "confidence": "high",
+    }]))
+    stats2 = _mine(repo, good, messages=msgs)
+    assert not stats2.skipped_marker and stats2.decisions_created == 1
+    marker = project.get_item(session_slug("repo", "s1"), KIND_SESSION)
+    assert marker.get_latest_revision() is not None

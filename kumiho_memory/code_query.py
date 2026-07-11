@@ -314,7 +314,13 @@ def _sync_expand_chain(kref: str, max_fetch: int) -> Dict[str, Any]:
     def _prio(e: Any) -> int:
         return 0 if getattr(e, "edge_type", "") == EDGE_SUPERSEDES else 1
 
-    scan = sorted((edges or [])[:MAX_EDGES_PER_DECISION], key=_prio)
+    # Sort BEFORE the cap, not after: session enrichment can grow a decision
+    # past MAX_EDGES_PER_DECISION MOTIVATED_BY edges, and slicing the raw
+    # edge list first would drop a SUPERSEDES edge sitting past the cap
+    # before the priority sort could pull it to the front — silently losing
+    # superseded_by (the exact hard-requirement-5 violation the sort exists
+    # to prevent).
+    scan = sorted(edges or [], key=_prio)[:MAX_EDGES_PER_DECISION]
     fetched = 0
     me = kref
     for edge in scan:
