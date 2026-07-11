@@ -244,11 +244,16 @@ enrichment는 기존 `code_decision`이 있어야 성립한다. `ingest_first=Tr
 원칙). 어휘 일치 단독으로는 어떤 경로에서도 병합하지 않는다:
 
 ```
-lex = jaccard(_tokens(cand.title+cand.decision), _tokens(target.title+target.decision))
-      (relations._jaccard/_tokens 재사용)
+lex = jaccard(_tokens(FULL prose), _tokens(FULL prose))
+      # [도그푸드 캘리브레이션, 2026-07-11] FULL prose = title+decision+rationale+
+      # why_question 양쪽 모두. 라이브 동일-결정 쌍이 title+decision만으로 0.14,
+      # 전체 산문으로 0.26 실측 — 세션과 커밋은 같은 결정을 다르게 제목 짓지만
+      # rationale 어휘(진짜 why)는 공유한다. (relations._jaccard/_tokens 재사용)
 
 ENRICH(target) iff:
-  [S1: sha 경로]    target ∈ T1  AND  lex ≥ 0.25         # sha가 사실을 증언 — lex는 sanity floor
+  [S1: sha 경로]    target ∈ T1  AND  lex ≥ 0.20         # sha가 사실을 증언 — lex는 sanity floor
+                    # (도그푸드 실측 보정: 정직한 동일-결정 쌍 ~0.26, 오인용-sha
+                    #  음성 ~0.1 — 0.20이 여유를 갖고 가른다. 초안의 0.25는 미측정)
   [S2: anchor 경로] target ∈ T2  AND  lex ≥ 0.35
                     AND (symbol_overlap ≥ 1  OR  lex ≥ 0.50)
                     AND |parse_decided_at(target) − session_ts| ≤ 14일
@@ -404,7 +409,7 @@ session_max_evidence_per_decision: int = 4     # 결정당 세션-추가 evidenc
 session_max_alternatives_per_decision: int = 4
 evidence_dup_jaccard: float = 0.8
 evidence_containment: float = 0.6              # verbatim 완화 매치 (§5.1 [4])
-correlate_jaccard_sha: float = 0.25
+correlate_jaccard_sha: float = 0.20      # 도그푸드 실측 보정 (§3.3)
 correlate_jaccard_anchored: float = 0.35
 correlate_jaccard_blind: float = 0.50          # anchored + symbol 0개일 때
 correlate_window_days: int = 14
@@ -434,7 +439,11 @@ env 추가: `KUMIHO_MEMORY_CODE_AUTOMINE` (기본 unset=off). `KUMIHO_MEMORY_COD
                     회귀의 조기 신호)
                 (b) sha: hex-regex 선검증 + `git rev-parse --verify` → 불통과 폐기
                 (c) file: normalize_path 후 `git ls-files` 집합(세션당 1회 캐시) 대조
-                    → 불통과 폐기; 전멸 시 anchor-less 생존
+                    → 불통과 시 **유일-접미사 해석** (세그먼트 경계의 suffix가
+                    추적 파일 중 정확히 1개와 일치하면 그 경로로 복원 —
+                    라이브 실측: 모델이 full path를 kumiho_memory/recall_rerank.py로
+                    축약) → 그래도 불통과면 폐기; 전멸 시 anchor-less 생존
+                    [도그푸드 캘리브레이션, 2026-07-11]
                 (d) confidence==low && evidence 0 && alternatives 0 → 후보 드랍
                 (e) **[판정 반영] credentials — 원자 단위**: 각 statement/decision/
                     rationale/embedding_text에 reject_credentials를 개별 try로 적용,
