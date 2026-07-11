@@ -1961,6 +1961,40 @@ class UniversalMemoryManager:
             reranker=self.reranker,
         )
 
+    async def code_ingest(
+        self,
+        repo_path: str = ".",
+        rev_range: Optional[str] = None,
+        *,
+        max_commits: Optional[int] = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Mine a git commit range into Decision Memory (opt-in, gated).
+
+        Same lazy/gated shape as :meth:`code_why`.  Reuses the summarizer's
+        LLM adapter + light model for structuring — no separate key.
+        """
+        from kumiho_memory.code_decisions import (
+            code_memory_enabled, config_from_env, resolve_project_name,
+        )
+
+        if not code_memory_enabled():
+            return {"errors": ["code memory is disabled (set KUMIHO_MEMORY_CODE=1)"]}
+        from kumiho_memory.code_capture import ingest_repo
+
+        cfg = config_from_env()
+        adapter = getattr(self.summarizer, "adapter", None)
+        model = getattr(self.summarizer, "light_model", "") or getattr(
+            self.summarizer, "model", "",
+        )
+        stats = await ingest_repo(
+            repo_path, rev_range,
+            project_name=resolve_project_name(self.project, cfg),
+            config=cfg, adapter=adapter, model=model,
+            force=force, max_commits=max_commits,
+        )
+        return stats.as_dict()
+
     async def _fetch_revision_metadata(
         self, kref: str, load_artifacts: bool = True,
     ) -> Dict[str, Any]:

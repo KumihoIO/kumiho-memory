@@ -1347,6 +1347,19 @@ def tool_code_why(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def tool_code_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Mine a git commit range into decision nodes (LLM-structured, idempotent)."""
+    manager = _get_manager()
+    return asyncio.run(
+        manager.code_ingest(
+            args.get("repo_path", "."),
+            args.get("rev_range"),
+            max_commits=args.get("max_commits"),
+            force=args.get("force", False),
+        )
+    )
+
+
 _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
     {
         "name": "kumiho_code_why",
@@ -1384,6 +1397,35 @@ _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
             "anyOf": [{"required": ["file"]}, {"required": ["question"]}],
         },
     },
+    {
+        "name": "kumiho_code_ingest",
+        "description": (
+            "Mine a git commit range into decision-memory nodes "
+            "(LLM-structured, idempotent — already-captured commits are "
+            "skipped without LLM cost). Omit rev_range for incremental mode."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "default": ".",
+                    "description": "Path to the git repository.",
+                },
+                "rev_range": {
+                    "type": "string",
+                    "description": "e.g. HEAD~30..HEAD; omit = incremental.",
+                },
+                "max_commits": {"type": "integer", "default": 50},
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Re-capture commits that already carry markers.",
+                },
+            },
+            "required": ["repo_path"],
+        },
+    },
 ]
 
 
@@ -1394,6 +1436,7 @@ def _register_code_memory_tools() -> None:
         return
     MEMORY_TOOLS.extend(_CODE_MEMORY_TOOLS)
     MEMORY_TOOL_HANDLERS["kumiho_code_why"] = tool_code_why
+    MEMORY_TOOL_HANDLERS["kumiho_code_ingest"] = tool_code_ingest
 
 
 _register_code_memory_tools()

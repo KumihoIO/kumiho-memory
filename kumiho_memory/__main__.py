@@ -209,6 +209,37 @@ def cmd_profile(args: argparse.Namespace) -> int:
     return 1 if errors else 0
 
 
+def cmd_code_ingest(args: argparse.Namespace) -> int:
+    """Mine a git commit range into Decision Memory (opt-in domain)."""
+    from kumiho_memory.code_decisions import (
+        code_memory_enabled, config_from_env, resolve_project_name,
+    )
+
+    if not code_memory_enabled():
+        print(json.dumps({
+            "errors": ["code memory is disabled — set KUMIHO_MEMORY_CODE=1"],
+        }))
+        return 1
+
+    from kumiho_memory.code_capture import ingest_repo
+    from kumiho_memory.summarization import MemorySummarizer
+
+    summarizer = MemorySummarizer()
+    cfg = config_from_env()
+    stats = asyncio.run(ingest_repo(
+        args.repo_path,
+        args.range,
+        project_name=resolve_project_name(args.project, cfg),
+        config=cfg,
+        adapter=summarizer.adapter,
+        model=summarizer.light_model,
+        force=args.force,
+        max_commits=args.max_commits,
+    ))
+    print(json.dumps(stats.as_dict(), indent=2, default=str))
+    return 1 if (stats.errors or stats.failed_commits) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kumiho-memory",
@@ -349,6 +380,43 @@ def main(argv: list[str] | None = None) -> int:
         help="Classify but do not persist profiles",
     )
 
+    # -- code-ingest subcommand (Decision Memory, opt-in) --
+    code_ingest = sub.add_parser(
+        "code-ingest",
+        help="Mine git commits into Decision Memory (KUMIHO_MEMORY_CODE=1)",
+        description="LLM-structure a git commit range into decision nodes "
+        "with git anchors and evidence chains. Idempotent: already-captured "
+        "commits are skipped without LLM cost. Omit --range for incremental "
+        "mode.",
+    )
+    code_ingest.add_argument(
+        "repo_path",
+        nargs="?",
+        default=".",
+        help="Path to the git repository (default: current directory)",
+    )
+    code_ingest.add_argument(
+        "--range",
+        default=None,
+        help="Rev range, e.g. HEAD~30..HEAD (omit = incremental)",
+    )
+    code_ingest.add_argument(
+        "--project",
+        default="CognitiveMemory",
+        help="Memory project; decisions go to '{project}-code' (default: CognitiveMemory)",
+    )
+    code_ingest.add_argument(
+        "--max-commits",
+        type=int,
+        default=None,
+        help="Cap on commits enumerated (default: config.max_commits)",
+    )
+    code_ingest.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-capture commits that already carry completion markers",
+    )
+
     parsed = parser.parse_args(argv)
 
     # Configure logging
@@ -364,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_dream(parsed)
     elif parsed.command == "profile":
         return cmd_profile(parsed)
+    elif parsed.command == "code-ingest":
+        return cmd_code_ingest(parsed)
 
     parser.print_help()
     return 0
