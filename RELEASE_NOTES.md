@@ -1,5 +1,35 @@
 # Release Notes — kumiho-memory
 
+## v0.13.0
+
+**Release Date:** 2026-07-12
+
+**Keyless, agent-driven Decision Memory capture.** The plugin runs inside
+Claude; requiring a separate OpenAI/Anthropic key to extract the *why*
+betrays the point. `kumiho_memory_reflect` already proved the pattern for
+conversation memory (the agent's own model identifies what matters; the tool
+just stores it, no key) — this release brings it to code.
+
+### Added
+
+- **`kumiho_code_capture`** (MCP tool) + `manager.code_capture()` +
+  `code_capture.capture_decisions()` — the keyless counterpart to
+  `code-ingest`. The agent passes decisions it already extracted from the
+  diff/conversation (`title`, `decision`, `rationale`, `why_question`,
+  `files`, `evidence`, `confidence`), so the structuring LLM call is skipped
+  entirely (no `adapter`). The same deterministic validation still runs —
+  anchors UNION with the commit's real changed files (list files, not line
+  ranges; hallucinated files drop) — and the same sha-anchored write path.
+  Defaults to `HEAD` (the commit just made).
+
+### Notes
+
+- `code-ingest` / `code-mine-session` remain for the detached-hook / batch
+  backfill that has no agent in the loop and therefore does need a model.
+  When Claude is present, `kumiho_code_capture` is the primary path.
+- Verified live **keyless** (`OPENAI_API_KEY` unset): capture → `why()`
+  recall round-trips the decision + a verbatim rejected-alternative.
+
 ## v0.12.1
 
 **Release Date:** 2026-07-11
