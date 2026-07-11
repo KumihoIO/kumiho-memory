@@ -1360,6 +1360,18 @@ def tool_code_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def tool_code_capture(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Store agent-extracted code decisions (keyless — you did the extraction)."""
+    manager = _get_manager()
+    return asyncio.run(
+        manager.code_capture(
+            args.get("decisions") or [],
+            repo_path=args.get("repo_path", "."),
+            commit_ref=args.get("commit_ref", "HEAD"),
+        )
+    )
+
+
 def tool_code_mine_session(args: Dict[str, Any]) -> Dict[str, Any]:
     """Mine an agent session's conversation into the code-decision graph."""
     manager = _get_manager()
@@ -1441,6 +1453,66 @@ _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "kumiho_code_capture",
+        "description": (
+            "Store a code DECISION you just made or observed — the keyless, "
+            "self-contained way to capture the *why* behind code (no LLM API "
+            "key: YOU did the extraction, this only stores it, exactly like "
+            "kumiho_memory_reflect). Use it right after you commit code that "
+            "embodies a real choice — an alternative picked over another, a "
+            "default/policy set, a reversal, or a measured trade-off — or "
+            "when a decision is settled in conversation. Anchors are unioned "
+            "with the commit's real changed files, so listing files is "
+            "enough; hallucinated files are dropped. Defaults to HEAD."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "decisions": {
+                    "type": "array",
+                    "description": "The decisions to store (usually one).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string",
+                                      "description": "The concrete choice (e.g. 'single-worker executor'), not a restatement of the diff."},
+                            "decision": {"type": "string",
+                                         "description": "What was decided, in one or two sentences."},
+                            "rationale": {"type": "string",
+                                          "description": "Why — the reasoning, constraint, or trade-off."},
+                            "why_question": {"type": "string",
+                                             "description": "The question a future reader would ask (e.g. 'why not asyncio.to_thread?')."},
+                            "symbols": {"type": "array", "items": {"type": "string"},
+                                        "description": "Identifiers involved (function/env/class names)."},
+                            "files": {"type": "array", "items": {"type": "string"},
+                                      "description": "Repo-relative files this decision defines/touches (forward slashes)."},
+                            "evidence": {
+                                "type": "array",
+                                "description": "Verbatim support: measurements, review findings, rejected alternatives.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": {"type": "string",
+                                                 "enum": ["measurement", "review_finding", "incident", "benchmark", "constraint", "rejected_alternative"]},
+                                        "text": {"type": "string", "description": "Verbatim quote carrying the WHY."},
+                                    },
+                                    "required": ["kind", "text"],
+                                },
+                            },
+                            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        },
+                        "required": ["title", "decision"],
+                    },
+                },
+                "repo_path": {"type": "string", "default": ".",
+                              "description": "Path to the git repository."},
+                "commit_ref": {"type": "string", "default": "HEAD",
+                               "description": "The commit these decisions belong to (default HEAD — the one you just made)."},
+            },
+            "required": ["decisions"],
+        },
+    },
+    {
         "name": "kumiho_code_mine_session",
         "description": (
             "Mine the current agent session into the code-decision graph: "
@@ -1505,6 +1577,7 @@ def _register_code_memory_tools() -> None:
     MEMORY_TOOLS.extend(_CODE_MEMORY_TOOLS)
     MEMORY_TOOL_HANDLERS["kumiho_code_why"] = tool_code_why
     MEMORY_TOOL_HANDLERS["kumiho_code_ingest"] = tool_code_ingest
+    MEMORY_TOOL_HANDLERS["kumiho_code_capture"] = tool_code_capture
     MEMORY_TOOL_HANDLERS["kumiho_code_mine_session"] = tool_code_mine_session
 
 

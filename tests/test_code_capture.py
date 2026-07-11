@@ -18,6 +18,7 @@ from kumiho_memory.code_capture import (
     CommitInfo,
     IngestStats,
     build_packet,
+    capture_decisions,
     derive_repo_id,
     enumerate_commits,
     ingest_repo,
@@ -611,3 +612,56 @@ def test_force_deprecates_then_rewrites(tmp_path, monkeypatch):
         assert not i.deprecated                      # converged -> restored
         assert len(i.revisions) > revs_before[i.slug]  # fresh revision written
         assert i.revisions[-1].metadata.get("status") == "active"
+
+
+def test_capture_decisions_is_keyless(tmp_path, monkeypatch):
+    """Agent-driven capture: structured decisions from the agent are written
+    with NO adapter/LLM (the keyless reflect pattern for code). Anchors union
+    with the commit's real changed files; hallucinated files drop."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+
+    # what Claude would pass after committing — no LLM produced this
+    decisions = [{
+        "title": "Use a single-worker executor",
+        "decision": "run the CE rerank on one dedicated worker",
+        "rationale": "a shared pool oversubscribes the cross-encoder",
+        "why_question": "why not the default executor?",
+        "symbols": ["rerank_async"],
+        "files": ["a.py", "ghost_never_changed.py"],   # ghost must drop
+        "evidence": [{"kind": "rejected_alternative",
+                      "text": "the default executor is shared - 32-thread oversubscription"}],
+        "confidence": "high",
+    }]
+
+    # NOTE: no adapter, no model — the whole point
+    stats = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert stats.decisions == 1 and not stats.errors
+    assert stats.evidence == 1
+
+    import kumiho
+    project = kumiho.get_project("p-code")
+    d_item = next(i for (s, k), i in project.items.items() if k == "code_decision")
+    rev = d_item.get_latest_revision()
+    files = set(rev.metadata["files"].split(","))
+    assert "a.py" in files                      # real changed file anchored
+    assert "ghost_never_changed.py" not in files  # hallucinated file dropped
+    # committed under the real HEAD commit (sha-anchored provenance)
+    assert rev.metadata["commit_hash"]
+
+
+def test_capture_decisions_empty_and_bad_ref(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    s1 = asyncio.run(capture_decisions(str(repo), [], project_name="p-code", config=cfg))
+    assert s1.errors and "no decisions" in s1.errors[0]
+    s2 = asyncio.run(capture_decisions(
+        str(repo), [{"title": "x", "decision": "y"}],
+        commit_ref="does-not-exist-ref", project_name="p-code", config=cfg,
+    ))
+    assert s2.errors  # unresolvable ref -> loud error, no write

@@ -904,3 +904,71 @@ async def ingest_repo(
             if ok is not True:
                 stats.failed_commits.append(c.hash[:12])
     return stats
+
+
+def _commit_info_for_ref(repo_path: str, ref: str) -> Optional[CommitInfo]:
+    """CommitInfo for a single git ref (default HEAD), with changed files
+    loaded — the deterministic ground truth the agent-driven capture path
+    unions its anchors against."""
+    commits = enumerate_commits(repo_path, ref, 1)
+    if not commits:
+        return None
+    c = commits[0]
+    c.files = _changed_files(repo_path, c.hash, parents=c.parents)
+    return c
+
+
+async def capture_decisions(
+    repo_path: str,
+    decisions: List[Dict[str, Any]],
+    *,
+    commit_ref: str = "HEAD",
+    project_name: str,
+    config: Optional[CodeMemoryConfig] = None,
+) -> IngestStats:
+    """Write AGENT-STRUCTURED decisions into the graph — **no LLM, no key**.
+
+    The keyless counterpart to :func:`ingest_repo`.  The agent (Claude) has
+    already read the diff / conversation and extracted the decision, so the
+    structuring LLM call is skipped entirely — this mirrors
+    ``kumiho_memory_reflect`` (the agent's own model identifies what matters;
+    the tool just stores it).  The same deterministic validation still runs:
+    anchors are UNIONED with the commit's real changed files, so a missing or
+    loose anchor still lands on the right file, and hallucinated files drop.
+    """
+    config = config or CodeMemoryConfig()
+    stats = IngestStats()
+    if not decisions:
+        stats.errors.append("no decisions provided")
+        return stats
+
+    repo = (config.repo or derive_repo_id(repo_path)).strip()
+    try:
+        commit = _commit_info_for_ref(repo_path, commit_ref)
+    except Exception as exc:  # noqa: BLE001
+        stats.errors.append(f"git resolution failed for {commit_ref!r}: {exc}")
+        return stats
+    if commit is None:
+        stats.errors.append(f"commit not found: {commit_ref!r}")
+        return stats
+
+    stats.commits_seen = 1
+    validated = validate_decisions(commit, list(decisions), config)
+    if not validated:
+        stats.errors.append(
+            "all decisions dropped by validation (missing title, or "
+            "low-confidence with no evidence)"
+        )
+        return stats
+
+    ok = await run_bounded_in_thread(
+        lambda: _sync_write_commit(
+            project_name, config, repo, commit, validated, SCHEMA_VERSION, stats,
+        ) or True,
+        timeout=config.write_timeout, label="code capture write",
+        on_timeout=None, on_error=None,
+    )
+    if ok is not True:
+        stats.failed_commits.append(commit.hash[:12])
+        stats.errors.append("write failed or timed out")
+    return stats

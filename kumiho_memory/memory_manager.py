@@ -2032,6 +2032,37 @@ class UniversalMemoryManager:
         )
         return stats.as_dict()
 
+    async def code_capture(
+        self,
+        decisions: List[Dict[str, Any]],
+        *,
+        repo_path: str = ".",
+        commit_ref: str = "HEAD",
+    ) -> Dict[str, Any]:
+        """Store agent-extracted code decisions — **keyless** (opt-in, gated).
+
+        The self-contained capture path: the agent (Claude) reads the diff or
+        conversation, extracts the decision, and passes it here — no separate
+        LLM key, mirroring :meth:`memory_reflect`.  ``ingest``/``mine_session``
+        exist for the detached-hook / batch case that has no agent in the
+        loop and therefore does need a model; this is the primary path when
+        Claude is present.
+        """
+        from kumiho_memory.code_decisions import (
+            code_memory_enabled, config_from_env, resolve_project_name,
+        )
+
+        if not code_memory_enabled():
+            return {"errors": ["code memory is disabled (set KUMIHO_MEMORY_CODE=1)"]}
+        from kumiho_memory.code_capture import capture_decisions
+
+        cfg = config_from_env()
+        stats = await capture_decisions(
+            repo_path, decisions or [], commit_ref=commit_ref,
+            project_name=resolve_project_name(self.project, cfg), config=cfg,
+        )
+        return stats.as_dict()
+
     async def code_mine_session(
         self,
         session_id: str,
