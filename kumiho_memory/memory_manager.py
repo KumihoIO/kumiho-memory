@@ -1043,6 +1043,31 @@ class UniversalMemoryManager:
                     config=self.entity_promotion_config,
                 )
 
+            # Decision Memory session mining chain (double opt-in:
+            # KUMIHO_MEMORY_CODE=1 AND KUMIHO_MEMORY_CODE_AUTOMINE=1 — see
+            # docs/SESSION_MINING_DESIGN.md §2.2c).  This exact spot is the
+            # point: the Redis buffer is still alive, `messages` is already
+            # in memory (zero re-reads), and `stored_kref` is in-band — the
+            # consolidated revision cannot be re-found later by session_id
+            # (search has no metadata filter).  Mirrors the
+            # decompose_and_link chain precedent; a mining failure must
+            # never break consolidation.
+            if stored_kref:
+                from kumiho_memory.code_decisions import code_automine_enabled
+
+                if code_automine_enabled():
+                    try:
+                        await self.code_mine_session(
+                            session_id,
+                            messages=messages,
+                            conversation_kref=stored_kref,
+                            ingest_first=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "code session mining failed (non-fatal): %s", exc,
+                        )
+
         await self.redis_buffer.clear_session(self.project, session_id)
 
         # Clear the active session pointer so the next conversation starts fresh.
@@ -1992,6 +2017,62 @@ class UniversalMemoryManager:
             project_name=resolve_project_name(self.project, cfg),
             config=cfg, adapter=adapter, model=model,
             force=force, max_commits=max_commits,
+        )
+        return stats.as_dict()
+
+    async def code_mine_session(
+        self,
+        session_id: str,
+        *,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        conversation_kref: str = "",
+        repo_path: str = ".",
+        ingest_first: bool = True,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Mine an agent session into Decision Memory (opt-in, gated).
+
+        Session mining enriches commit-mined decisions with the
+        conversation-only cargo (rejected alternatives, measurements in
+        their original form), captures decisions that never reached a
+        commit, and bridges decisions to the consolidated conversation
+        revision.  Same lazy/gated shape as :meth:`code_ingest`; see
+        ``docs/SESSION_MINING_DESIGN.md``.
+
+        ``ingest_first`` runs an incremental commit ingest before mining so
+        enrichment targets exist ("talk → commit → mine" is the natural
+        workflow); already-captured commits are marker-skipped at zero LLM
+        cost.
+        """
+        from kumiho_memory.code_decisions import (
+            code_memory_enabled, config_from_env, resolve_project_name,
+        )
+
+        if not code_memory_enabled():
+            return {"errors": ["code memory is disabled (set KUMIHO_MEMORY_CODE=1)"]}
+        from kumiho_memory.code_session import mine_session
+
+        cfg = config_from_env()
+        adapter = getattr(self.summarizer, "adapter", None)
+        model = getattr(self.summarizer, "light_model", "") or getattr(
+            self.summarizer, "model", "",
+        )
+        if ingest_first:
+            try:
+                await self.code_ingest(repo_path)
+            except Exception as exc:  # noqa: BLE001 — enrichment degrades, mining proceeds
+                logger.warning("code session mining: pre-ingest failed: %s", exc)
+        stats = await mine_session(
+            session_id,
+            project_name=resolve_project_name(self.project, cfg),
+            messages=messages,
+            conversation_kref=conversation_kref,
+            repo_path=repo_path,
+            config=cfg, adapter=adapter, model=model,
+            redactor=self.pii_redactor,
+            redis_buffer=self.redis_buffer,
+            memory_project=self.project,
+            force=force,
         )
         return stats.as_dict()
 

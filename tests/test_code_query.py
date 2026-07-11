@@ -461,3 +461,90 @@ def test_repo_fallback_derives_from_cwd(monkeypatch):
         file=f, line=120, project_name=proj_name, config=cfg,
     ))
     assert res["decisions"] and res["decisions"][0]["kref"] == "kref://c/d/1"
+
+
+# ---------------- session mining query surface (Phase 2) ----------------
+
+
+def test_derived_from_routes_sessions_no_ghost_commits(monkeypatch):
+    """A decision whose provenance is a session marker must route to
+    chain["sessions"] — not leak a {"sha": ""} ghost into commits (the
+    judged-and-confirmed defect in the Phase-2 design pass)."""
+    from kumiho_memory.code_query import _sync_expand_chain
+
+    d = _Rev("kref://c/d/s1", {"title": "Session decision", "decision": "x"})
+    commit_marker = _Rev("kref://c/m/1", {
+        "hash": "cfec845042f8", "subject": "the commit", "committed_at": "2026-07-10",
+    })
+    session_marker = _Rev("kref://c/s/1", {
+        "session_id": "sess-42", "mined_at": "2026-07-11", "source": "redis",
+    })
+    edges = [
+        _Edge("DERIVED_FROM", d.kref.uri, commit_marker.kref.uri, {}),
+        _Edge("DERIVED_FROM", d.kref.uri, session_marker.kref.uri, {}),
+    ]
+    d._edges = edges
+    revs = {r.kref.uri: r for r in (d, commit_marker, session_marker)}
+    fake = _fake_kumiho(_Project("p", {}), revs, {})
+    monkeypatch.setitem(sys.modules, "kumiho", fake)
+
+    chain = _sync_expand_chain(d.kref.uri, max_fetch=10)
+    assert chain["sessions"] == [
+        {"session_id": "sess-42", "mined_at": "2026-07-11", "source": "redis"},
+    ]
+    assert chain["commits"] == [
+        {"sha": "cfec845042f8", "subject": "the commit", "date": "2026-07-10"},
+    ]
+    assert all(c["sha"] for c in chain["commits"])  # no ghosts
+
+
+def test_discussed_in_expands_to_conversation_without_budget(monkeypatch):
+    """DISCUSSED_IN lands in chain["conversation"] (kref is the payload —
+    no cross-project fetch) and never displaces superseded_by within a tiny
+    fetch budget."""
+    from kumiho_memory.code_query import _sync_expand_chain
+
+    d = _Rev("kref://c/d/1", {"title": "Old way"})
+    newer = _Rev("kref://c/d/2", {"title": "New way"})
+    edges = [
+        _Edge("DISCUSSED_IN", d.kref.uri, "kref://p/mem/conv-1",
+              {"session_id": "sess-42"}),
+        _Edge("SUPERSEDES", newer.kref.uri, d.kref.uri, {}),
+    ]
+    d._edges = edges
+    revs = {d.kref.uri: d, newer.kref.uri: newer}
+    fake = _fake_kumiho(_Project("p", {}), revs, {})
+    monkeypatch.setitem(sys.modules, "kumiho", fake)
+
+    chain = _sync_expand_chain(d.kref.uri, max_fetch=1)
+    assert chain["conversation"] == {"kref": "kref://p/mem/conv-1",
+                                     "session_id": "sess-42"}
+    assert chain["superseded_by"] == {"kref": newer.kref.uri, "title": "New way"}
+
+
+def test_compose_renders_session_origin_and_bridge():
+    d = _answer(
+        "Defer the bge-m3 migration",
+        commits=[],
+        origin="session",
+        status_hint="uncommitted",
+        conversation={"kref": "kref://p/mem/conv-1", "session_id": "sess-42"},
+        evidence=[{"statement": "rejected migrate-now because release first",
+                   "kind": "rejected_alternative",
+                   "source_ref": "session:sess-42#m3"}],
+    )
+    text = compose_why_context([d])
+    assert "(session" in text.split("\n")[0]           # header marks origin
+    assert "origin: session (uncommitted)" in text
+    assert '(rejected_alternative) "rejected migrate-now because release first"' in text
+    assert "[session:sess-42#m3]" in text
+    assert "discussed in: kref://p/mem/conv-1 (session sess-42)" in text
+
+
+def test_compose_commit_answers_unchanged_by_session_fields():
+    """Commit-origin answers (no session fields) render exactly as before —
+    the Phase-2 keys are additive."""
+    d = _answer("Offload CE")  # helper predates the session fields
+    text = compose_why_context([d])
+    assert "origin: session" not in text
+    assert "discussed in:" not in text

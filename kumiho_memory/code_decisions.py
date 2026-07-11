@@ -53,6 +53,7 @@ KIND_DECISION = "code_decision"
 KIND_ANCHOR = "code_anchor"
 KIND_COMMIT = "code_commit"
 KIND_EVIDENCE = "code_evidence"
+KIND_SESSION = "code_session"
 
 #: Edge types.  ``create_edge`` accepts free-form UPPERCASE strings
 #: (``kumiho/edge.py::validate_edge_type``) — no server changes involved.
@@ -60,16 +61,20 @@ KIND_EVIDENCE = "code_evidence"
 #: traversal defaults already know.
 EDGE_IMPLEMENTED_IN = "IMPLEMENTED_IN"   # code_decision -> code_anchor
 EDGE_MOTIVATED_BY = "MOTIVATED_BY"       # code_decision -> code_evidence
-EDGE_DERIVED_FROM = "DERIVED_FROM"       # code_decision -> code_commit
+EDGE_DERIVED_FROM = "DERIVED_FROM"       # code_decision -> code_commit | code_session
 EDGE_SUPERSEDES = "SUPERSEDES"           # newer decision -> older decision
+EDGE_DISCUSSED_IN = "DISCUSSED_IN"       # code_decision -> conversation revision (kref)
 
 #: Evidence taxonomy (``code_evidence.evidence_kind``).
+#: ``rejected_alternative`` is session mining's unique cargo — the option
+#: that was considered and turned down, with the verbatim rejection sentence.
 EVIDENCE_KINDS = (
     "measurement",
     "review_finding",
     "incident",
     "benchmark",
     "constraint",
+    "rejected_alternative",
 )
 
 
@@ -95,6 +100,7 @@ class CodeMemoryConfig:
     anchors_space: str = "anchors"
     commits_space: str = "commits"
     evidence_space: str = "evidence"
+    sessions_space: str = "sessions"
 
     # --- capture budgets (consumed by code_capture) ---
     llm_batch_size: int = 6
@@ -131,6 +137,29 @@ class CodeMemoryConfig:
     #: happens to share title+date, and the new one gets a ``-2`` suffix.
     slug_collision_jaccard: float = 0.3
 
+    # --- session mining budgets (consumed by code_session, §4.5) ---
+    session_salience_min: int = 2
+    session_per_message_chars: int = 800
+    session_chunk_chars: int = 18000
+    session_max_chunks: int = 6
+    session_max_decisions: int = 8
+    session_max_evidence_per_decision: int = 4
+    session_max_alternatives_per_decision: int = 4
+    #: Near-duplicate cut: a session evidence atom whose statement shares
+    #: this token-Jaccard with one already MOTIVATED_BY the target decision
+    #: is a rephrasing, not new information — skip it.
+    evidence_dup_jaccard: float = 0.8
+    #: Relaxed verbatim match: token containment floor when the exact
+    #: normalized-substring check fails (multi-message paraphrase slack).
+    evidence_containment: float = 0.6
+    # --- correlation thresholds (§3.3: conjunction, biased to split) ---
+    correlate_jaccard_sha: float = 0.25
+    correlate_jaccard_anchored: float = 0.35
+    correlate_jaccard_blind: float = 0.50
+    correlate_window_days: int = 14
+    #: Re-mine a marked session when this many new messages arrived since.
+    session_remine_message_delta: int = 10
+
 
 def config_from_env(base: Optional[CodeMemoryConfig] = None) -> CodeMemoryConfig:
     """Overlay ``KUMIHO_MEMORY_CODE_*`` env vars onto *base* (or defaults)."""
@@ -154,6 +183,15 @@ def code_memory_enabled() -> bool:
     return os.getenv("KUMIHO_MEMORY_CODE", "").strip().casefold() in (
         "1", "true", "yes", "on",
     )
+
+
+def code_automine_enabled() -> bool:
+    """Double opt-in for the consolidation chain (§2.2c): the master gate
+    AND ``KUMIHO_MEMORY_CODE_AUTOMINE`` must both be on.  Chaining an LLM
+    pass onto consolidation latency is an explicit consent matter."""
+    return code_memory_enabled() and os.getenv(
+        "KUMIHO_MEMORY_CODE_AUTOMINE", "",
+    ).strip().casefold() in ("1", "true", "yes", "on")
 
 
 def resolve_project_name(memory_project: str, config: CodeMemoryConfig) -> str:
@@ -266,6 +304,12 @@ def commit_slug(repo: str, commit_hash: str) -> str:
 def evidence_slug(statement: str) -> str:
     """Evidence identity = the verbatim statement (re-mining converges)."""
     return slugify(statement, hash_on_truncate=True)
+
+
+def session_slug(repo: str, session_id: str) -> str:
+    """Session marker identity — repo-qualified so the same session_id
+    reused against a different repo can never false-skip the marker."""
+    return slugify(f"{repo}-session-{session_id}", hash_on_truncate=True)
 
 
 def _author_day(author_date: Any) -> str:

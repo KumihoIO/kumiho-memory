@@ -1360,6 +1360,20 @@ def tool_code_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def tool_code_mine_session(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Mine an agent session's conversation into the code-decision graph."""
+    manager = _get_manager()
+    return asyncio.run(
+        manager.code_mine_session(
+            args.get("session_id", ""),
+            conversation_kref=args.get("conversation_kref", ""),
+            repo_path=args.get("repo_path", "."),
+            ingest_first=args.get("ingest_first", True),
+            force=args.get("force", False),
+        )
+    )
+
+
 _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
     {
         "name": "kumiho_code_why",
@@ -1426,6 +1440,52 @@ _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
             "required": ["repo_path"],
         },
     },
+    {
+        "name": "kumiho_code_mine_session",
+        "description": (
+            "Mine the current agent session into the code-decision graph: "
+            "enrich commit-mined decisions with conversation-only "
+            "alternatives/measurements, capture decisions that never "
+            "reached a commit, and bridge decisions to the consolidated "
+            "conversation."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "The chat session to mine.",
+                },
+                "conversation_kref": {
+                    "type": "string",
+                    "description": (
+                        "Consolidated revision kref for the bridge edge; "
+                        "omit to skip bridging."
+                    ),
+                },
+                "repo_path": {
+                    "type": "string",
+                    "default": ".",
+                    "description": "Path to the git repository.",
+                },
+                "ingest_first": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Run an incremental commit ingest first so "
+                        "enrichment targets exist (marker-skipped, no LLM "
+                        "cost for already-captured commits)."
+                    ),
+                },
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Re-mine a session that already carries a marker.",
+                },
+            },
+            "required": ["session_id"],
+        },
+    },
 ]
 
 
@@ -1445,6 +1505,7 @@ def _register_code_memory_tools() -> None:
     MEMORY_TOOLS.extend(_CODE_MEMORY_TOOLS)
     MEMORY_TOOL_HANDLERS["kumiho_code_why"] = tool_code_why
     MEMORY_TOOL_HANDLERS["kumiho_code_ingest"] = tool_code_ingest
+    MEMORY_TOOL_HANDLERS["kumiho_code_mine_session"] = tool_code_mine_session
 
 
 _register_code_memory_tools()
