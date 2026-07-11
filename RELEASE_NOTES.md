@@ -1,5 +1,59 @@
 # Release Notes — kumiho-memory
 
+## v0.11.0
+
+**Release Date:** 2026-07-11
+
+**Decision Memory** — a second domain profile on the same graph engine:
+the *why-layer* for a codebase. git stays the lossless source of
+what/when/who; this release adds the graph of **why** — decisions,
+rationale, and verbatim evidence, anchored to git and queryable by coding
+agents mid-session. Opt-in via `KUMIHO_MEMORY_CODE=1` (default OFF;
+conversation paths are byte-identical when gated off — proven by
+isolation tests).
+
+### Added
+
+- **Capture** (`code_capture.py`): an 8-stage git commit-mining pipeline —
+  deterministic prefilter (only *certain* noise dropped; `chore:` can carry
+  decisions), message-first evidence packets (comment/docstring diff lines
+  survive truncation — rationale lives in comments), batched LLM
+  structuring with a strict decision definition ("zero decisions is a
+  valid answer"), hallucination defenses (anchors unioned with the
+  changed-file ground truth), anchor-scoped 3-signal `SUPERSEDES` with
+  in-place status demotion, and marker-last idempotency: re-running a
+  range costs **zero LLM calls**, and partial failures retry themselves.
+- **Query** (`code_query.py`): `why(question, file=, line=, commit=)` —
+  a deterministic anchor leg (file → decisions, zero search infra), a
+  semantic leg, and an evidence-bridge leg, fused **lexicographically**
+  (anchor facts always outrank cross-encoder probabilities). Superseded
+  decisions are demoted and always carry `superseded_by`. Returns
+  structured answers plus an inject-ready markdown context block.
+- **Schema** (`code_decisions.py`): sha-free identity (decisions key on
+  `title + author-date`, anchors on `repo::path` hubs; volatile
+  coordinates live on edge metadata) so history rewrites converge instead
+  of duplicating — the non-rotting property.
+- Surface: `manager.code_why` / `manager.code_ingest`,
+  `kumiho_code_why` / `kumiho_code_ingest` MCP tools (registered only when
+  gated on), and a `kumiho-memory code-ingest` CLI subcommand.
+- Design doc: `docs/DECISION_MEMORY_DESIGN.md` (3-design judge-panel
+  synthesis; all codebase constraints verified against real code).
+
+### Notes
+
+- Code nodes live in a dedicated **`{project}-code` kumiho project** —
+  physical isolation from conversation recall (the measured
+  vector-crowding incident class). Zero new dependencies, zero server
+  changes.
+- Live-verified on this repo's own history against a kumiho-server CE:
+  three agent-style why-queries (single-worker executor / ontology
+  default / unconditional partition) answer with the actual deciding
+  commits and their verbatim measurements as evidence (3/3, machine-
+  judged; `scripts/dogfood_code_memory.py`).
+- Hardened by a 4-lens adversarial review (26 confirmed findings fixed,
+  including a critical revision-pinning identity split in supersede
+  demotion and a git argv option-injection guard).
+
 ## v0.10.1
 
 **Release Date:** 2026-07-10

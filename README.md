@@ -8,14 +8,20 @@
 
 ### Status
 
-> **Beta (0.6.x)**
+> **Beta (0.11.x)**
 > Actively developed; the public API is stabilizing but may still change
 > between minor versions.
-> Latest release: `0.6.1` (2026-07-03) — fixes the mirrored evidence-tag
-> carrier introduced in `0.6.0` (requires `kumiho>=0.10.1`).
-> `0.6.0` (2026-07-02) introduced Level-of-Evidence belief revision:
-> evidence grading, a corroboration-aware assessor, Dream State policy
-> injection, evidence-weighted recall, and per-Space knowledge profiles.
+> Latest release: `0.11.0` (2026-07-11) — **Decision Memory**: a
+> git-anchored code-decision domain — mine commits into decision/evidence
+> nodes and ask *why* a file is the way it is (opt-in,
+> `KUMIHO_MEMORY_CODE=1`).
+> Recent highlights: `0.10.1` moved the cross-encoder rerank off the event
+> loop (pure perf; recall byte-identical) · `0.10.0` made the **write-time
+> ontology** the default — typed decomposition into facts/entities/
+> decisions/events plus entity-bridge and fact-recall legs (+0.042 overall /
+> +0.054 fact leg on paired LoCoMo evidence) · `0.9.0` consolidated the
+> full cognitive-recall pipeline into the SDK (graph-augmented recall,
+> hybrid sibling ranking, `compose_context`).
 > See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the full history.
 
 ---
@@ -63,6 +69,18 @@ client-side, no server changes required.
   deprecation (capped, published-protected), tag/metadata enrichment,
   relationship discovery. Accepts deployment policy via
   `extra_instructions`.
+* **Write-time ontology** *(0.10, on by default)* — every consolidation
+  is decomposed into a typed knowledge graph (entities / facts /
+  decisions / events / actions / questions) with deterministic edges;
+  recall consumes the structure via an entity-bridge join and a
+  fact-recall leg, both strictly **additive** (structural evidence never
+  displaces conversation evidence). Opt out with
+  `KUMIHO_MEMORY_ONTOLOGY=0`.
+* **Decision Memory** *(0.11, opt-in)* — a second, code-domain profile:
+  mine git commits into decision nodes with rationale, verbatim evidence
+  atoms, and `{repo, commit, file, line}` anchors, then ask
+  ``why("why is this file like this?", file=...)`` mid-session. See the
+  section below.
 * **Graph-augmented recall** — multi-query reformulation + edge
   traversal + semantic fallback (`GraphAugmentedRecall`).
 * **Sibling revision filtering** — BM25-light or embedding-based
@@ -80,8 +98,8 @@ client-side, no server changes required.
   extraction strategy can adapt per collection.
 * **Skill ingest** — parse and version `SKILL.md` files and reference
   docs into the graph (`kumiho-memory ingest-skill`).
-* **MCP tools** — 13 tool wrappers, auto-discovered by the core `kumiho`
-  MCP server (see table below).
+* **MCP tools** — 13 tool wrappers (15 with Decision Memory enabled),
+  auto-discovered by the core `kumiho` MCP server (see table below).
 
 ---
 
@@ -370,9 +388,54 @@ revision-creation frequency is the documented proxy, valid because
 
 ---
 
+### Decision Memory — the why-layer for a codebase (0.11, opt-in)
+
+git is a lossless graph of *what/when/who*; it cannot hold the ***why***.
+Decision Memory mines commits into typed **decision** nodes (title,
+decision, rationale, the why-question they answer), **verbatim evidence
+atoms** (measurements, review findings — quoted, never paraphrased), and
+git anchors. Code is **never copied**: anchors are
+`{repo, commit_hash, file, line_range}` pointers, and node identity is
+sha-free (`title + author-date`), so rebases and squashes converge instead
+of duplicating — the memory does not rot as history rewrites.
+
+```bash
+export KUMIHO_MEMORY_CODE=1            # opt-in gate (default off)
+kumiho-memory code-ingest . --range HEAD~30..HEAD   # idempotent; re-runs cost zero LLM calls
+```
+
+```python
+result = await manager.code_why(
+    "why is rerank_async a single-worker executor?",
+    file="kumiho_memory/recall_rerank.py", line=420,
+)
+# → decisions with rationale + evidence chains + superseded_by status,
+#   plus an inject-ready markdown context block
+```
+
+Key properties:
+
+* **Three query legs, lexicographic fusion** — a deterministic anchor leg
+  (file → decisions, zero search), a semantic leg, and an evidence-bridge
+  leg. Anchor *facts* always outrank cross-encoder *probabilities*.
+* **Belief revision** — a reversed decision is linked with `SUPERSEDES`,
+  demoted in ranking, and always carries `superseded_by`; an agent never
+  receives a reversed decision as the answer without seeing its
+  replacement.
+* **Physical isolation** — code nodes live in a dedicated
+  `{project}-code` kumiho project; conversation recall is untouched by
+  construction (and by test).
+* Design doc: [`docs/DECISION_MEMORY_DESIGN.md`](docs/DECISION_MEMORY_DESIGN.md).
+  Live-verified on this repo's own history: *"why is the executor
+  single-worker?"* answers with the actual offload commit and its
+  concurrency measurement as evidence.
+
+---
+
 ### MCP Tools
 
-13 tool wrappers, auto-discovered by the core `kumiho` MCP server:
+13 tool wrappers (15 with `KUMIHO_MEMORY_CODE=1`), auto-discovered by the
+core `kumiho` MCP server:
 
 | Tool | Description |
 | ------ | ------------- |
@@ -389,6 +452,8 @@ revision-creation frequency is the documented proxy, valid because
 | `kumiho_memory_reflect` | Buffer response + store captures |
 | `kumiho_memory_dream_state` | Run Dream State consolidation cycle |
 | `kumiho_memory_space_profile` | Profile each Space's knowledge dynamics |
+| `kumiho_code_why` | *(opt-in)* Why is this code the way it is? — anchored decisions + evidence |
+| `kumiho_code_ingest` | *(opt-in)* Mine a git commit range into decision nodes (idempotent) |
 
 ---
 
@@ -408,6 +473,14 @@ revision-creation frequency is the documented proxy, valid because
 | `evidence_rank` | `apply_evidence_weights`, `evidence_badge`, `EvidenceRankConfig` |
 | `space_profiler` | `SpaceProfiler`, `SpaceProfile`, `SpaceSignals`, `get_space_profile`, `SPACE_CLASSES` |
 | `skill_ingest` | `ingest_skill`, `ingest_file`, `ingest_batch`, `parse_skill` |
+| `ontology` | write-time typed decomposition (facts/entities/decisions/events) |
+| `relations` | deterministic edge derivation (`ABOUT`, `DEPENDS_ON`, `SUPERSEDES`) |
+| `entity_promotion` | `EntityPromotionConfig` — entity anchor hubs |
+| `context_compose` | `compose_context`, `collect_top_revisions`, `DEFAULT_CONTEXT_TOP_K` |
+| `recall_rerank` | `RerankConfig`, `rerank`, `rerank_async`, `two_pass_rerank` |
+| `code_decisions` | Decision Memory schema: `CodeMemoryConfig`, slugs, anchors |
+| `code_capture` | `ingest_repo`, `IngestStats` — git commit mining |
+| `code_query` | `why`, `compose_why_context` — the 3-leg why engine |
 | `mcp_tools` | `MEMORY_TOOLS`, `MEMORY_TOOL_HANDLERS` |
 
 ---
@@ -415,7 +488,12 @@ revision-creation frequency is the documented proxy, valid because
 ### Roadmap
 
 * `0.5.x` — Graph-augmented recall, sibling filtering, recall dedup
-* `0.6.x` — Level-of-Evidence belief revision (current)
+* `0.6.x` — Level-of-Evidence belief revision
+* `0.9.x` — Cognitive-recall pipeline consolidated into the SDK
+* `0.10.x` — Write-time ontology on by default (typed knowledge graph)
+* `0.11.x` — Decision Memory: git-anchored code-decision domain (current)
+* next — Decision Memory Phase 2: agent-session mining, conversation↔code
+  bridges, editor-hook auto-capture (see issue #43 / kumiho-plugins#10)
 * `1.0.0` — Stabilized public API, production-ready client SDK
 
 The scope of this package will remain limited to **client-side concerns**
