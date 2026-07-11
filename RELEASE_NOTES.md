@@ -1,5 +1,55 @@
 # Release Notes — kumiho-memory
 
+## v0.12.0
+
+**Release Date:** 2026-07-11
+
+**Decision Memory Phase 2 — session mining.** A commit records *what*
+landed; the session that produced it holds what git loses — the rejected
+alternative, the measurement in its original form, the decision that never
+reached a commit. This release mines the agent-session transcript into the
+same git-anchored decision graph and closes the capture loop
+(commit hook → SessionEnd worker). All opt-in behind `KUMIHO_MEMORY_CODE=1`;
+conversation paths stay byte-identical when gated off.
+
+### Added
+
+- **Session mining** (`code_session.py`): salience selection → budget-capped
+  chunks → LLM structuring → verbatim/sha/`git ls-files`/per-atom-credential
+  validation → **enrich-or-standalone correlation** → additive write → a
+  repo-qualified session marker (written last, completeness-checked).
+  - **Enrichment is additive by invariant** — a session decision that
+    correlates with a commit-mined decision attaches its conversation-only
+    evidence via new nodes + `MOTIVATED_BY`/`DERIVED_FROM`/`DISCUSSED_IN`
+    edges only, never a new revision or a metadata rewrite on the target.
+    Correlation is deterministic (verified-sha or verified-anchor discovery)
+    with signal conjunction; lexical similarity alone can never merge.
+  - **Standalone** — commit-less decisions become `origin="session"` nodes
+    with `role="mentioned"` anchors; rejected alternatives join the
+    embedding text (queries arrive under the *rejected* option's name).
+  - **Bridge** — `DISCUSSED_IN` links a decision to the consolidated
+    conversation revision (cross-project by kref; the conversation project
+    is never written to).
+- **`code-mine-session` CLI** + `parse_claude_transcript()` — the loop-closer
+  surface the plugin SessionEnd worker calls.
+- **MCP** `kumiho_code_mine_session`; **manager** `code_mine_session` + an
+  opt-in consolidation chain (`KUMIHO_MEMORY_CODE_AUTOMINE=1`).
+
+### Changed
+
+- **`--force` is now true deprecate-then-rewrite** (commit and session): the
+  stale generation is retired via `Item.set_deprecated` before re-mining.
+- **Query**: `DERIVED_FROM` routes session markers to `chain.sessions` (no
+  more `{sha:""}` ghost commits); the SUPERSEDES priority sort now runs
+  before the per-decision edge cap so `superseded_by` survives session
+  enrichment; `origin`/`status_hint` passthrough.
+
+### Verification
+
+Unit: 68 code-domain tests (full suite 523 passed). Live dogfood gate 8/8 on
+a CE. Real-session proof: mining a 7,959-turn transcript surfaced actual
+decisions with verbatim measurements and rejected alternatives via `why()`.
+
 ## v0.11.0
 
 **Release Date:** 2026-07-11
