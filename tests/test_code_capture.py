@@ -574,3 +574,40 @@ def test_rewrite_convergence_no_duplicates(tmp_path, monkeypatch):
         if k == "code_decision"
     ])
     assert decisions_after == decisions_before  # converged, not duplicated
+
+
+def test_force_deprecates_then_rewrites(tmp_path, monkeypatch):
+    """--force (design §4.6): the commit's stale decisions are deprecated
+    (in-place status too), then re-mining writes a fresh revision and
+    restores converged items."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    commits = enumerate_commits(str(repo), None, 10)
+    adapter = _StubAdapter(_payload_for(commits))
+
+    # deprecated 플래그를 지원하도록 페이크 확장
+    _MemItem.deprecated = False
+    def set_deprecated(self, status):
+        self.deprecated = bool(status)
+    _MemItem.set_deprecated = set_deprecated
+    def set_attribute(self, key, value):
+        self.metadata[key] = value
+        return True
+    _MemRev.set_attribute = set_attribute
+
+    asyncio.run(ingest_repo(str(repo), None, project_name="p-code",
+                            config=cfg, adapter=adapter, model="stub"))
+    project = _FAKE.projects["p-code"]
+    dec_items = [i for (s, k), i in project.items.items() if k == "code_decision"]
+    revs_before = {i.slug: len(i.revisions) for i in dec_items}
+    assert dec_items and all(not i.deprecated for i in dec_items)
+
+    stats = asyncio.run(ingest_repo(str(repo), None, project_name="p-code",
+                                    config=cfg, adapter=adapter, model="stub",
+                                    force=True))
+    assert stats.deprecated >= 1                     # pre-pass retired old gen
+    for i in dec_items:
+        assert not i.deprecated                      # converged -> restored
+        assert len(i.revisions) > revs_before[i.slug]  # fresh revision written
+        assert i.revisions[-1].metadata.get("status") == "active"

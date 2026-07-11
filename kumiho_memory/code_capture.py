@@ -103,6 +103,7 @@ class IngestStats:
     anchors: int = 0
     edges: int = 0
     superseded: int = 0
+    deprecated: int = 0
     failed_commits: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
@@ -499,6 +500,50 @@ def _create_edge_once(src_rev: Any, target_rev: Any, edge_type: str,
     stats.edges += 1
 
 
+def _force_deprecate_commit_decisions(
+    project: Any, config: CodeMemoryConfig, slug: str, stats: IngestStats,
+) -> None:
+    """--force pre-pass (design §4.6): deprecate the commit's existing
+    decision nodes before re-mining, so a prompt-upgraded extraction never
+    leaves orphaned stale generations behind.
+
+    Only DECISION items are deprecated — evidence atoms are shared across
+    decisions (slugged on their verbatim statement) and may be referenced by
+    other commits' decisions.  The revision also gets ``status=deprecated``
+    in place so query-side ranking demotes it even before the item-level
+    flag propagates to search filters.
+    """
+    import kumiho
+
+    try:
+        item = project.get_item(slug, KIND_COMMIT,
+                                parent_path=f"/{project.name}/{config.commits_space}")
+        marker_rev = item.get_latest_revision()
+    except Exception:  # noqa: BLE001 — no marker, nothing to deprecate
+        return
+    if marker_rev is None:
+        return
+    try:
+        edges = marker_rev.get_edges(edge_type_filter=EDGE_DERIVED_FROM,
+                                     direction=kumiho.INCOMING)
+    except Exception:  # noqa: BLE001
+        return
+    for edge in edges or []:
+        src = getattr(getattr(edge, "source_kref", None), "uri", "")
+        if not src:
+            continue
+        try:
+            rev = kumiho.get_revision(src)
+            meta = getattr(rev, "metadata", {}) or {}
+            if "decision" not in meta:
+                continue  # evidence atom — shared, never deprecated here
+            rev.set_attribute("status", "deprecated")
+            rev.get_item().set_deprecated(True)
+            stats.deprecated += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("code capture: force deprecation failed for %s: %s", src, exc)
+
+
 def _marker_complete(project: Any, config: CodeMemoryConfig, slug: str) -> bool:
     """A commit counts as captured only when its marker revision exists AND
     its promised provenance edges are present.
@@ -609,6 +654,7 @@ def _sync_write_commit(
     decisions: List[Dict[str, Any]],
     capture_version: str,
     stats: IngestStats,
+    force: bool = False,
 ) -> None:
     """Stages [6]-[8] for one commit.  Crash-safe: the marker revision is
     the very last write, so any partial failure leaves the commit unmarked
@@ -680,8 +726,17 @@ def _sync_write_commit(
         item = get_or_create_decision_item(
             project, config, meta["title"], commit.author_date, meta["decision"],
         )
+        if force and getattr(item, "deprecated", False):
+            # Re-captured decision converged on a force-deprecated item —
+            # restore it; the fresh revision below carries the new content.
+            try:
+                item.set_deprecated(False)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("code capture: un-deprecate failed: %s", exc)
         decision_rev = item.get_latest_revision()
-        if decision_rev is None:
+        if decision_rev is None or force:
+            # force always writes a NEW revision — a re-capture exists to
+            # replace stale extraction content, not to converge silently.
             decision_rev = write_revision(
                 item, meta, _compose_embedding_text(meta, commit.subject),
             )
@@ -714,7 +769,7 @@ def _sync_write_commit(
         project, slug, KIND_COMMIT, f"/{project_name}/{config.commits_space}",
     )
     marker_rev = marker_item.get_latest_revision()
-    if marker_rev is None:
+    if marker_rev is None or force:
         marker_rev = write_revision(marker_item, {
             "repo": repo,
             "hash": commit.hash,
@@ -777,6 +832,17 @@ async def ingest_repo(
             return False
         return _marker_complete(project, config, commit_slug(repo, sha))
 
+    def _sync_force_deprecate(sha: str) -> bool:
+        import kumiho
+
+        project = kumiho.get_project(project_name)
+        if project is None:
+            return False
+        _force_deprecate_commit_decisions(
+            project, config, commit_slug(repo, sha), stats,
+        )
+        return True
+
     pending: List[CommitInfo] = []
     for c in commits:
         if not force:
@@ -788,6 +854,14 @@ async def ingest_repo(
             if marked:
                 stats.skipped_marker += 1
                 continue
+        else:
+            # design §4.6 deprecate-then-rewrite: retire the commit's stale
+            # decision generation before re-mining it.
+            await run_bounded_in_thread(
+                lambda sha=c.hash: _sync_force_deprecate(sha),
+                timeout=config.write_timeout, label="code force deprecate",
+                on_timeout=False, on_error=False,
+            )
         # Changed files are loaded BEFORE the prefilter: its trivial-subject
         # rule reads commit.files, and evaluating it against a not-yet-loaded
         # empty list silently dropped every bodyless short-subject commit
@@ -865,6 +939,7 @@ async def ingest_repo(
             ok = await run_bounded_in_thread(
                 lambda c=c, d=decisions: _sync_write_commit(
                     project_name, config, repo, c, d, capture_version, stats,
+                    force=force,
                 ) or True,
                 timeout=config.write_timeout, label="code commit write",
                 on_timeout=None, on_error=None,

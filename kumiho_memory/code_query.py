@@ -385,7 +385,7 @@ def _sort_candidates(
     """
     def key(c: Dict[str, Any]) -> Tuple:
         meta = c["meta"]
-        active = 0 if str(meta.get("status", "active")) == "superseded" else 1
+        active = 0 if str(meta.get("status", "active")) in ("superseded", "deprecated") else 1
         if ce_by_kref is not None and c["kref"] in ce_by_kref:
             prob = ce_by_kref[c["kref"]]
         else:
