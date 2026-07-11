@@ -1,5 +1,17 @@
 # Release Notes — kumiho-memory
 
+## v0.12.1
+
+**Release Date:** 2026-07-11
+
+Dependency fix — requires **`kumiho>=0.10.5`**. Decision Memory imports
+`kumiho._text.slugify`, which the published core 0.10.4 predates (it landed
+on the core repo after that tag without a re-publish). Against PyPI 0.10.4,
+`from kumiho._text import slugify` failed with `ModuleNotFoundError` — so
+Decision Memory could not actually run from a clean install. Pinning
+`kumiho>=0.10.5` (published alongside this release) resolves it. No behavior
+change to session mining itself.
+
 ## v0.12.0
 
 **Release Date:** 2026-07-11
