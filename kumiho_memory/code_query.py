@@ -288,13 +288,19 @@ def _sync_evidence_bridge_leg(
 # Evidence-chain expansion (§5.3 — after the limit cut)
 # ---------------------------------------------------------------------------
 
-def _sync_expand_chain(kref: str, max_fetch: int) -> Dict[str, Any]:
-    import kumiho
-
-    chain: Dict[str, Any] = {
+def _empty_chain() -> Dict[str, Any]:
+    """The chain shape every answer carries, even when expansion fails —
+    single source so the fallback literal can never drift from the walker."""
+    return {
         "evidence": [], "commits": [], "sessions": [], "supersedes": [],
         "superseded_by": None, "conversation": None,
     }
+
+
+def _sync_expand_chain(kref: str, max_fetch: int) -> Dict[str, Any]:
+    import kumiho
+
+    chain = _empty_chain()
     try:
         rev = kumiho.get_revision(kref)
         edges = rev.get_edges(direction=kumiho.BOTH)
@@ -585,8 +591,7 @@ async def why(
             functools.partial(_sync_expand_chain, cand["kref"], max_fetch),
             timeout=QUERY_TIMEOUT, label="code why chain",
             on_timeout=None, on_error=None,
-        ) or {"evidence": [], "commits": [], "sessions": [], "supersedes": [],
-              "superseded_by": None, "conversation": None}
+        ) or _empty_chain()
         answers.append(_answer_from(cand, chain))
 
     result: Dict[str, Any] = {

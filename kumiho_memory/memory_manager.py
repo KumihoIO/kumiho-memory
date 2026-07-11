@@ -15,7 +15,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from kumiho_memory.evidence import EVIDENCE_LEVELS, evidence_tag
 from kumiho_memory.privacy import PIIRedactor
@@ -1947,6 +1947,29 @@ class UniversalMemoryManager:
 
         return two_pass_rerank(query, memories, self.embedding_adapter)
 
+    _CODE_MEMORY_DISABLED = "code memory is disabled (set KUMIHO_MEMORY_CODE=1)"
+
+    def _code_memory_context(self) -> Optional[Tuple[Any, str, Any, str]]:
+        """Gate + shared wiring for the Decision Memory delegations.
+
+        ``(cfg, project_name, adapter, model)`` when ``KUMIHO_MEMORY_CODE=1``,
+        else ``None``.  The LLM wiring reuses the summarizer's adapter +
+        light model — no separate key.  Lazy import so the conversation
+        paths carry zero code-domain imports while the gate is off.
+        """
+        from kumiho_memory.code_decisions import (
+            code_memory_enabled, config_from_env, resolve_project_name,
+        )
+
+        if not code_memory_enabled():
+            return None
+        cfg = config_from_env()
+        adapter = getattr(self.summarizer, "adapter", None)
+        model = getattr(self.summarizer, "light_model", "") or getattr(
+            self.summarizer, "model", "",
+        )
+        return cfg, resolve_project_name(self.project, cfg), adapter, model
+
     async def code_why(
         self,
         question: Optional[str] = None,
@@ -1966,22 +1989,19 @@ class UniversalMemoryManager:
         (physical isolation from conversation recall); see
         ``docs/DECISION_MEMORY_DESIGN.md``.
         """
-        from kumiho_memory.code_decisions import (
-            code_memory_enabled, config_from_env, resolve_project_name,
-        )
-
-        if not code_memory_enabled():
+        ctx = self._code_memory_context()
+        if ctx is None:
             return {
                 "decisions": [], "context": "",
-                "error": "code memory is disabled (set KUMIHO_MEMORY_CODE=1)",
+                "error": self._CODE_MEMORY_DISABLED,
             }
         from kumiho_memory.code_query import why
 
-        cfg = config_from_env()
+        cfg, project_name, _adapter, _model = ctx
         return await why(
             question,
             file=file, line=line, commit=commit, repo=repo, limit=limit,
-            project_name=resolve_project_name(self.project, cfg),
+            project_name=project_name,
             config=cfg,
             reranker=self.reranker,
         )
@@ -1996,25 +2016,17 @@ class UniversalMemoryManager:
     ) -> Dict[str, Any]:
         """Mine a git commit range into Decision Memory (opt-in, gated).
 
-        Same lazy/gated shape as :meth:`code_why`.  Reuses the summarizer's
-        LLM adapter + light model for structuring — no separate key.
+        Same lazy/gated shape as :meth:`code_why`.
         """
-        from kumiho_memory.code_decisions import (
-            code_memory_enabled, config_from_env, resolve_project_name,
-        )
-
-        if not code_memory_enabled():
-            return {"errors": ["code memory is disabled (set KUMIHO_MEMORY_CODE=1)"]}
+        ctx = self._code_memory_context()
+        if ctx is None:
+            return {"errors": [self._CODE_MEMORY_DISABLED]}
         from kumiho_memory.code_capture import ingest_repo
 
-        cfg = config_from_env()
-        adapter = getattr(self.summarizer, "adapter", None)
-        model = getattr(self.summarizer, "light_model", "") or getattr(
-            self.summarizer, "model", "",
-        )
+        cfg, project_name, adapter, model = ctx
         stats = await ingest_repo(
             repo_path, rev_range,
-            project_name=resolve_project_name(self.project, cfg),
+            project_name=project_name,
             config=cfg, adapter=adapter, model=model,
             force=force, max_commits=max_commits,
         )
@@ -2044,19 +2056,12 @@ class UniversalMemoryManager:
         workflow); already-captured commits are marker-skipped at zero LLM
         cost.
         """
-        from kumiho_memory.code_decisions import (
-            code_memory_enabled, config_from_env, resolve_project_name,
-        )
-
-        if not code_memory_enabled():
-            return {"errors": ["code memory is disabled (set KUMIHO_MEMORY_CODE=1)"]}
+        ctx = self._code_memory_context()
+        if ctx is None:
+            return {"errors": [self._CODE_MEMORY_DISABLED]}
         from kumiho_memory.code_session import mine_session
 
-        cfg = config_from_env()
-        adapter = getattr(self.summarizer, "adapter", None)
-        model = getattr(self.summarizer, "light_model", "") or getattr(
-            self.summarizer, "model", "",
-        )
+        cfg, project_name, adapter, model = ctx
         if ingest_first:
             try:
                 await self.code_ingest(repo_path)
@@ -2064,7 +2069,7 @@ class UniversalMemoryManager:
                 logger.warning("code session mining: pre-ingest failed: %s", exc)
         stats = await mine_session(
             session_id,
-            project_name=resolve_project_name(self.project, cfg),
+            project_name=project_name,
             messages=messages,
             conversation_kref=conversation_kref,
             repo_path=repo_path,

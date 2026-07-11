@@ -983,6 +983,132 @@ def test_resolve_tracked_path_unique_suffix():
     assert _resolve_tracked_path("", tracked) == ""
 
 
+def test_chunk_cap_pins_frame_chunks():
+    """§2.3: over the chunk cap, the first and last chunks carry the session
+    frame (goal statement / closing agreement) and are pinned — density
+    eviction competes only over the middle.  Whole-chunk drop of the
+    low-density opening chunk was a reviewed spec violation."""
+    cfg = _cfg(session_chunk_chars=120, session_max_chunks=2)
+    texts = (
+        ["opening goal statement, low salience filler chatter here"]
+        + [f"decided measured 12% instead of rather than rejected option {i}"
+           for i in range(6)]
+        + ["closing agreement, also low salience"]
+    )
+    selected = [
+        {"index": i, "role": "user", "timestamp": "", "content": t,
+         "score": 5 if 0 < i < 7 else 0}
+        for i, t in enumerate(texts)
+    ]
+    packets = build_chunks("s1", selected, cfg)
+    assert len(packets) == 2
+    assert "opening goal statement" in packets[0]   # frame pinned
+    assert "closing agreement" in packets[-1]       # frame pinned
+
+
+def _bge_payload(quote):
+    return _payload([{
+        "title": "Defer the bge-m3 embedding migration",
+        "decision": "defer the bge-m3 migration until after the release cycle",
+        "rationale": "release first", "why_question": "why deferred?",
+        "symbols": [], "files": [], "mentioned_commits": [],
+        "alternatives": [{"option": "migrate now", "verdict": "deferred",
+                          "quote": quote, "quote_en": "", "message_index": 1}],
+        "evidence": [], "settled_by_message": 2,
+        "status_hint": "uncommitted", "confidence": "high",
+    }])
+
+
+class _StubSessionRedactor:
+    """Deterministic PIIRedactor stand-in: rewrites the email, raises on
+    the key pattern (privacy.reject_credentials raises; verified)."""
+
+    def anonymize_summary(self, text):
+        return text.replace("bob@example.com", "[EMAIL]")
+
+    def reject_credentials(self, text):
+        if "sk-" in text:
+            raise ValueError("credential detected")
+
+
+def test_session_line_is_redacted_before_storage(monkeypatch, tmp_path):
+    """§5.1: session_line feeds STORED embedding_text (marker + standalone
+    decisions) — the raw first user turn must never reach the store."""
+    repo, _sha = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+
+    quote = "defer the bge-m3 migration because the release cycle comes first"
+    msgs = [_msg("user", "bob@example.com asked: migrate the embeddings now?"),
+            _msg("assistant", quote),
+            _msg("user", "yes, agreed")]
+    stats = _mine(repo, _StubAdapter(_bge_payload(quote)), messages=msgs,
+                  redactor=_StubSessionRedactor())
+    assert stats.decisions_created == 1
+    assert _FAKE.embedding_texts
+    assert all("bob@example.com" not in t for t in _FAKE.embedding_texts)
+    assert any("[EMAIL]" in t for t in _FAKE.embedding_texts)
+
+
+def test_session_line_with_credential_is_dropped(monkeypatch, tmp_path):
+    """A pasted key in the first user turn drops the session_line atom
+    (per-atom screen) — the session itself still mines."""
+    repo, _sha = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+
+    quote = "defer the bge-m3 migration because the release cycle comes first"
+    msgs = [_msg("user", "my key is sk-abcdefghijklmnop — also, migrate now?"),
+            _msg("assistant", quote),
+            _msg("user", "yes, agreed")]
+    stats = _mine(repo, _StubAdapter(_bge_payload(quote)), messages=msgs,
+                  redactor=_StubSessionRedactor())
+    assert stats.decisions_created == 1          # the SESSION survives
+    assert stats.credentials_dropped >= 1
+    assert all("sk-" not in t for t in _FAKE.embedding_texts)
+
+
+def test_correlate_anchored_dead_zone_regression(monkeypatch, tmp_path):
+    """S2 regression: lex moved to FULL prose (honest pairs ~0.26), so the
+    anchored floor moved to the same measured basis — a same-decision pair
+    below the draft's 0.35 floor must still enrich via the anchor + symbol
+    conjunction instead of splitting into a duplicate standalone."""
+    repo, sha = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    import kumiho
+
+    project = kumiho.create_project("p-code")
+    target = _seed_commit_decision(
+        project, "repo", sha,
+        title="offload fastembed cross-encoder rerank",
+        decision="offload the cross-encoder rerank processing to a dedicated "
+                 "single-worker executor instead of blocking the event loop",
+        symbols="rerank_async", decided_at="2026-07-10T12:00:00+00:00",
+    )
+    target.metadata["rationale"] = "inline CE blocked the loop under the harness"
+    target.metadata["why_question"] = "why is the rerank offloaded?"
+
+    cand = _candidate(
+        title="Use a Dedicated ThreadPoolExecutor for Inference Serialization",
+        decision="Commit to using a dedicated single-worker "
+                 "ThreadPoolExecutor for inference serialization.",
+        rationale="The default executor oversubscribes the cross-encoder "
+                  "with a shared 32-thread pool, causing issues with the "
+                  "event loop.",
+        why_question="Why did we choose a dedicated ThreadPoolExecutor "
+                     "instead of asyncio.to_thread?",
+        symbols=["rerank_async"],
+        files=["rerank.py"],
+        verified_commits={},
+    )
+    # Pin the scenario inside the dead zone the draft floor created.
+    from kumiho_memory.code_session import _lex_text
+    from kumiho_memory.relations import _jaccard, _tokens
+
+    lex = _jaccard(_tokens(_lex_text(cand)), _tokens(_lex_text(target.metadata)))
+    assert 0.20 <= lex < 0.35, f"pair drifted out of the dead zone: {lex:.2f}"
+    hit = correlate(project, _cfg(), "repo", cand, "2026-07-11T12:00:00+00:00")
+    assert hit is not None and hit["correlation"] == "anchored"
+
+
 def test_correlate_lex_uses_full_prose(monkeypatch, tmp_path):
     """Dogfood-calibrated: a live same-decision pair measured 0.14 on
     title+decision but 0.26 on full prose — rationale carries the shared

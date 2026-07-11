@@ -51,21 +51,25 @@ from kumiho_memory.code_decisions import (
     EVIDENCE_KINDS,
     KIND_ANCHOR,
     KIND_COMMIT,
-    KIND_DECISION,
     KIND_EVIDENCE,
     KIND_SESSION,
     SCHEMA_VERSION,
     CodeMemoryConfig,
     anchor_slug,
     commit_slug,
+    deprecate_marker_decisions,
+    edge_source_uri,
+    edge_target_uri,
     ensure_space,
     evidence_slug,
     get_or_create_anchor,
     get_or_create_decision_item,
     get_or_create_item,
+    marker_provenance_complete,
     normalize_path,
     parse_decided_at,
     session_slug,
+    undeprecate_item,
     write_revision,
 )
 
@@ -340,13 +344,28 @@ def build_chunks(
     chunks = [c for c in chunks if c[0]]
 
     if len(chunks) > config.session_max_chunks:
-        density = [
-            (sum(sc) / max(1, len(sc)), i) for i, (_, sc) in enumerate(chunks)
+        # Frame preservation (§2.3): the first and last chunks carry the
+        # session frame — the goal statement and the closing agreement —
+        # and are pinned ("무조건 포함"); density eviction only competes
+        # over the middle.  Without the pin, a low-density opening chunk
+        # (the goal is often stated before any high-salience signal) was
+        # dropped wholesale.
+        pinned = {0, len(chunks) - 1}
+        budget = config.session_max_chunks - len(pinned)
+        middle = [
+            (sum(sc) / max(1, len(sc)), i)
+            for i, (_, sc) in enumerate(chunks) if i not in pinned
         ]
-        keep_idx = {
-            i for _, i in sorted(density, key=lambda t: t[0], reverse=True)
-            [: config.session_max_chunks]
+        keep_idx = set(pinned) | {
+            i for _, i in sorted(middle, key=lambda t: t[0], reverse=True)
+            [: max(0, budget)]
         }
+        if config.session_max_chunks < len(pinned):
+            # Pathological cap (<2): keep the denser of the frame chunks.
+            keep_idx = {max(
+                pinned,
+                key=lambda i: sum(chunks[i][1]) / max(1, len(chunks[i][1])),
+            )}
         chunks = [c for i, c in enumerate(chunks) if i in keep_idx]
 
     total = len(chunks)
@@ -388,7 +407,7 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _structuring_schema(config: CodeMemoryConfig) -> Dict[str, Any]:
+def _structuring_schema() -> Dict[str, Any]:
     def obj(props: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "type": "object",
@@ -440,7 +459,7 @@ async def _structure_chunk(
         system=_SYSTEM_PROMPT,
         max_tokens=8192,
         json_mode={"name": "session_decisions",
-                   "schema": _structuring_schema(config)},
+                   "schema": _structuring_schema()},
     )
     data = json.loads(raw)
     return list(data.get("decisions", []))
@@ -641,7 +660,7 @@ def _decision_sources_of(rev: Any, edge_type: str) -> List[Any]:
     except Exception:  # noqa: BLE001
         return out
     for edge in edges or []:
-        src = getattr(getattr(edge, "source_kref", None), "uri", "")
+        src = edge_source_uri(edge)
         if not src:
             continue
         try:
@@ -816,7 +835,7 @@ def _existing_evidence_statements(decision_rev: Any) -> List[str]:
     except Exception:  # noqa: BLE001
         return out
     for edge in edges or []:
-        dst = getattr(getattr(edge, "target_kref", None), "uri", "")
+        dst = edge_target_uri(edge)
         if not dst:
             continue
         try:
@@ -980,36 +999,18 @@ def _bridge(
 
 
 def _session_marker_complete(project: Any, config: CodeMemoryConfig, slug: str) -> Tuple[bool, Optional[Any]]:
-    """Marker-completeness check (the commit `_marker_complete` pattern):
-    the marker revision must exist AND carry at least the promised number of
-    incoming DERIVED_FROM edges — a crash between marker and edges becomes a
-    retry instead of silent provenance loss.  Returns (complete, marker_rev)."""
-    import kumiho
-
+    """Marker-completeness check (see
+    :func:`code_decisions.marker_provenance_complete`): the promised edge
+    count is the sum of the three per-session counters.  Returns
+    (complete, marker_rev)."""
     try:
         item = project.get_item(slug, KIND_SESSION,
                                 parent_path=f"/{project.name}/{config.sessions_space}")
     except Exception:  # noqa: BLE001
         return False, None
-    if item is None:
-        return False, None
-    try:
-        rev = item.get_latest_revision()
-        if rev is None:
-            return False, None
-        meta = getattr(rev, "metadata", {}) or {}
-        expected = (
-            int(meta.get("decisions_created", "0") or 0)
-            + int(meta.get("decisions_enriched", "0") or 0)
-            + int(meta.get("evidence_added", "0") or 0)
-        )
-        if expected <= 0:
-            return True, rev
-        edges = rev.get_edges(edge_type_filter=EDGE_DERIVED_FROM,
-                              direction=kumiho.INCOMING)
-        return len(edges or []) >= expected, rev
-    except Exception:  # noqa: BLE001
-        return False, None
+    return marker_provenance_complete(
+        item, ("decisions_created", "decisions_enriched", "evidence_added"),
+    )
 
 
 def _force_deprecate_session_decisions(
@@ -1018,46 +1019,25 @@ def _force_deprecate_session_decisions(
 ) -> None:
     """--force pre-pass, session flavor of the commit pattern.
 
-    The guard is the essence: the marker's INCOMING DERIVED_FROM sources
-    include commit-origin decisions this session merely ENRICHED (the audit
-    hub, §3.4) — copying the commit pattern verbatim would deprecate someone
+    The skip predicate is the essence: the marker's INCOMING DERIVED_FROM
+    sources include commit-origin decisions this session merely ENRICHED
+    (the audit hub, §3.4) — the bare commit pattern would deprecate someone
     else's commit decisions.  Only ``origin == "session"`` decisions of THIS
     session are retired; evidence atoms are shared assets and never touched.
     """
-    import kumiho
-
     try:
         item = project.get_item(slug, KIND_SESSION,
                                 parent_path=f"/{project.name}/{config.sessions_space}")
         marker_rev = item.get_latest_revision() if item is not None else None
     except Exception:  # noqa: BLE001
         return
-    if marker_rev is None:
-        return
-    try:
-        edges = marker_rev.get_edges(edge_type_filter=EDGE_DERIVED_FROM,
-                                     direction=kumiho.INCOMING)
-    except Exception:  # noqa: BLE001
-        return
-    for edge in edges or []:
-        src = getattr(getattr(edge, "source_kref", None), "uri", "")
-        if not src:
-            continue
-        try:
-            rev = kumiho.get_revision(src)
-            meta = getattr(rev, "metadata", {}) or {}
-            if "decision" not in meta:
-                continue  # evidence atom — shared, never deprecated
-            if str(meta.get("origin", "")) != "session":
-                continue  # enriched commit decision — NOT this force's to retire
-            if str(meta.get("session_id", "")) != session_id:
-                continue
-            rev.set_attribute("status", "deprecated")
-            rev.get_item().set_deprecated(True)
-            stats.deprecated += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("code session: force deprecation failed for %s: %s",
-                         src, exc)
+    deprecate_marker_decisions(
+        marker_rev, stats,
+        skip=lambda meta: (
+            str(meta.get("origin", "")) != "session"
+            or str(meta.get("session_id", "")) != session_id
+        ),
+    )
 
 
 def _sync_write_session(
@@ -1160,11 +1140,8 @@ def _sync_write_session(
         item = get_or_create_decision_item(
             project, config, meta["title"], settled_ts, meta["decision"],
         )
-        if force and getattr(item, "deprecated", False):
-            try:
-                item.set_deprecated(False)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("code session: un-deprecate failed: %s", exc)
+        if force:
+            undeprecate_item(item)
         decision_rev = item.get_latest_revision()
         if decision_rev is None or force:
             decision_rev = write_revision(
@@ -1222,8 +1199,6 @@ def _sync_write_session(
 
 
 def _sync_bridge_only_pass(
-    project_name: str,
-    config: CodeMemoryConfig,
     marker_rev: Any,
     conversation_kref: str,
     session_id: str,
@@ -1364,8 +1339,7 @@ async def mine_session(
                 if conversation_kref and conversation_kref != recorded_kref:
                     await run_bounded_in_thread(
                         lambda: _sync_bridge_only_pass(
-                            project_name, config, marker_rev,
-                            conversation_kref, session_id, stats,
+                            marker_rev, conversation_kref, session_id, stats,
                         ) or True,
                         timeout=config.write_timeout,
                         label="code session bridge pass",
@@ -1427,10 +1401,21 @@ async def mine_session(
             settled = -1
         d["_settled_ts"] = ts_by_index.get(settled, "") or last_ts
 
+    # session_line feeds STORED embedding_text (marker + standalone
+    # decisions), so it must go through the same redaction/credential
+    # discipline as everything else that leaves the machine (§5.1: the
+    # stored text stream is redacted text, no exceptions).  Redact and
+    # screen the FULL first user line before truncating — an 80-char cut
+    # could split a credential right past the detector.
     session_line = ""
     for m in normalized:
         if m["role"] == "user":
-            session_line = " ".join(m["content"].split())[:80]
+            line = " ".join(m["content"].split())
+            if redactor is not None:
+                line = redactor.anonymize_summary(line)
+                if _drop_if_credential(redactor, line, stats):
+                    line = ""
+            session_line = line[:80]
             break
 
     # --- [6]-[9] write (single sync worker, marker last)

@@ -11,8 +11,10 @@ Machine-judged (verbatim evidence makes substring matching honest):
 
   [2] enrich, don't create        (both correlation failure directions)
   [3] additive constitution       (before/after snapshot byte-identical)
-  [4] why() surfaces the alternative with session:* provenance, no ghost sha
-  [5] standalone control          (origin=session, semantic recovery)
+  [4] why() surfaces the alternative with session:* provenance, no ghost
+      sha, and the bridge kref on the enriched decision (§7.2: session A
+      is mined with the conversation kref in-band)
+  [5] standalone control          (origin=session, match=="semantic")
   [6] idempotent re-mine          (zero LLM calls, zero new nodes)
   [7] bridge-only reconciliation  (DISCUSSED_IN resolves to the kref)
 
@@ -78,6 +80,26 @@ def _messages_standalone():
          "agreed, decided: defer the bge-m3 migration until after the "
          "release cycle"},
     ]
+
+
+def _conversation_rev(project, slug, title):
+    """Get-or-create a synthetic consolidated-conversation revision (the
+    bridge target a real consolidation would have produced)."""
+    try:
+        project.create_space("conversations")
+    except Exception:  # noqa: BLE001 — exists
+        pass
+    try:
+        item = project.create_item(
+            slug, "memory", parent_path=f"/{PROJECT}/conversations",
+        )
+    except Exception:  # noqa: BLE001 — exists from a previous run
+        item = project.get_item(
+            slug, "memory", parent_path=f"/{PROJECT}/conversations",
+        )
+    return item.get_latest_revision() or item.create_revision(
+        metadata={"title": title},
+    )
 
 
 def _find_cfec845_decision(result_decisions):
@@ -159,12 +181,21 @@ async def main() -> int:
         return 1
     print(f"    before-snapshot: {before['kref']}")
 
+    # conversation revision for session A — §7.2 mines A with the kref
+    # in-band (the AUTOMINE chain's shape) so [4] can assert the bridge.
+    import kumiho
+
+    conv_a_kref = _conversation_rev(
+        kumiho.get_project(PROJECT), "dogfood-conv-a", "the rerank offload chat",
+    ).kref.uri
+
     # [1]+[2] mine the enrichment session
     print("[2] mine session A (enrichment)")
     stats = await mine_session(
         SESSION_A, project_name=PROJECT,
         messages=_messages_enrich(sha7), repo_path=REPO,
         config=cfg, adapter=adapter, model=model, redactor=redactor,
+        conversation_kref=conv_a_kref,
     )
     print(json.dumps(stats.as_dict(), indent=2, default=str))
     if args.preflight:
@@ -211,6 +242,10 @@ async def main() -> int:
         c.get("sha") for d in r.get("decisions", []) for c in d.get("commits", [])
     )
     checks["[4] alternative-with-session-provenance"] = hit is not None
+    checks["[4] bridge-on-enriched"] = (
+        hit is not None
+        and (hit.get("conversation") or {}).get("kref") == conv_a_kref
+    )
     checks["[4] no-ghost-commits"] = no_ghosts
     for d in top3:
         print(f"    - {d.get('title', '')} (origin={d.get('origin')})")
@@ -230,6 +265,7 @@ async def main() -> int:
     top3_b = rb.get("decisions", [])[:3]
     checks["[5] standalone-capture"] = stats_b.decisions_created >= 1 and any(
         d.get("origin") == "session"
+        and d.get("match") == "semantic"
         and "bge" in (d.get("title", "") + d.get("decision", "")).lower()
         for d in top3_b
     )
@@ -242,6 +278,7 @@ async def main() -> int:
         SESSION_A, project_name=PROJECT,
         messages=_messages_enrich(sha7), repo_path=REPO,
         config=cfg, adapter=adapter, model=model, redactor=redactor,
+        conversation_kref=conv_a_kref,
     )
     checks["[6] idempotent"] = (
         stats2.skipped_marker and stats2.llm_calls == 0
@@ -251,26 +288,9 @@ async def main() -> int:
     # [7] bridge-only reconciliation: a conversation revision materializes
     # later; the pass backfills DISCUSSED_IN with zero LLM calls.
     print("[7] bridge-only reconciliation")
-    import kumiho
-
-    project = kumiho.get_project(PROJECT)
-    try:
-        project.create_space("conversations")
-    except Exception:  # noqa: BLE001 — exists
-        pass
-    conv_item = None
-    try:
-        conv_item = project.create_item(
-            "dogfood-conv-b", "memory", parent_path=f"/{PROJECT}/conversations",
-        )
-    except Exception:  # noqa: BLE001 — exists from a previous run
-        conv_item = project.get_item(
-            "dogfood-conv-b", "memory", parent_path=f"/{PROJECT}/conversations",
-        )
-    conv_rev = conv_item.get_latest_revision() or conv_item.create_revision(
-        metadata={"title": "the bge-m3 deferral chat"},
-    )
-    conv_kref = conv_rev.kref.uri
+    conv_kref = _conversation_rev(
+        kumiho.get_project(PROJECT), "dogfood-conv-b", "the bge-m3 deferral chat",
+    ).kref.uri
     stats3 = await mine_session(
         SESSION_B, project_name=PROJECT,
         messages=_messages_standalone(), repo_path=REPO,

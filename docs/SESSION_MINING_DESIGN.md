@@ -210,7 +210,9 @@ score(msg) = Σ
 
 **[iii] 상한** — `session_chunk_chars=18000`(~4.5k tokens), `session_max_chunks=6` =
 세션당 LLM 콜 하드캡 6, 동시 2 (`asyncio.Semaphore`). 초과 시 salience 밀도(청크 내 평균
-score) 상위 유지.
+score) 상위 유지 — 단, **첫/끝 청크는 프레임 담지자로서 고정** (§[i]의 "첫 2 + 끝 3 무조건
+포함"이 청크 단위 탈락으로 무효화되면 안 된다; 목표 진술 청크는 저밀도이기 쉽다 — 리뷰
+반영, 2026-07-11). 밀도 경쟁은 중간 청크들 사이에서만.
 
 **비용 모델**: 전형 200-메시지 세션 = salience 후 40-60 메시지 → 2-3청크 → **$0.005-0.02**
 (light_model). 최악 6청크 ~$0.05 — `code_ingest` 30-커밋 예산과 같은 자릿수.
@@ -254,7 +256,11 @@ ENRICH(target) iff:
   [S1: sha 경로]    target ∈ T1  AND  lex ≥ 0.20         # sha가 사실을 증언 — lex는 sanity floor
                     # (도그푸드 실측 보정: 정직한 동일-결정 쌍 ~0.26, 오인용-sha
                     #  음성 ~0.1 — 0.20이 여유를 갖고 가른다. 초안의 0.25는 미측정)
-  [S2: anchor 경로] target ∈ T2  AND  lex ≥ 0.35
+  [S2: anchor 경로] target ∈ T2  AND  lex ≥ 0.20
+                    # (리뷰 반영, 2026-07-11: lex가 FULL prose로 재정의되면서
+                    #  anchored floor도 같은 실측 기준으로 이동 — 정직한 쌍 ~0.26에
+                    #  초안의 0.35는 데드존이었다. 구조 신호는 floor가 아니라
+                    #  아래 symbol/blind 합류와 14일 창이 담당한다)
                     AND (symbol_overlap ≥ 1  OR  lex ≥ 0.50)
                     AND |parse_decided_at(target) − session_ts| ≤ 14일
 둘 다 실패 → STANDALONE (§3.5)
@@ -410,7 +416,7 @@ session_max_alternatives_per_decision: int = 4
 evidence_dup_jaccard: float = 0.8
 evidence_containment: float = 0.6              # verbatim 완화 매치 (§5.1 [4])
 correlate_jaccard_sha: float = 0.20      # 도그푸드 실측 보정 (§3.3)
-correlate_jaccard_anchored: float = 0.35
+correlate_jaccard_anchored: float = 0.20 # lex=FULL prose 재정의에 동행 (§3.3, 리뷰 반영)
 correlate_jaccard_blind: float = 0.50          # anchored + symbol 0개일 때
 correlate_window_days: int = 14
 session_remine_message_delta: int = 10         # §5.2 [2]

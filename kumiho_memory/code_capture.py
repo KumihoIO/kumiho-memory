@@ -47,17 +47,19 @@ from kumiho_memory.code_decisions import (
     EDGE_SUPERSEDES,
     EVIDENCE_KINDS,
     KIND_COMMIT,
-    KIND_DECISION,
     KIND_EVIDENCE,
     SCHEMA_VERSION,
     commit_slug,
+    deprecate_marker_decisions,
     ensure_space,
     evidence_slug,
     get_or_create_anchor,
     get_or_create_decision_item,
     get_or_create_item,
+    marker_provenance_complete,
     normalize_path,
     parse_decided_at,
+    undeprecate_item,
     write_revision,
 )
 
@@ -492,7 +494,9 @@ def _edge_exists(src_rev: Any, edge_type: str, target_uri: str) -> bool:
 
 
 def _create_edge_once(src_rev: Any, target_rev: Any, edge_type: str,
-                      metadata: Dict[str, str], stats: IngestStats) -> None:
+                      metadata: Dict[str, str], stats: Any) -> None:
+    # stats is duck-typed on .edges (IngestStats | SessionMineStats) —
+    # code_session reuses this exact write primitive.
     target_uri = getattr(getattr(target_rev, "kref", None), "uri", "")
     if _edge_exists(src_rev, edge_type, target_uri):
         return
@@ -513,67 +517,25 @@ def _force_deprecate_commit_decisions(
     in place so query-side ranking demotes it even before the item-level
     flag propagates to search filters.
     """
-    import kumiho
-
     try:
         item = project.get_item(slug, KIND_COMMIT,
                                 parent_path=f"/{project.name}/{config.commits_space}")
         marker_rev = item.get_latest_revision()
     except Exception:  # noqa: BLE001 — no marker, nothing to deprecate
         return
-    if marker_rev is None:
-        return
-    try:
-        edges = marker_rev.get_edges(edge_type_filter=EDGE_DERIVED_FROM,
-                                     direction=kumiho.INCOMING)
-    except Exception:  # noqa: BLE001
-        return
-    for edge in edges or []:
-        src = getattr(getattr(edge, "source_kref", None), "uri", "")
-        if not src:
-            continue
-        try:
-            rev = kumiho.get_revision(src)
-            meta = getattr(rev, "metadata", {}) or {}
-            if "decision" not in meta:
-                continue  # evidence atom — shared, never deprecated here
-            rev.set_attribute("status", "deprecated")
-            rev.get_item().set_deprecated(True)
-            stats.deprecated += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("code capture: force deprecation failed for %s: %s", src, exc)
+    deprecate_marker_decisions(marker_rev, stats)
 
 
 def _marker_complete(project: Any, config: CodeMemoryConfig, slug: str) -> bool:
     """A commit counts as captured only when its marker revision exists AND
-    its promised provenance edges are present.
-
-    The marker revision is written before the DERIVED_FROM edges (edges
-    need the revision as a target), so a crash in that window would leave a
-    marker that silently loses provenance forever.  Verifying the incoming
-    edge count against ``decisions_count`` turns that window into a retry.
-    """
-    import kumiho
-
+    its promised provenance edges are present (``decisions_count`` —
+    see :func:`code_decisions.marker_provenance_complete`)."""
     try:
         item = project.get_item(slug, KIND_COMMIT,
                                 parent_path=f"/{project.name}/{config.commits_space}")
     except Exception:  # noqa: BLE001
         return False
-    if item is None:
-        return False
-    try:
-        rev = item.get_latest_revision()
-        if rev is None:
-            return False
-        expected = int((getattr(rev, "metadata", {}) or {}).get("decisions_count", "0") or 0)
-        if expected <= 0:
-            return True
-        edges = rev.get_edges(edge_type_filter=EDGE_DERIVED_FROM,
-                              direction=kumiho.INCOMING)
-        return len(edges or []) >= expected
-    except Exception:  # noqa: BLE001
-        return False
+    return marker_provenance_complete(item, ("decisions_count",))[0]
 
 
 def _supersede_pass(
@@ -726,13 +688,8 @@ def _sync_write_commit(
         item = get_or_create_decision_item(
             project, config, meta["title"], commit.author_date, meta["decision"],
         )
-        if force and getattr(item, "deprecated", False):
-            # Re-captured decision converged on a force-deprecated item —
-            # restore it; the fresh revision below carries the new content.
-            try:
-                item.set_deprecated(False)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("code capture: un-deprecate failed: %s", exc)
+        if force:
+            undeprecate_item(item)
         decision_rev = item.get_latest_revision()
         if decision_rev is None or force:
             # force always writes a NEW revision — a re-capture exists to
