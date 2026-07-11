@@ -1275,3 +1275,38 @@ def test_chunk_structuring_failure_withholds_marker_for_retry(monkeypatch, tmp_p
     assert not stats2.skipped_marker and stats2.decisions_created == 1
     marker = project.get_item(session_slug("repo", "s1"), KIND_SESSION)
     assert marker.get_latest_revision() is not None
+
+
+def test_parse_claude_transcript_jsonl(tmp_path):
+    """The plugin SessionEnd input surface: Claude Code transcript JSONL ->
+    mine_session messages (text kept, tool_use marked, tool_result/system-
+    reminder dropped, timestamps preserved)."""
+    from kumiho_memory.code_session import parse_claude_transcript
+
+    path = tmp_path / "transcript.jsonl"
+    path.write_text("\n".join([
+        json.dumps({"timestamp": "2026-07-11T10:00:00Z",
+                    "message": {"role": "user", "content": "why single-worker executor?"}}),
+        json.dumps({"message": {"role": "assistant", "content": [
+            {"type": "text", "text": "because the pool is shared"},
+            {"type": "tool_use", "name": "Bash"},
+            {"type": "tool_result", "content": "verbose noise dropped"},
+        ]}}),
+        json.dumps({"message": {"role": "user", "content": "<system-reminder>ignore me</system-reminder>"}}),
+        json.dumps({"type": "summary", "role": "system", "content": "not a turn"}),
+        "not json at all",
+        json.dumps({"message": {"role": "user", "content": "yes, decided"}}),
+    ]), encoding="utf-8")
+
+    msgs = parse_claude_transcript(str(path))
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+    assert msgs[0]["timestamp"] == "2026-07-11T10:00:00Z"
+    assert "because the pool is shared" in msgs[1]["content"]
+    assert "*[tool: Bash]*" in msgs[1]["content"]
+    assert "verbose noise" not in msgs[1]["content"]     # tool_result dropped
+    assert msgs[2]["content"] == "yes, decided"          # system-reminder skipped
+
+
+def test_parse_claude_transcript_missing_file():
+    from kumiho_memory.code_session import parse_claude_transcript
+    assert parse_claude_transcript("/nonexistent/transcript.jsonl") == []

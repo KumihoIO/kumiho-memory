@@ -128,6 +128,64 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def parse_claude_transcript(path: str) -> List[Dict[str, Any]]:
+    """Parse a Claude Code / Cowork transcript JSONL into mine_session
+    messages (``[{role, content, timestamp}]``).
+
+    The transcript is JSONL — one JSON object per line.  Only user/assistant
+    turns are kept; content blocks are flattened (text kept, tool_use marked,
+    tool_result dropped as noise), and system-reminder injections are
+    skipped.  This is the plugin SessionEnd input surface: the hook hands
+    the worker a transcript path, the worker hands it here.  Kept in the SDK
+    (not the plugin) so it is unit-tested and the plugin worker stays thin.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    p = _Path(path)
+    if not p.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = _json.loads(line)
+        except _json.JSONDecodeError:
+            continue
+        message = entry.get("message") or entry
+        role = str(message.get("role", ""))
+        if role not in ("user", "assistant"):
+            continue
+        content = message.get("content", "")
+        if isinstance(content, list):
+            parts: List[str] = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    btype = block.get("type", "")
+                    if btype == "text":
+                        parts.append(str(block.get("text", "")))
+                    elif btype == "tool_use":
+                        parts.append(f"*[tool: {block.get('name', 'unknown')}]*")
+                    # tool_result: dropped (verbose, low decision signal)
+            content = "\n".join(parts)
+        elif not isinstance(content, str):
+            continue
+        content = content.strip()
+        if not content or content.startswith("<system-reminder>"):
+            continue
+        ts = str(entry.get("timestamp") or message.get("timestamp") or "")
+        out.append({"role": role, "content": content, "timestamp": ts})
+    return out
+
+
 #: Role headers as ``_build_conversation_markdown`` emits them:
 #: ``### {role.capitalize()}`` — a single capitalized word on its own line.
 _ARTIFACT_HEADER_RE = re.compile(r"^### ([A-Z][A-Za-z0-9_]*)\s*$")

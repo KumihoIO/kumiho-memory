@@ -240,6 +240,64 @@ def cmd_code_ingest(args: argparse.Namespace) -> int:
     return 1 if (stats.errors or stats.failed_commits) else 0
 
 
+def cmd_code_mine_session(args: argparse.Namespace) -> int:
+    """Mine an agent session's transcript into Decision Memory (opt-in).
+
+    The loop-closing command: the plugin SessionEnd worker hands a Claude
+    Code transcript path here.  ``ingest_first`` runs an incremental commit
+    ingest so enrichment targets exist ("talk -> commit -> mine").
+    """
+    from kumiho_memory.code_decisions import (
+        code_memory_enabled, config_from_env, resolve_project_name,
+    )
+
+    if not code_memory_enabled():
+        print(json.dumps({
+            "errors": ["code memory is disabled — set KUMIHO_MEMORY_CODE=1"],
+        }))
+        return 1
+
+    from kumiho_memory.code_capture import ingest_repo
+    from kumiho_memory.code_session import mine_session, parse_claude_transcript
+    from kumiho_memory.privacy import PIIRedactor
+    from kumiho_memory.summarization import MemorySummarizer
+
+    messages = None
+    if args.transcript:
+        messages = parse_claude_transcript(args.transcript)
+        if not messages:
+            print(json.dumps({
+                "errors": [f"no messages parsed from transcript {args.transcript!r}"],
+            }))
+            return 0
+
+    summarizer = MemorySummarizer()
+    cfg = config_from_env()
+    project_name = resolve_project_name(args.project, cfg)
+
+    async def _run():
+        if args.ingest_first:
+            try:
+                await ingest_repo(
+                    args.repo, None, project_name=project_name, config=cfg,
+                    adapter=summarizer.adapter, model=summarizer.light_model,
+                    max_commits=args.max_commits or 20,
+                )
+            except Exception as exc:  # noqa: BLE001 — enrichment degrades, mining proceeds
+                logger.warning("pre-ingest failed: %s", exc)
+        return await mine_session(
+            args.session_id,
+            project_name=project_name, messages=messages,
+            conversation_kref=args.conversation_kref or "", repo_path=args.repo,
+            config=cfg, adapter=summarizer.adapter, model=summarizer.light_model,
+            redactor=PIIRedactor(), force=args.force,
+        )
+
+    stats = asyncio.run(_run())
+    print(json.dumps(stats.as_dict(), indent=2, default=str))
+    return 1 if stats.errors else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kumiho-memory",
@@ -417,6 +475,57 @@ def main(argv: list[str] | None = None) -> int:
         help="Re-capture commits that already carry completion markers",
     )
 
+    # -- code-mine-session subcommand (Decision Memory Phase 2, opt-in) --
+    code_mine = sub.add_parser(
+        "code-mine-session",
+        help="Mine an agent session transcript into Decision Memory",
+        description="Enrich commit-mined decisions with conversation-only "
+        "alternatives/measurements, capture decisions that never reached a "
+        "commit, and bridge them to the conversation. Idempotent: a "
+        "completed session is marker-skipped at zero LLM cost.",
+    )
+    code_mine.add_argument(
+        "session_id",
+        help="The chat session id (marker identity)",
+    )
+    code_mine.add_argument(
+        "--transcript",
+        default=None,
+        help="Path to a Claude Code transcript JSONL (the session's messages)",
+    )
+    code_mine.add_argument(
+        "--repo",
+        default=".",
+        help="Path to the git repository (default: current directory)",
+    )
+    code_mine.add_argument(
+        "--project",
+        default="CognitiveMemory",
+        help="Memory project; decisions go to '{project}-code' (default: CognitiveMemory)",
+    )
+    code_mine.add_argument(
+        "--conversation-kref",
+        default=None,
+        help="Consolidated conversation revision kref for the DISCUSSED_IN bridge",
+    )
+    code_mine.add_argument(
+        "--max-commits",
+        type=int,
+        default=None,
+        help="Cap on commits for the ingest_first pre-pass (default: 20)",
+    )
+    code_mine.add_argument(
+        "--no-ingest-first",
+        dest="ingest_first",
+        action="store_false",
+        help="Skip the incremental commit ingest that seeds enrichment targets",
+    )
+    code_mine.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-mine a session that already carries a completion marker",
+    )
+
     parsed = parser.parse_args(argv)
 
     # Configure logging
@@ -434,6 +543,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_profile(parsed)
     elif parsed.command == "code-ingest":
         return cmd_code_ingest(parsed)
+    elif parsed.command == "code-mine-session":
+        return cmd_code_mine_session(parsed)
 
     parser.print_help()
     return 0
