@@ -16,6 +16,7 @@ import types
 from kumiho_memory.code_decisions import CodeMemoryConfig
 from kumiho_memory.code_capture import (
     CommitInfo,
+    IngestStats,
     build_packet,
     derive_repo_id,
     enumerate_commits,
@@ -404,3 +405,172 @@ def test_ingest_without_adapter_reports_error(tmp_path):
         config=CodeMemoryConfig(), adapter=None, model="",
     ))
     assert stats.errors and "adapter" in stats.errors[0]
+
+
+# ---------------- review-fix regression tests ----------------
+
+
+def test_rev_range_injection_rejected(tmp_path):
+    from kumiho_memory.code_capture import _validate_rev_range
+    import pytest as _pytest
+
+    assert _validate_rev_range("HEAD~30..HEAD") == "HEAD~30..HEAD"
+    assert _validate_rev_range("v1.0.0...main") == "v1.0.0...main"
+    for bad in ("--output=/tmp/pwn", "-p", "--upload-pack=rm", "; rm -rf"):
+        with _pytest.raises(ValueError):
+            _validate_rev_range(bad)
+
+
+def test_prefilter_runs_after_files_loaded(tmp_path, monkeypatch):
+    """A bodyless short-subject commit WITH a real diff must survive: the
+    trivial-subject rule reads commit.files, which is only valid after the
+    changed-file load (reviewed-and-confirmed ordering defect)."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "T")
+    (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "fix rerank")  # 2 words, no body, real diff
+
+    _install_fake_kumiho(monkeypatch)
+    commits = enumerate_commits(str(repo), None, 5)
+    adapter = _StubAdapter(_payload_for(commits))
+    stats = asyncio.run(ingest_repo(
+        str(repo), None, project_name="p-code",
+        config=CodeMemoryConfig(repo="r"), adapter=adapter, model="stub",
+    ))
+    assert stats.skipped_prefilter == 0
+    assert adapter.calls >= 1  # it reached the LLM
+
+
+def test_supersede_pass_three_signals_and_inplace_demotion(monkeypatch):
+    """3-signal confluence + in-place demotion: the SAME revision the edges
+    are pinned to must carry status=superseded afterwards (the two-krefs
+    identity split was the review's confirmed critical)."""
+    import kumiho_memory.code_capture as cc
+
+    fake = _install_fake_kumiho(monkeypatch)
+    project = fake.create_project("p-code")
+    for s in ("decisions", "anchors", "commits", "evidence"):
+        project.create_space(s)
+
+    cfg = CodeMemoryConfig(repo="r")
+    # old decision anchored to a.py, decided earlier (different tz offset —
+    # +14:00 makes the raw string LARGER than the -05:00 new date, which
+    # would flip a naive string comparison)
+    old_item = project.create_item("old-dec", "code_decision")
+    old_rev = old_item.create_revision(metadata={
+        "title": "Use inline call",
+        "decision": "Call the cross encoder inline on the loop",
+        "decided_at": "2026-07-10T23:00:00+14:00",  # = 09:00 UTC
+        "status": "active",
+    })
+    anchor_item = project.create_item("anchor-a", "code_anchor")
+    anchor_rev = anchor_item.create_revision(metadata={"repo": "r", "path": "a.py"})
+    old_rev.create_edge(anchor_rev, "IMPLEMENTED_IN", metadata={})
+
+    new_item = project.create_item("new-dec", "code_decision")
+    new_rev = new_item.create_revision(metadata={
+        "title": "Use offloaded call",
+        "decision": "Call the cross encoder inline on the loop via executor",
+        "decided_at": "2026-07-10T10:00:00-05:00",  # = 15:00 UTC (LATER)
+        "status": "active",
+    })
+
+    # set_attribute support on the fake
+    def set_attribute(self, key, value):
+        self.metadata[key] = value
+        return True
+    _MemRev.set_attribute = set_attribute
+
+    stats = IngestStats()
+    cc._supersede_pass(
+        project, cfg, new_rev, new_rev.metadata, [anchor_rev], "", stats,
+    )
+    # linked (jaccard high, shared anchor, old(09:00Z) < new(15:00Z))
+    sup_edges = [e for e in new_rev.edges if e.edge_type == "SUPERSEDES"]
+    assert len(sup_edges) == 1 and sup_edges[0].target_kref.uri == old_rev.kref.uri
+    # demotion happened IN PLACE on the edge-pinned revision
+    assert old_rev.metadata["status"] == "superseded"
+    assert old_item.get_latest_revision() is old_rev  # no new revision created
+
+    # time-order guard: swapping direction must NOT link (old > new)
+    stats2 = IngestStats()
+    cc._supersede_pass(
+        project, cfg, old_rev, old_rev.metadata, [anchor_rev], "", stats2,
+    )
+    back_edges = [e for e in old_rev.edges
+                  if e.edge_type == "SUPERSEDES" and e.source_kref.uri == old_rev.kref.uri]
+    assert back_edges == []
+
+
+def test_supersede_requires_jaccard_confluence(monkeypatch):
+    """Shared anchor alone must not link — the Jaccard signal gates it."""
+    import kumiho_memory.code_capture as cc
+
+    fake = _install_fake_kumiho(monkeypatch)
+    project = fake.create_project("p-code")
+    old_item = project.create_item("old2", "code_decision")
+    old_rev = old_item.create_revision(metadata={
+        "title": "Completely unrelated topic",
+        "decision": "Cache invalidation policy for artifacts",
+        "decided_at": "2026-07-01T00:00:00+00:00",
+        "status": "active",
+    })
+    anchor_item = project.create_item("anchor-b", "code_anchor")
+    anchor_rev = anchor_item.create_revision(metadata={"repo": "r", "path": "b.py"})
+    old_rev.create_edge(anchor_rev, "IMPLEMENTED_IN", metadata={})
+
+    new_item = project.create_item("new2", "code_decision")
+    new_rev = new_item.create_revision(metadata={
+        "title": "Executor offload",
+        "decision": "Run reranks on a dedicated executor",
+        "decided_at": "2026-07-10T00:00:00+00:00",
+        "status": "active",
+    })
+    stats = IngestStats()
+    cc._supersede_pass(
+        project, CodeMemoryConfig(repo="r"), new_rev, new_rev.metadata,
+        [anchor_rev], "", stats,
+    )
+    assert all(e.edge_type != "SUPERSEDES" for e in new_rev.edges)
+    assert old_rev.metadata["status"] == "active"
+
+
+def test_rewrite_convergence_no_duplicates(tmp_path, monkeypatch):
+    """Rebase simulation: amending a commit changes its sha; re-ingest must
+    converge on the SAME decision node (sha-free identity) — no duplicates."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+
+    commits = enumerate_commits(str(repo), None, 10)
+    adapter = _StubAdapter(_payload_for(commits))
+    asyncio.run(ingest_repo(str(repo), None, project_name="p-code",
+                            config=cfg, adapter=adapter, model="stub"))
+    decisions_before = len([
+        i for (s, k), i in _FAKE.projects["p-code"].items.items()
+        if k == "code_decision"
+    ])
+
+    # rewrite history: amend HEAD (same author date, new sha). The committer
+    # date is forced forward — an amend within the same second would
+    # otherwise reproduce the identical sha (flaky in fast batch runs).
+    import os as _os
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--amend", "-q", "--no-edit"],
+        check=True, capture_output=True, text=True,
+        env={**_os.environ, "GIT_COMMITTER_DATE": "2030-01-01T00:00:00+00:00"},
+    )
+    commits2 = enumerate_commits(str(repo), None, 10)
+    assert commits2[0].hash != commits[0].hash  # sha changed
+    adapter2 = _StubAdapter(_payload_for(commits2))
+    asyncio.run(ingest_repo(str(repo), None, project_name="p-code",
+                            config=cfg, adapter=adapter2, model="stub"))
+    decisions_after = len([
+        i for (s, k), i in _FAKE.projects["p-code"].items.items()
+        if k == "code_decision"
+    ])
+    assert decisions_after == decisions_before  # converged, not duplicated

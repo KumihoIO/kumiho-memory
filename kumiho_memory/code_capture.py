@@ -36,6 +36,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import re
+
 from kumiho_memory._bounded import run_bounded_in_thread
 from kumiho_memory.code_decisions import (
     CodeMemoryConfig,
@@ -55,6 +57,7 @@ from kumiho_memory.code_decisions import (
     get_or_create_decision_item,
     get_or_create_item,
     normalize_path,
+    parse_decided_at,
     write_revision,
 )
 
@@ -107,7 +110,22 @@ class IngestStats:
         return dict(self.__dict__)
 
 
+#: Rev-range charset: hashes, refs, ``..``/``...``, ``~^@{}`` navigation.
+#: The leading character must not be ``-`` — a range like ``--output=x``
+#: would otherwise be parsed by git as an option (argv option injection:
+#: ``--output`` overwrites arbitrary files).
+_REV_RANGE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./~^@{}\-]*(\.\.\.?[A-Za-z0-9_][A-Za-z0-9_./~^@{}\-]*)?$")
+
+
+def _validate_rev_range(rev_range: str) -> str:
+    if not _REV_RANGE_RE.match(rev_range):
+        raise ValueError(f"unsafe rev range: {rev_range!r}")
+    return rev_range
+
+
 def _run_git(repo_path: str, *args: str) -> str:
+    if str(repo_path).startswith("-"):
+        raise ValueError(f"unsafe repo path: {repo_path!r}")
     out = subprocess.run(
         ["git", "-C", repo_path, *args],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -137,7 +155,7 @@ def enumerate_commits(
     fmt = _FIELD_SEP.join(["%H", "%an", "%aI", "%P", "%s", "%b"]) + _RECORD_SEP
     args = ["log", f"--format={fmt}", f"--max-count={max_commits}"]
     if rev_range:
-        args.append(rev_range)
+        args.append(_validate_rev_range(rev_range))
     raw = _run_git(repo_path, *args)
     commits: List[CommitInfo] = []
     for record in raw.split(_RECORD_SEP):
@@ -160,8 +178,18 @@ def enumerate_commits(
     return commits
 
 
-def _changed_files(repo_path: str, sha: str) -> List[str]:
-    raw = _run_git(repo_path, "show", "--name-only", "--format=", sha)
+def _changed_files(repo_path: str, sha: str, parents: Optional[List[str]] = None) -> List[str]:
+    """Changed-file list — the anchor ground truth.
+
+    Merge commits get the FIRST-PARENT diff: ``git show`` on a merge prints
+    a combined diff that is empty for clean merges, which would leave the
+    rationale-carrying squash-merge commits (§4.2 deliberately keeps them)
+    with no anchors at all.
+    """
+    if parents and len(parents) >= 2:
+        raw = _run_git(repo_path, "diff", "--name-only", f"{sha}^1", sha)
+    else:
+        raw = _run_git(repo_path, "show", "--name-only", "--format=", sha)
     return [normalize_path(l) for l in raw.splitlines() if l.strip()]
 
 
@@ -359,7 +387,7 @@ async def _structure_batch(
         messages=[{"role": "user", "content": prompt}],
         model=model,
         system=_SYSTEM_PROMPT,
-        max_tokens=4096,
+        max_tokens=8192,  # rationale-rich batches overflow 4096 (measured)
         json_mode={"name": "code_decisions", "schema": _structuring_schema()},
     )
     data = json.loads(raw)
@@ -400,12 +428,20 @@ def validate_decisions(
                     "code capture: dropping hallucinated anchor %r for %s",
                     a.get("file"), commit.hash[:12],
                 )
-        if not anchors:
-            # stat fallback: file-level anchors from ground truth
-            anchors = [
-                {"file": f, "line_start": 0, "line_end": 0, "role": "touched"}
-                for f in sorted(changed) if not _is_denylisted(f)
-            ]
+        # UNION with the changed-file ground truth (deterministic coverage):
+        # the LLM's anchor picks contribute line ranges and primary roles,
+        # but coverage must never depend on them — a measured miss (the
+        # extractor anchoring release notes + a call site while skipping the
+        # file that DEFINES the mechanism) silently kills the deterministic
+        # query leg for exactly the file an agent will ask about.
+        picked = {a["file"] for a in anchors}
+        for f in sorted(changed):
+            if len(anchors) >= config.max_anchors_per_decision:
+                break
+            if f in picked or _is_denylisted(f):
+                continue
+            anchors.append({"file": f, "line_start": 0, "line_end": 0,
+                            "role": "touched"})
         d = dict(d)
         d["evidence"] = evidence
         d["anchors"] = anchors[: config.max_anchors_per_decision]
@@ -441,12 +477,16 @@ def _compose_embedding_text(meta: Dict[str, str], subject: str) -> str:
 
 
 def _edge_exists(src_rev: Any, edge_type: str, target_uri: str) -> bool:
-    try:
-        for e in src_rev.get_edges(edge_type_filter=edge_type, direction=0):
-            if getattr(getattr(e, "target_kref", None), "uri", "") == target_uri:
-                return True
-    except Exception:  # noqa: BLE001
-        pass
+    """Edge-idempotency precheck (server-side dedupe is NOT assumed).
+
+    Deliberately lets read errors PROPAGATE: swallowing them here would
+    turn a transient outage into duplicate edges on the retry pass — the
+    bounded worker converts the raised error into a failed commit, which
+    re-runs cleanly next time.
+    """
+    for e in src_rev.get_edges(edge_type_filter=edge_type, direction=0):
+        if getattr(getattr(e, "target_kref", None), "uri", "") == target_uri:
+            return True
     return False
 
 
@@ -460,6 +500,16 @@ def _create_edge_once(src_rev: Any, target_rev: Any, edge_type: str,
 
 
 def _marker_complete(project: Any, config: CodeMemoryConfig, slug: str) -> bool:
+    """A commit counts as captured only when its marker revision exists AND
+    its promised provenance edges are present.
+
+    The marker revision is written before the DERIVED_FROM edges (edges
+    need the revision as a target), so a crash in that window would leave a
+    marker that silently loses provenance forever.  Verifying the incoming
+    edge count against ``decisions_count`` turns that window into a retry.
+    """
+    import kumiho
+
     try:
         item = project.get_item(slug, KIND_COMMIT,
                                 parent_path=f"/{project.name}/{config.commits_space}")
@@ -468,7 +518,15 @@ def _marker_complete(project: Any, config: CodeMemoryConfig, slug: str) -> bool:
     if item is None:
         return False
     try:
-        return item.get_latest_revision() is not None
+        rev = item.get_latest_revision()
+        if rev is None:
+            return False
+        expected = int((getattr(rev, "metadata", {}) or {}).get("decisions_count", "0") or 0)
+        if expected <= 0:
+            return True
+        edges = rev.get_edges(edge_type_filter=EDGE_DERIVED_FROM,
+                              direction=kumiho.INCOMING)
+        return len(edges or []) >= expected
     except Exception:  # noqa: BLE001
         return False
 
@@ -490,7 +548,7 @@ def _supersede_pass(
 
     my_uri = getattr(getattr(decision_rev, "kref", None), "uri", "")
     my_text = f"{decision_meta.get('title', '')} {decision_meta.get('decision', '')}"
-    my_date = decision_meta.get("decided_at", "")
+    my_date = parse_decided_at(decision_meta.get("decided_at", ""))
     threshold = config.supersede_jaccard_hinted if hint else config.supersede_jaccard_blind
 
     seen: set = set()
@@ -517,24 +575,27 @@ def _supersede_pass(
             overlap = _jaccard(_tokens(my_text), _tokens(old_text))
             if overlap < threshold:
                 continue
-            old_date = str(old_meta.get("decided_at", ""))
-            if not old_date or not my_date or not old_date < my_date:
-                continue  # strict time ordering — ingest order must not matter
+            # Strict time ordering via PARSED aware datetimes — git author
+            # dates carry the author's local UTC offset, so raw string
+            # comparison misorders cross-timezone histories.
+            old_date = parse_decided_at(old_meta.get("decided_at", ""))
+            if old_date is None or my_date is None or not old_date < my_date:
+                continue  # ingest order must not matter
             _create_edge_once(
                 decision_rev, old_rev, EDGE_SUPERSEDES,
                 {"reason": "belief update", "overlap": f"{overlap:.2f}"},
                 stats,
             )
-            # Demote the old decision so query-time ranking sinks it.
+            # Demote the old decision IN PLACE (set_attribute on the SAME
+            # revision the edges are pinned to).  Writing a new revision
+            # here was the reviewed-and-confirmed critical: edges are
+            # revision-scoped, so a new revision splits the decision's
+            # identity — the anchor leg keeps seeing 'active' on the old
+            # revision while the semantic leg surfaces an edgeless copy
+            # whose superseded_by can never resolve.
             if old_meta.get("status") != "superseded":
-                new_meta = dict(old_meta)
-                new_meta["status"] = "superseded"
                 try:
-                    target_item = old_rev.get_item()
-                    write_revision(
-                        target_item, new_meta,
-                        _compose_embedding_text(new_meta, ""),
-                    )
+                    old_rev.set_attribute("status", "superseded")
                     stats.superseded += 1
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("code capture: status demotion failed: %s", exc)
@@ -727,11 +788,20 @@ async def ingest_repo(
             if marked:
                 stats.skipped_marker += 1
                 continue
+        # Changed files are loaded BEFORE the prefilter: its trivial-subject
+        # rule reads commit.files, and evaluating it against a not-yet-loaded
+        # empty list silently dropped every bodyless short-subject commit
+        # regardless of its real diff (reviewed-and-confirmed defect).
+        try:
+            c.files = _changed_files(repo_path, c.hash, parents=c.parents)
+        except Exception as exc:  # noqa: BLE001
+            stats.failed_commits.append(c.hash[:12])
+            stats.errors.append(f"changed-files failed for {c.hash[:12]}: {exc}")
+            continue
         keep, _reason = prefilter(c)
         if not keep:
             stats.skipped_prefilter += 1
             continue
-        c.files = _changed_files(repo_path, c.hash)
         if c.files and all(_is_denylisted(f) for f in c.files):
             stats.skipped_prefilter += 1
             continue
@@ -755,13 +825,35 @@ async def ingest_repo(
                     stats.failed_commits.append(c.hash[:12])
                 stats.errors.append(f"structuring failed: {exc}")
                 return []
-        by_hash = {str(e.get("hash", ""))[:12]: e for e in entries}
+        def _match_entry(c: CommitInfo) -> Optional[Dict[str, Any]]:
+            # Prefix-tolerant hash matching: models echo abbreviated hashes
+            # (7 chars, measured) — require at least 7 matching prefix chars
+            # in either direction.
+            want = c.hash.lower()
+            for e in entries:
+                h = str(e.get("hash", "")).strip().lower()
+                if len(h) >= 7 and (want.startswith(h) or h.startswith(want[:12])):
+                    return e
+            return None
+
         out = []
         for i, c in enumerate(batch):
-            entry = by_hash.get(c.hash[:12])
+            entry = _match_entry(c)
             if entry is None and i < len(entries):
-                entry = entries[i]  # positional fallback (order is contractual)
-            decisions = validate_decisions(c, list((entry or {}).get("decisions", [])), config)
+                candidate = entries[i]  # positional fallback (order is contractual)
+                # Only accept the positional entry when its hash slot is
+                # empty/unknown — a mismatched hash means the model lost
+                # alignment and this commit's verdict is unreliable.
+                if not str(candidate.get("hash", "")).strip():
+                    entry = candidate
+            if entry is None:
+                # A missing batch entry is a FAILURE, not a zero-decision
+                # verdict: writing a marker here would permanently skip a
+                # commit the model never actually judged.
+                stats.failed_commits.append(c.hash[:12])
+                stats.errors.append(f"LLM batch entry missing for {c.hash[:12]}")
+                continue
+            decisions = validate_decisions(c, list(entry.get("decisions", [])), config)
             out.append((c, decisions))
         return out
 

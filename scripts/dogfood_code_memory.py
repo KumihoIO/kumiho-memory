@@ -138,11 +138,23 @@ async def main() -> int:
             print("no decisions captured — aborting gate")
             return 1
 
-    print("[2/3] gate queries")
+    # §5.2 validation point: the anchor-tier CE rerank must actually run in
+    # the gate (hub files like memory_manager.py carry many decisions).
+    reranker = None
+    try:
+        from kumiho_memory.recall_rerank import resolve_reranker_from_env
+
+        os.environ.setdefault("KUMIHO_RERANK_CROSS_ENCODER", "1")
+        reranker = resolve_reranker_from_env(env=os.environ)
+        print(f"[2/3] gate queries (cross-encoder: {'ON' if reranker else 'unavailable'})")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[2/3] gate queries (cross-encoder resolution failed: {exc})")
+
     verdicts = []
     for case in CASES:
         result = await why(
-            project_name=PROJECT, config=cfg, limit=5, **case["query"],
+            project_name=PROJECT, config=cfg, limit=5, reranker=reranker,
+            **case["query"],
         )
         verdict = _judge(case, result)
         verdicts.append(verdict)

@@ -145,15 +145,59 @@ def config_from_env(base: Optional[CodeMemoryConfig] = None) -> CodeMemoryConfig
 
 
 def code_memory_enabled() -> bool:
-    """The opt-in gate: ``KUMIHO_MEMORY_CODE=1`` (default off)."""
-    return os.getenv("KUMIHO_MEMORY_CODE", "").strip() == "1"
+    """The opt-in gate: ``KUMIHO_MEMORY_CODE=1|true|yes|on`` (default off).
+
+    Read at call time by the manager delegation, but the MCP tool registry
+    reads it once at import — long-lived MCP servers must restart to pick up
+    a gate change (documented behavior, mirrors the other env-gated wiring).
+    """
+    return os.getenv("KUMIHO_MEMORY_CODE", "").strip().casefold() in (
+        "1", "true", "yes", "on",
+    )
 
 
 def resolve_project_name(memory_project: str, config: CodeMemoryConfig) -> str:
-    """Dedicated code project name: explicit config wins, else ``{project}-code``."""
+    """Dedicated code project name: explicit config wins, else ``{project}-code``.
+
+    Guard: the whole isolation story rests on code nodes living in a
+    *different* project than conversation memory (the measured
+    vector-crowding incident class).  An explicit override equal to the
+    conversation project would silently defeat that, so it is corrected to
+    ``{project}-code`` with a warning instead of being honored.
+    """
     if config.project:
+        if memory_project and config.project == memory_project:
+            logger.warning(
+                "KUMIHO_MEMORY_CODE_PROJECT=%r equals the conversation "
+                "memory project — physical isolation requires a separate "
+                "project; using %r instead.",
+                config.project, f"{memory_project}-code",
+            )
+            return f"{memory_project}-code"
         return config.project
     return f"{memory_project}-code"
+
+
+def parse_decided_at(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 author date into an aware datetime, or ``None``.
+
+    The single source for temporal comparisons: git emits author dates with
+    the author's LOCAL UTC offset, so raw string comparison misorders
+    cross-timezone histories — every ordering decision must go through here.
+    """
+    if isinstance(value, datetime):
+        return value
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 # ---------------------------------------------------------------------------
@@ -359,9 +403,18 @@ def get_or_create_decision_item(
         if _jaccard(_tokens(existing), _tokens(decision_text)) >= config.slug_collision_jaccard:
             return item  # same decision re-mined — converge
         suffix = 2 if suffix == 0 else suffix + 1
-        if suffix > 9:  # pathological; give up on suffixing deterministically
+        if suffix > 9:
+            # Pathological pile-up: NEVER wrong-merge (unrecoverable) —
+            # fall back to a deterministic content-hash suffix so the same
+            # decision text still converges on re-mining.
+            import hashlib
+
+            digest = hashlib.sha1(decision_text.encode("utf-8")).hexdigest()[:8]
+            slug = slugify(f"{title} {_author_day(author_date)} {digest}",
+                           hash_on_truncate=True)
             logger.warning(
-                "decision slug collision guard exhausted for title=%r date=%s",
-                title, author_date,
+                "decision slug collision guard exhausted for title=%r date=%s"
+                " — using content-hash slug %r",
+                title, author_date, slug,
             )
-            return item
+            return get_or_create_item(project, slug, KIND_DECISION, space_path)

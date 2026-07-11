@@ -17,6 +17,10 @@ def test_gate_defaults_off(monkeypatch):
     assert code_memory_enabled() is False
     monkeypatch.setenv("KUMIHO_MEMORY_CODE", "1")
     assert code_memory_enabled() is True
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE", "true")
+    assert code_memory_enabled() is True  # common truthy spellings accepted
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE", "YES")
+    assert code_memory_enabled() is True
     monkeypatch.setenv("KUMIHO_MEMORY_CODE", "0")
     assert code_memory_enabled() is False
 

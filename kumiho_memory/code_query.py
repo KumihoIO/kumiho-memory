@@ -135,6 +135,11 @@ def _sync_anchor_leg(
     line: Optional[int],
     commit: Optional[str],
 ) -> List[Dict[str, Any]]:
+    """Deterministic leg.  An anchor MISS (NOT_FOUND) is a definitive
+    "no recorded decision"; any OTHER failure propagates — a transient
+    outage must degrade the leg visibly (why() records a warning), never
+    masquerade as a confident empty answer."""
+    import grpc
     import kumiho
 
     project = kumiho.get_project(project_name)
@@ -146,8 +151,10 @@ def _sync_anchor_leg(
     space_path = f"/{project_name}/{config.anchors_space}"
     try:
         item = project.get_item(slug, "code_anchor", parent_path=space_path)
-    except Exception:
-        return []  # anchor miss = definitively no recorded decision
+    except grpc.RpcError as exc:
+        if exc.code() == grpc.StatusCode.NOT_FOUND:
+            return []  # definitive miss
+        raise  # transient/server error → degraded leg, not an empty verdict
     if item is None:
         return []
     anchor_rev = item.get_latest_revision()
@@ -293,9 +300,16 @@ def _sync_expand_chain(kref: str, max_fetch: int) -> Dict[str, Any]:
         logger.debug("code why: chain expansion failed for %s: %s", kref, exc)
         return chain
 
+    # SUPERSEDES edges are processed FIRST: superseded_by must never be
+    # dropped by the fetch budget — a superseded decision without its
+    # replacement is the exact state hard requirement 5 forbids.
+    def _prio(e: Any) -> int:
+        return 0 if getattr(e, "edge_type", "") == EDGE_SUPERSEDES else 1
+
+    scan = sorted((edges or [])[:MAX_EDGES_PER_DECISION], key=_prio)
     fetched = 0
     me = kref
-    for edge in (edges or [])[:MAX_EDGES_PER_DECISION]:
+    for edge in scan:
         if fetched >= max_fetch:
             break
         etype = getattr(edge, "edge_type", "")
@@ -378,7 +392,12 @@ def _sort_candidates(
             prob = c["semantic_score"]
         both = 1 if (c["anchor_hit"] and c["in_semantic"]) else 0
         commit_match = 1 if c.get("commit_match") else 0
-        decided_at = str(meta.get("decided_at", ""))
+        # Recency tiebreak through PARSED timestamps — author dates carry
+        # mixed local UTC offsets, so raw string comparison misorders them.
+        from kumiho_memory.code_decisions import parse_decided_at
+
+        dt = parse_decided_at(meta.get("decided_at", ""))
+        decided_ts = dt.timestamp() if dt is not None else 0.0
         return (
             1 if c["anchor_line_hit"] else 0,
             1 if c["anchor_hit"] else 0,
@@ -386,7 +405,7 @@ def _sort_candidates(
             prob,
             both,
             commit_match,
-            decided_at,
+            decided_ts,
         )
 
     return sorted(cands, key=key, reverse=True)
@@ -454,8 +473,21 @@ async def why(
     if not question and not file:
         return {"decisions": [], "context": ""}
     repo_id = (repo or config.repo or "").strip()
+    if not repo_id and file:
+        # Anchor slugs were written with a repo id derived at capture time;
+        # querying with an empty repo would slug a name that was never
+        # written and silently kill the deterministic leg (reviewed-and-
+        # confirmed defect).  Mirror the capture-side derivation from the
+        # current working directory.
+        try:
+            from kumiho_memory.code_capture import derive_repo_id
+
+            repo_id = derive_repo_id(".")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("code why: repo id derivation failed: %s", exc)
     limit = max(1, int(limit))
     scan_limit = max(limit * 2, 10)
+    warnings: List[str] = []
 
     legs: List[List[Dict[str, Any]]] = []
     if file:
@@ -465,8 +497,14 @@ async def why(
                 normalize_path(file), line, commit,
             ),
             timeout=QUERY_TIMEOUT, label="code why anchor leg",
-            on_timeout=[], on_error=[],
-        ) or []
+            on_timeout=None, on_error=None,
+        )
+        if anchor_cands is None:
+            warnings.append(
+                "anchor leg degraded (backend error) — results are "
+                "semantic-only and may miss file-anchored decisions"
+            )
+            anchor_cands = []
         legs.append(anchor_cands)
     if question:
         semantic_cands = await run_bounded_in_thread(
@@ -488,7 +526,10 @@ async def why(
 
     merged = list(_merge_candidates(*legs).values())
     if not merged:
-        return {"decisions": [], "context": ""}
+        out: Dict[str, Any] = {"decisions": [], "context": ""}
+        if warnings:
+            out["warnings"] = warnings
+        return out
 
     ce_by_kref: Optional[Dict[str, float]] = None
     if question and len(merged) >= 2:
@@ -517,19 +558,39 @@ async def why(
         ) or {"evidence": [], "commits": [], "supersedes": [], "superseded_by": None}
         answers.append(_answer_from(cand, chain))
 
-    return {"decisions": answers, "context": compose_why_context(answers)}
+    result: Dict[str, Any] = {
+        "decisions": answers,
+        "context": compose_why_context(answers),
+    }
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
+def _flat(text: Any) -> str:
+    """Flatten newlines in captured text before context injection.
+
+    Decision/evidence text originates from commit messages — attacker-
+    influenceable input.  Flattening keeps a hostile multi-line commit
+    message from fabricating its own markdown blocks (fake [D2] entries,
+    fake role headers) inside the agent-visible context.  This is
+    containment, not a full defense: consumers should treat rendered
+    evidence as untrusted data, never as instructions.
+    """
+    return " ".join(str(text or "").split())
+
+
 def compose_why_context(decisions: List[Dict[str, Any]], char_limit: int = 4000) -> str:
     """Render answers as an inject-ready markdown block (pure function).
 
     Additive discipline: over-budget decisions are truncated from the tail —
     evidence lives inside its own decision's block and never displaces
-    another decision.
+    another decision.  All captured text is newline-flattened (see
+    :func:`_flat`) because it descends from commit messages.
     """
     blocks: List[str] = []
     for i, d in enumerate(decisions, start=1):
@@ -537,31 +598,31 @@ def compose_why_context(decisions: List[Dict[str, Any]], char_limit: int = 4000)
         date = str(d.get("decided_at", ""))[:10]
         if not date and d["commits"]:
             date = str(d["commits"][0].get("date", ""))[:10]
-        head = f"### [D{i}] {d['title']}"
+        head = f"### [D{i}] {_flat(d['title'])}"
         if sha:
             head += f"  ({sha}{', ' + date if date else ''})"
         lines = [head]
         if d["anchors"]:
             files = ", ".join(
-                a["file"] + (f":{a['lines']}" if a["lines"] else "")
+                _flat(a["file"]) + (f":{_flat(a['lines'])}" if a["lines"] else "")
                 for a in d["anchors"][:4]
             )
             lines.append(f"files: {files}")
         if d["decision"]:
-            lines.append(f"decision: {d['decision']}")
+            lines.append(f"decision: {_flat(d['decision'])}")
         if d["rationale"]:
-            lines.append(f"why: {d['rationale']}")
+            lines.append(f"why: {_flat(d['rationale'])}")
         if d["evidence"]:
             lines.append("evidence:")
             for ev in d["evidence"]:
-                ref = f"  [{ev['source_ref']}]" if ev["source_ref"] else ""
-                lines.append(f"- ({ev['kind']}) \"{ev['statement']}\"{ref}")
-        sup = ", ".join(s["title"] or s["kref"] for s in d["supersedes"]) or "none"
-        sup_by = (
+                ref = f"  [{_flat(ev['source_ref'])}]" if ev["source_ref"] else ""
+                lines.append(f"- ({_flat(ev['kind'])}) \"{_flat(ev['statement'])}\"{ref}")
+        sup = _flat(", ".join(s["title"] or s["kref"] for s in d["supersedes"])) or "none"
+        sup_by = _flat(
             (d["superseded_by"] or {}).get("title")
             or (d["superseded_by"] or {}).get("kref")
-            or "none"
-        )
+            or ""
+        ) or "none"
         if d["status"] == "superseded":
             lines.append(f"⚠ SUPERSEDED by: {sup_by}")
         lines.append(f"supersedes: {sup} / superseded_by: {sup_by}")

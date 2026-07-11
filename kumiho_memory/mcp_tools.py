@@ -1430,10 +1430,18 @@ _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
 
 
 def _register_code_memory_tools() -> None:
+    """Gate-checked, idempotent registration.
+
+    The gate is read once at import time — long-lived MCP servers restart to
+    change it (same contract as the rest of the env-gated wiring).  The
+    idempotency guard makes re-invocation (tests, module reloads) safe.
+    """
     from kumiho_memory.code_decisions import code_memory_enabled
 
     if not code_memory_enabled():
         return
+    if any(t["name"] == "kumiho_code_why" for t in MEMORY_TOOLS):
+        return  # already registered
     MEMORY_TOOLS.extend(_CODE_MEMORY_TOOLS)
     MEMORY_TOOL_HANDLERS["kumiho_code_why"] = tool_code_why
     MEMORY_TOOL_HANDLERS["kumiho_code_ingest"] = tool_code_ingest
