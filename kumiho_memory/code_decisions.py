@@ -153,7 +153,11 @@ class CodeMemoryConfig:
     #: normalized-substring check fails (multi-message paraphrase slack).
     evidence_containment: float = 0.6
     # --- correlation thresholds (§3.3: conjunction, biased to split) ---
-    correlate_jaccard_sha: float = 0.25
+    #: Live-dogfood calibrated: honest same-decision session/commit pairs
+    #: measured ~0.26 over the FULL prose (title+decision+rationale+why),
+    #: misquoted-sha negatives ~0.1 — 0.20 splits them with margin while
+    #: the sha remains the structural witness.
+    correlate_jaccard_sha: float = 0.20
     correlate_jaccard_anchored: float = 0.35
     correlate_jaccard_blind: float = 0.50
     correlate_window_days: int = 14

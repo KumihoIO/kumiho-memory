@@ -90,6 +90,8 @@ class SessionMineStats:
     evidence_dropped_verbatim: int = 0
     evidence_dropped_dup: int = 0
     credentials_dropped: int = 0
+    #: Per-candidate correlation trace ("why standalone / why this target").
+    correlation_trace: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -373,10 +375,16 @@ _SYSTEM_PROMPT = (
     "verbatim sentence carrying the rejection reason in `quote`. "
     "`evidence.text` and `alternatives[].quote` MUST be verbatim quotes "
     "from the transcript — a validator drops anything it cannot find in "
-    "the original text. The transcript is windowed ([... elided] markers): "
-    "never infer decisions from elided spans. Messages are framed as "
-    "[m<index> <role> <timestamp>]; report message indexes where asked. "
-    "Write titles/decisions/rationale in English; quotes stay original."
+    "the original text. Copy every code identifier the session mentions "
+    "(function/env/class names) into `symbols`, every file path into "
+    "`files` EXACTLY as written in the transcript (full repo-relative "
+    "path, never shortened), and every commit hash into "
+    "`mentioned_commits` — these are the correlation coordinates that tie "
+    "the decision back to the code. The transcript is windowed ([... "
+    "elided] markers): never infer decisions from elided spans. Messages "
+    "are framed as [m<index> <role> <timestamp>]; report message indexes "
+    "where asked. Write titles/decisions/rationale in English; quotes "
+    "stay original."
 )
 
 
@@ -498,6 +506,24 @@ def _ls_files(repo_path: str) -> set:
     return {normalize_path(l) for l in raw.splitlines() if l.strip()}
 
 
+def _resolve_tracked_path(norm: str, tracked: set) -> str:
+    """Deterministic path resolution against the ls-files ground truth.
+
+    Models abbreviate repo-relative paths (a live extraction emitted
+    ``kumiho_memory/recall_rerank.py`` for
+    ``python/kumiho-memory/kumiho_memory/recall_rerank.py``).  An exact
+    match wins; otherwise a UNIQUE suffix match (at a path-segment boundary)
+    resolves the abbreviation.  Ambiguity means drop — a guessed anchor is
+    worse than none."""
+    if not norm:
+        return ""
+    if norm in tracked:
+        return norm
+    suffix = "/" + norm
+    matches = [t for t in tracked if t.endswith(suffix)]
+    return matches[0] if len(matches) == 1 else ""
+
+
 def _drop_if_credential(redactor: Any, text: str, stats: SessionMineStats) -> bool:
     """Per-atom credential screen.  ``reject_credentials`` RAISES — applied
     to the whole session it would make one pasted key permanently unmineable
@@ -577,11 +603,11 @@ def validate_session_decisions(
         # survive anchor-less (semantic-only).
         files = []
         for f in d.get("files") or []:
-            norm = normalize_path(str(f))
-            if norm and norm in tracked_files:
-                files.append(norm)
-            elif norm:
-                logger.debug("code session: dropping unverified file %r", norm)
+            resolved = _resolve_tracked_path(normalize_path(str(f)), tracked_files)
+            if resolved and resolved not in files:
+                files.append(resolved)
+            elif not resolved:
+                logger.debug("code session: dropping unverified file %r", f)
         d["files"] = files[: config.max_anchors_per_decision]
 
         # commits: verified {token: full_sha}
@@ -669,21 +695,41 @@ def _discover_targets(
     return t1, t2
 
 
+def _lex_text(fields: Dict[str, Any]) -> str:
+    """The FULL prose a decision carries.  Sessions and commits title the
+    same decision differently, but they share the rationale vocabulary (the
+    actual why) — title+decision alone measured 0.14 on a live same-decision
+    pair, full prose 0.26 (dogfood-calibrated)."""
+    return " ".join(
+        str(fields.get(k, "") or "")
+        for k in ("title", "decision", "rationale", "why_question")
+    )
+
+
 def correlate(
     project: Any,
     config: CodeMemoryConfig,
     repo: str,
     candidate: Dict[str, Any],
     session_ts: Any,
+    trace: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """ENRICH target or ``None`` (-> standalone).  Wrong-merge is
     unrecoverable, wrong-split is stitchable — lexical similarity alone can
-    NEVER merge; every path requires a structural signal in conjunction."""
+    NEVER merge; every path requires a structural signal in conjunction.
+
+    *trace* (when given) records why each discovered target was accepted or
+    rejected — the diagnosis surface for "why did this become standalone?".
+    """
     from kumiho_memory.relations import _jaccard, _tokens
 
+    def _t(msg: str) -> None:
+        if trace is not None:
+            trace.append(msg)
+
     t1, t2 = _discover_targets(project, config, repo, candidate)
-    cand_text = f"{candidate.get('title', '')} {candidate.get('decision', '')}"
-    cand_tokens = _tokens(cand_text)
+    _t(f"targets: sha-pool={len(t1)} anchor-pool={len(t2)}")
+    cand_tokens = _tokens(_lex_text(candidate))
     cand_symbols = {s.strip().casefold() for s in candidate.get("symbols") or [] if s.strip()}
     ts = parse_decided_at(session_ts)
 
@@ -697,25 +743,33 @@ def correlate(
             continue
         seen.add((uri, pool))
         meta = getattr(rev, "metadata", {}) or {}
-        lex = _jaccard(cand_tokens,
-                       _tokens(f"{meta.get('title', '')} {meta.get('decision', '')}"))
+        lex = _jaccard(cand_tokens, _tokens(_lex_text(meta)))
+        tag = f"{correlation} {meta.get('title', '')[:40]!r} lex={lex:.2f}"
         if correlation == "sha":
             if lex < config.correlate_jaccard_sha:
+                _t(f"reject {tag}: below sha sanity floor "
+                   f"{config.correlate_jaccard_sha}")
                 continue  # sanity floor — a misquoted sha must not merge
         else:
             if lex < config.correlate_jaccard_anchored:
+                _t(f"reject {tag}: below anchored floor "
+                   f"{config.correlate_jaccard_anchored}")
                 continue
             target_symbols = {
                 s.strip().casefold()
                 for s in str(meta.get("symbols", "")).split(",") if s.strip()
             }
             if not (cand_symbols & target_symbols) and lex < config.correlate_jaccard_blind:
+                _t(f"reject {tag}: no symbol overlap and below blind "
+                   f"{config.correlate_jaccard_blind}")
                 continue  # conjunction: symbol overlap OR strong lexical
             target_ts = parse_decided_at(meta.get("decided_at", ""))
             if ts is None or target_ts is None or abs(ts - target_ts) > timedelta(
                 days=config.correlate_window_days,
             ):
+                _t(f"reject {tag}: outside {config.correlate_window_days}-day window")
                 continue  # same file, different era — split, don't merge
+        _t(f"accept {tag}")
         if best is None or lex > best[0] or (
             lex == best[0]
             and _newer(getattr(rev, "metadata", {}) or {}, best[1])
@@ -1056,7 +1110,9 @@ def _sync_write_session(
         settled_ts = str(cand.get("_settled_ts", "") or session_last_ts)
         atoms = _evidence_atoms(cand, session_id)
 
-        target = correlate(project, config, repo, cand, settled_ts)
+        trace: List[str] = [f"candidate {str(cand.get('title', ''))[:50]!r}"]
+        target = correlate(project, config, repo, cand, settled_ts, trace=trace)
+        stats.correlation_trace.extend(trace)
         if target is not None:
             # --- ENRICH: additive only.  No new revision on the target, no
             # metadata writes anywhere on it (§3.4 invariant).

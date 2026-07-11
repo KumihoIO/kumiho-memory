@@ -959,3 +959,71 @@ def test_gate_off_manager_returns_error(monkeypatch):
     assert not code_automine_enabled()
     monkeypatch.setenv("KUMIHO_MEMORY_CODE", "1")
     assert code_automine_enabled()
+
+
+def test_resolve_tracked_path_unique_suffix():
+    """Models abbreviate repo-relative paths (live-measured) — a UNIQUE
+    suffix match resolves, ambiguity or absence drops."""
+    from kumiho_memory.code_session import _resolve_tracked_path
+
+    tracked = {
+        "python/kumiho-memory/kumiho_memory/recall_rerank.py",
+        "python/kumiho-memory/tests/test_recall_rerank.py",
+        "a/dup.py", "b/dup.py",
+    }
+    assert (_resolve_tracked_path("kumiho_memory/recall_rerank.py", tracked)
+            == "python/kumiho-memory/kumiho_memory/recall_rerank.py")
+    assert (_resolve_tracked_path("recall_rerank.py", tracked)
+            == "python/kumiho-memory/kumiho_memory/recall_rerank.py")
+    assert (_resolve_tracked_path("python/kumiho-memory/kumiho_memory/recall_rerank.py",
+                                  tracked)
+            == "python/kumiho-memory/kumiho_memory/recall_rerank.py")
+    assert _resolve_tracked_path("dup.py", tracked) == ""      # ambiguous
+    assert _resolve_tracked_path("ghost.py", tracked) == ""    # absent
+    assert _resolve_tracked_path("", tracked) == ""
+
+
+def test_correlate_lex_uses_full_prose(monkeypatch, tmp_path):
+    """Dogfood-calibrated: a live same-decision pair measured 0.14 on
+    title+decision but 0.26 on full prose — rationale carries the shared
+    why-vocabulary, so correlation must read it."""
+    repo, sha = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    import kumiho
+
+    project = kumiho.create_project("p-code")
+    # commit side, styled like the real cfec845 extraction
+    from kumiho_memory.code_decisions import commit_slug, decision_slug
+
+    d_item = project.create_item(
+        decision_slug("offload fastembed cross-encoder rerank",
+                      "2026-07-10T12:00:00+00:00"), KIND_DECISION, "")
+    d_rev = d_item.create_revision({
+        "title": "offload fastembed cross-encoder rerank",
+        "decision": "offload the cross-encoder rerank processing to a "
+                    "dedicated single-worker executor instead of blocking "
+                    "the event loop",
+        "rationale": "inline CE blocked the loop under the harness",
+        "why_question": "why is the rerank offloaded?",
+        "symbols": "", "decided_at": "2026-07-10T12:00:00+00:00",
+        "status": "active",
+    })
+    m_item = project.create_item(commit_slug("repo", sha), KIND_COMMIT, "")
+    m_rev = m_item.create_revision({"repo": "repo", "hash": sha,
+                                    "decisions_count": "1"})
+    d_rev.create_edge(m_rev, EDGE_DERIVED_FROM, {})
+
+    # session side, styled like the real live extraction (different title)
+    cand = _candidate(
+        title="Use a Dedicated ThreadPoolExecutor for Inference Serialization",
+        decision="Commit to using a dedicated single-worker "
+                 "ThreadPoolExecutor for inference serialization.",
+        rationale="The default executor oversubscribes the cross-encoder "
+                  "with a shared 32-thread pool, causing issues with the "
+                  "event loop.",
+        why_question="Why did we choose a dedicated ThreadPoolExecutor "
+                     "instead of asyncio.to_thread?",
+        verified_commits={sha[:7]: sha},
+    )
+    hit = correlate(project, _cfg(), "repo", cand, "2026-07-11T12:00:00+00:00")
+    assert hit is not None and hit["correlation"] == "sha"
