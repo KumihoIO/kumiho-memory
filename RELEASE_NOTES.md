@@ -1,5 +1,53 @@
 # Release Notes — kumiho-memory
 
+## v0.16.0
+
+**Release Date:** 2026-07-13
+
+**Dream State maintains the typed ontology & Decision Memory graphs (#59).**
+Dream State consolidated only flat conversation revisions; the typed ontology
+(`entity`/`fact`) and Decision Memory (`{repo}-code`) graphs shipped in 0.14.x /
+0.15.0 were never maintained — duplicate entities accumulated, facts went stale,
+and a code decision's `evidence_level` was stamped once at capture and never
+rose. This extends the same consolidation cycle to both graphs, split by the
+keyless constraint.
+
+### Added
+
+- **Keyless deterministic maintenance** (`graph_maintenance.GraphMaintainer`,
+  no LLM key): merge duplicate entities (alias/slug) with edge repointing,
+  dedup near-duplicate facts about the same entity, prune orphan entities,
+  **re-grade a `code_decision`'s `evidence_level` from its current
+  `MOTIVATED_BY` atoms** via the deterministic `_evidence_grade` — lifts
+  `unverified`→`corroborated` when evidence accrues after capture (closes the
+  §6 Level-of-Evidence auto-upgrade gap) — dedup decisions via `SUPERSEDES` +
+  query-time status demotion, and **bridge `code_decision`→conversation
+  `entity`** with `ABOUT` edges ("one brain" at the graph level).
+- **Optional LLM entity-merge** (`maintenance_llm`): semantic merge suggestions
+  the deterministic alias rule can't see are applied through the same keyless,
+  budgeted write path — the model only suggests, never writes.
+- **`DreamState`** gains `maintain_graph` / `maintenance_llm` / `code_project`
+  (runs even with no new revisions — evidence accrues independently); the
+  `kumiho_memory_dream_state` MCP tool exposes them; `GraphMaintainer` and
+  `MaintenanceStats` are exported.
+
+### Safety
+
+Reuses the flat pass's guarantees on every typed-node change: `published` /
+`evidence:official` protection, the `max_deprecation_ratio` cap, `dry_run`,
+idempotency (edge-dedup precheck), and cursor-incremental scanning; a
+maintenance failure never aborts the flat consolidation run. Default off
+(tri-state `maintain_graph`; `KUMIHO_DREAM_MAINTAIN_GRAPH`).
+
+Proven end-to-end by `scripts/dogfood_dream_maintenance.py` (keyless, live CE):
+a seeded duplicate set collapses (entities 4→3, facts 3→2), a decision whose
+evidence grew re-grades `unverified`→`corroborated`, ≥1 `code_decision` bridges
+to its `entity`, `dry_run` mutates nothing, and the re-run is idempotent.
+Hardened against a 3-agent adversarial review (published protection across all
+typed-node deprecations, tag-carried grade reads, decision-dedup SUPERSEDES-cycle
+guard, one-pass transitive alias chains, prune-after-bridge ordering, run-abort
+isolation).
+
 ## v0.15.0
 
 **Release Date:** 2026-07-13
