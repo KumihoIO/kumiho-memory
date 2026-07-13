@@ -20,6 +20,7 @@ from kumiho_memory.summarization import (
 from kumiho_memory.privacy import PIIRedactor, CredentialDetectedError
 from kumiho_memory.retry import RetryQueue
 from kumiho_memory.dream_state import DreamState, MemoryAssessment, DreamStateStats
+from kumiho_memory.graph_maintenance import GraphMaintainer, MaintenanceStats
 from kumiho_memory.graph_augmentation import GraphAugmentedRecall, GraphAugmentationConfig
 from kumiho_memory.space_profiler import (
     SPACE_CLASSES,
@@ -82,6 +83,8 @@ __all__ = [
     "DreamState",
     "MemoryAssessment",
     "DreamStateStats",
+    "GraphMaintainer",
+    "MaintenanceStats",
     "GraphAugmentedRecall",
     "GraphAugmentationConfig",
     "DEFAULT_STORAGE_POLICY",

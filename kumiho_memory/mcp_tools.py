@@ -497,6 +497,11 @@ def tool_memory_dream_state(args: Dict[str, Any]) -> Dict[str, Any]:
         max_deprecation_ratio=args.get("max_deprecation_ratio", 0.5),
         allow_published_deprecation=args.get("allow_published_deprecation", False),
         extra_instructions=args.get("extra_instructions"),
+        # Pass None (not False) when the caller omits it, so DreamState's
+        # tri-state sentinel lets KUMIHO_DREAM_MAINTAIN_GRAPH decide.
+        maintain_graph=args.get("maintain_graph"),
+        maintenance_llm=args.get("maintenance_llm", False),
+        code_project=args.get("code_project"),
         summarizer=summarizer,
     )
     return asyncio.run(ds.run())
@@ -1247,6 +1252,37 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                         "KUMIHO_DREAM_EXTRA_INSTRUCTIONS env var when omitted. "
                         "Cannot weaken hard guardrails (deprecation cap, "
                         "published protection, conservative-KEEP rule)."
+                    ),
+                },
+                "maintain_graph": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Also consolidate the typed graphs (issue #59): merge "
+                        "duplicate entities, dedup facts, prune orphans, "
+                        "re-grade code-decision evidence from current atoms, "
+                        "dedup decisions, and bridge code_decision→entity. "
+                        "Keyless and deterministic; runs even with no new "
+                        "revisions. Honors dry_run/max_deprecation_ratio. "
+                        "Falls back to KUMIHO_DREAM_MAINTAIN_GRAPH."
+                    ),
+                },
+                "maintenance_llm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "With maintain_graph, also ask the LLM for semantic "
+                        "entity-merge pairs the deterministic alias rule can't "
+                        "see (applied through the keyless write path). Needs a "
+                        "summarizer key."
+                    ),
+                },
+                "code_project": {
+                    "type": "string",
+                    "description": (
+                        "Explicit {repo}-code project for the Decision Memory "
+                        "maintenance passes. Derived from KUMIHO_MEMORY_CODE "
+                        "wiring when omitted."
                     ),
                 },
                 "provider": {

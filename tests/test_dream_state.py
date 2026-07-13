@@ -405,6 +405,84 @@ def test_run_processes_revisions():
         asyncio.run(run())
 
 
+def test_run_maintenance_with_no_revisions():
+    """maintain_graph=True runs typed-graph maintenance even when there are
+    no new conversation revisions, and surfaces the maintenance stats +
+    generates a report (issue #59)."""
+    cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
+    items = {cursor_item.kref.uri: cursor_item}
+    sdk, client, attrs = _build_fake_sdk(
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={},
+    )
+    # GraphMaintainer enumerates typed nodes via item_search — empty graph.
+    sdk.item_search = lambda context_filter="", name_filter="", kind_filter="": []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        async def run():
+            ds = _make_dream_state(sdk, maintain_graph=True, artifact_root=tmpdir)
+            ds._cursor_item_kref = cursor_item.kref.uri
+            try:
+                report = await ds.run()
+                assert report["success"] is True
+                assert report["events_processed"] == 0
+                assert "maintenance" in report
+                assert report["maintenance"]["entities_merged"] == 0
+                assert report["maintenance"]["decisions_regraded"] == 0
+                # a report is still generated on a maintenance-only run
+                assert report.get("report_kref") is not None
+            finally:
+                _cleanup_sdk()
+
+        asyncio.run(run())
+
+
+def test_maintain_graph_off_leaves_run_unchanged():
+    """Default (maintain_graph=False) keeps the light no-revisions path:
+    no maintenance key, no report."""
+    cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")
+    items = {cursor_item.kref.uri: cursor_item}
+    sdk, client, attrs = _build_fake_sdk(
+        items=items,
+        spaces=[FakeSpace("/CognitiveMemory/personal")],
+        items_by_space={},
+    )
+
+    async def run():
+        ds = _make_dream_state(sdk)
+        ds._cursor_item_kref = cursor_item.kref.uri
+        try:
+            report = await ds.run()
+            assert report["success"] is True
+            assert "maintenance" not in report
+        finally:
+            _cleanup_sdk()
+
+    asyncio.run(run())
+
+
+def test_maintain_graph_explicit_false_overrides_env(monkeypatch):
+    """Tri-state sentinel: an explicit maintain_graph=False is authoritative
+    and can't be surprise-enabled by KUMIHO_DREAM_MAINTAIN_GRAPH."""
+    monkeypatch.setenv("KUMIHO_DREAM_MAINTAIN_GRAPH", "1")
+    assert DreamState(summarizer=StubSummarizer(), maintain_graph=False).maintain_graph is False
+    # left unset (None) → the env var decides
+    assert DreamState(summarizer=StubSummarizer()).maintain_graph is True
+    # explicit True is honored regardless
+    monkeypatch.setenv("KUMIHO_DREAM_MAINTAIN_GRAPH", "0")
+    assert DreamState(summarizer=StubSummarizer(), maintain_graph=True).maintain_graph is True
+
+
+def test_code_project_isolation_guard():
+    """An explicit code_project equal to the conversation project is corrected
+    to {project}-code (physical-isolation guard applies to every path)."""
+    ds = DreamState(summarizer=StubSummarizer(), project="Mem", code_project="Mem")
+    assert ds._code_project == "Mem-code"
+    ds2 = DreamState(summarizer=StubSummarizer(), project="Mem", code_project="Custom-code")
+    assert ds2._code_project == "Custom-code"
+
+
 def test_load_last_run_at_first_run():
     """Returns None when no timestamp exists."""
     cursor_item = FakeItem("kref://CognitiveMemory/_dream_state.conversation")

@@ -225,6 +225,63 @@ def _parse_assessments(raw: str) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Optional-LLM entity-merge (issue #59, track A semantic pass)
+# ---------------------------------------------------------------------------
+
+_ENTITY_MERGE_SYSTEM_PROMPT = """\
+You are a memory consolidation agent deduplicating typed entity nodes.
+You receive a JSON array of entities, each with a stable ``slug`` plus its
+display ``name``, ``aliases``, and ``type``.  Identify pairs that name the
+SAME real-world entity but were stored under different slugs (synonyms,
+abbreviations, spelling/casing variants — e.g. "Postgres"/"PostgreSQL").
+
+Return ONLY a JSON object:
+{"merges": [{"canonical": "<slug>", "duplicate": "<slug>"}, ...]}
+
+Rules:
+- Use ONLY slug strings that appear in the input; never invent slugs.
+- ``canonical`` is the more complete/standard name; ``duplicate`` folds in.
+- Be conservative: pair two entities ONLY when you are confident they are
+  the same thing.  Distinct-but-related entities must NOT be paired.
+- Return {"merges": []} when nothing should merge.
+"""
+
+_ENTITY_MERGE_SCHEMA_MODE = _json_schema_mode(
+    "kumiho_entity_merges_response",
+    _strict_object_schema({
+        "merges": {
+            "type": "array",
+            "items": _strict_object_schema({
+                "canonical": {"type": "string"},
+                "duplicate": {"type": "string"},
+            }),
+        },
+    }),
+)
+
+
+def _parse_entity_merges(raw: str) -> List[Dict[str, Any]]:
+    """Best-effort parse of the entity-merge LLM response."""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and "merges" in parsed:
+            return parsed["merges"] or []
+        if isinstance(parsed, list):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed.get("merges", []) or []
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+# ---------------------------------------------------------------------------
 # DreamState
 # ---------------------------------------------------------------------------
 
@@ -268,6 +325,27 @@ class DreamState:
         normalizes to no-policy.  Cannot weaken the hard guardrails —
         the deprecation cap, published protection, and conservative-KEEP
         rule are enforced in code after the LLM's suggestions.
+    maintain_graph:
+        Also run the typed-graph maintenance pass (issue #59) — entity
+        merge/dedup, orphan prune, code-decision evidence re-grade + dedup,
+        and the code_decision→entity cross-graph bridge.  Keyless and
+        deterministic; runs even when there are no new conversation
+        revisions (evidence accrues independently).  Tri-state: an explicit
+        ``True``/``False`` is authoritative; left as ``None`` (the default)
+        the ``KUMIHO_DREAM_MAINTAIN_GRAPH`` env var decides — so an explicit
+        ``False`` is never surprise-enabled by the env var.  Honors
+        ``dry_run`` and ``max_deprecation_ratio``.
+    maintenance_llm:
+        When *maintain_graph* is on, additionally ask the summarizer for
+        semantic entity-merge pairs the deterministic alias rule can't see
+        ("Postgres"/"PostgreSQL"), applied through the same keyless write
+        path.  Requires a working summarizer key; no-op (recorded as an
+        error) if the model call fails.
+    code_project:
+        Explicit ``{repo}-code`` project for the Decision Memory passes.
+        When None, derived via ``resolve_project_name`` only if code memory
+        is enabled (``KUMIHO_MEMORY_CODE``); otherwise the code-graph passes
+        are skipped.
     """
 
     def __init__(
@@ -284,6 +362,9 @@ class DreamState:
         allow_published_deprecation: bool = False,
         kind_filter: str = "conversation",
         extra_instructions: Optional[str] = None,
+        maintain_graph: Optional[bool] = None,
+        maintenance_llm: bool = False,
+        code_project: Optional[str] = None,
         # Legacy parameters — accepted but ignored for backward compatibility
         routing_key_filter: str = "revision.*",
         event_timeout: float = 10.0,
@@ -334,6 +415,43 @@ class DreamState:
         else:
             self.summarizer = MemorySummarizer()
 
+        # Typed-graph maintenance (issue #59). Tri-state sentinel mirrors the
+        # extra_instructions pattern: an explicit True/False is authoritative;
+        # only when the arg is left unset (None) does the env flag decide — so
+        # an explicit maintain_graph=False can never be surprise-enabled by
+        # KUMIHO_DREAM_MAINTAIN_GRAPH.
+        if maintain_graph is None:
+            self.maintain_graph = os.getenv(
+                "KUMIHO_DREAM_MAINTAIN_GRAPH", ""
+            ).strip().casefold() in ("1", "true", "yes", "on")
+        else:
+            self.maintain_graph = bool(maintain_graph)
+        self.maintenance_llm = bool(maintenance_llm)
+        # Resolve the Decision Memory project. Both the explicit arg and the
+        # derived name go through resolve_project_name so the physical-
+        # isolation guard (a code project must differ from the conversation
+        # project — the measured vector-crowding incident class) is enforced
+        # on every path, not just the derived one.
+        self._code_project: Optional[str] = None
+        try:
+            from kumiho_memory.code_decisions import (
+                CodeMemoryConfig,
+                code_memory_enabled,
+                config_from_env,
+                resolve_project_name,
+            )
+
+            if code_project:
+                self._code_project = resolve_project_name(
+                    self.project, CodeMemoryConfig(project=code_project)
+                )
+            elif code_memory_enabled():
+                self._code_project = resolve_project_name(
+                    self.project, config_from_env()
+                )
+        except Exception:  # noqa: BLE001
+            self._code_project = None
+
         # Will be resolved lazily on first run.
         self._cursor_item_kref: Optional[str] = None
 
@@ -379,6 +497,20 @@ class DreamState:
                     "Dream State: no new revisions since %s",
                     last_run_at or "beginning",
                 )
+                # Graph maintenance is independent of new conversations —
+                # a decision's evidence can accrue with no new revision — so
+                # it still runs (and reports) when maintain_graph is on.
+                if self.maintain_graph:
+                    maintenance = await self._maintain(kumiho)
+                    stats.duration_ms = int((time.monotonic() - start) * 1000)
+                    report_kref = self._generate_report(
+                        kumiho, cursor_kref, stats, [], maintenance=maintenance
+                    )
+                    self._save_last_run_at(kumiho, cursor_kref, run_started_at)
+                    result = self._build_result(stats, report_kref=report_kref)
+                    result["extra_instructions"] = self.extra_instructions or ""
+                    result["maintenance"] = maintenance
+                    return result
                 stats.duration_ms = int((time.monotonic() - start) * 1000)
                 # Still save timestamp so next run skips this window
                 self._save_last_run_at(kumiho, cursor_kref, run_started_at)
@@ -403,17 +535,23 @@ class DreamState:
             # 6. Apply actions
             self._apply_actions(kumiho, all_assessments, stats)
 
+            # 6b. Typed-graph maintenance (issue #59) — after the flat
+            # conversation pass so newly-consolidated nodes are in place.
+            maintenance = await self._maintain(kumiho) if self.maintain_graph else None
+
             # 7. Save last_run_at
             self._save_last_run_at(kumiho, cursor_kref, run_started_at)
 
             # 8. Generate report
             stats.duration_ms = int((time.monotonic() - start) * 1000)
             report_kref = self._generate_report(
-                kumiho, cursor_kref, stats, all_assessments
+                kumiho, cursor_kref, stats, all_assessments, maintenance=maintenance
             )
 
             result = self._build_result(stats, report_kref=report_kref)
             result["extra_instructions"] = self.extra_instructions or ""
+            if maintenance is not None:
+                result["maintenance"] = maintenance
             return result
 
         except Exception as exc:
@@ -426,6 +564,107 @@ class DreamState:
                 "extra_instructions": self.extra_instructions or "",
                 **self._stats_dict(stats),
             }
+
+    # ------------------------------------------------------------------
+    # Typed-graph maintenance (issue #59)
+    # ------------------------------------------------------------------
+
+    async def _maintain(self, sdk: Any) -> Dict[str, Any]:
+        """Run the typed-graph maintenance passes and return their stats.
+
+        The keyless deterministic passes are blocking SDK writes, so they run
+        off the event loop.  The optional LLM entity-merge pass (only when
+        ``maintenance_llm``) makes its model call on the loop, then applies
+        the resulting merges through the same keyless, budgeted write path.
+
+        Never raises: maintenance is secondary to the flat consolidation pass,
+        so any failure here is recorded into the returned stats rather than
+        aborting the whole Dream State run (which would discard the flat
+        pass's already-applied changes, its report, and the cursor advance).
+        """
+        from kumiho_memory.graph_maintenance import GraphMaintainer, MaintenanceStats
+
+        stats = MaintenanceStats()
+        try:
+            maintainer = GraphMaintainer(
+                sdk,
+                project=self.project,
+                code_project=self._code_project,
+                dry_run=self.dry_run,
+                max_deprecation_ratio=self.max_deprecation_ratio,
+                allow_published_deprecation=self.allow_published_deprecation,
+            )
+            await asyncio.to_thread(maintainer.run_keyless, stats)
+
+            if self.maintenance_llm:
+                try:
+                    pairs = await self._llm_entity_merge_suggestions(maintainer)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Dream State LLM entity-merge failed: %s", exc)
+                    stats.errors.append(f"llm_entity_merge: {exc}")
+                    pairs = []
+                if pairs:
+                    try:
+                        await asyncio.to_thread(
+                            maintainer.apply_entity_merges, pairs, stats
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        stats.errors.append(f"apply_entity_merges: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Dream State graph maintenance failed")
+            stats.errors.append(f"maintenance: {exc}")
+
+        return stats.as_dict()
+
+    async def _llm_entity_merge_suggestions(
+        self, maintainer: Any, max_entities: int = 100
+    ) -> List[Tuple[str, str]]:
+        """Ask the summarizer for semantic ``(canonical_slug, duplicate_slug)``
+        entity-merge pairs the deterministic alias rule can't catch.
+
+        Returns raw pairs of slugs drawn from the live entity set; the
+        keyless :meth:`GraphMaintainer.apply_entity_merges` validates that
+        each resolves to two distinct live entities before merging (so a
+        hallucinated slug is simply dropped).
+        """
+        # Off the event loop: _load_entities issues one blocking gRPC per
+        # entity (item_search + get_latest_revision).
+        entities = (await asyncio.to_thread(maintainer._load_entities))[:max_entities]
+        if len(entities) < 2:
+            return []
+        listing = [
+            {
+                "slug": e.slug,
+                "name": e.display,
+                "aliases": e.aliases,
+                "type": e.entity_type,
+            }
+            for e in entities
+        ]
+        user_prompt = (
+            "Here is a list of entity nodes. Identify pairs that refer to the "
+            "SAME real-world entity but have different slugs (e.g. 'Postgres' "
+            "and 'PostgreSQL', 'k8s' and 'Kubernetes'). Use ONLY the exact "
+            "slug strings given. 'canonical' is the more complete/standard "
+            "name; 'duplicate' folds into it. Be conservative — only pair "
+            "entities you are confident are the same thing.\n\n"
+            + json.dumps(listing, indent=2, default=str)
+        )
+        raw = await self.summarizer.adapter.chat(
+            messages=[{"role": "user", "content": user_prompt}],
+            model=self.summarizer.model,
+            system=_ENTITY_MERGE_SYSTEM_PROMPT,
+            max_tokens=1024,
+            json_mode=_ENTITY_MERGE_SCHEMA_MODE,
+        )
+        valid = {e.slug for e in entities}
+        pairs: List[Tuple[str, str]] = []
+        for m in _parse_entity_merges(raw):
+            canon = str(m.get("canonical", "")).strip()
+            dup = str(m.get("duplicate", "")).strip()
+            if canon in valid and dup in valid and canon != dup:
+                pairs.append((canon, dup))
+        return pairs
 
     # ------------------------------------------------------------------
     # Timestamp management (replaces event-stream cursor)
@@ -930,6 +1169,7 @@ class DreamState:
         cursor_kref: str,
         stats: DreamStateStats,
         assessments: List[MemoryAssessment],
+        maintenance: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Create a report revision + artifact on the cursor item."""
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -937,6 +1177,7 @@ class DreamState:
             stats, assessments, now_iso,
             allow_published_deprecation=self.allow_published_deprecation,
             extra_instructions=self.extra_instructions,
+            maintenance=maintenance,
         )
 
         # Write artifact to local storage.
@@ -957,23 +1198,30 @@ class DreamState:
             if item is None:
                 return None
 
-            revision = item.create_revision(
-                metadata={
-                    "type": "dream_state_report",
-                    "events_processed": str(stats.events_processed),
-                    "revisions_assessed": str(stats.revisions_assessed),
-                    "deprecated": str(stats.deprecated),
-                    "metadata_updated": str(stats.metadata_updated),
-                    "tags_added": str(stats.tags_added),
-                    "edges_created": str(stats.edges_created),
-                    "cursor": stats.last_cursor or "",
-                    "run_at": now_iso,
-                    "duration_ms": str(stats.duration_ms),
-                    "extra_instructions_active": (
-                        "true" if self.extra_instructions else "false"
-                    ),
-                },
-            )
+            report_meta = {
+                "type": "dream_state_report",
+                "events_processed": str(stats.events_processed),
+                "revisions_assessed": str(stats.revisions_assessed),
+                "deprecated": str(stats.deprecated),
+                "metadata_updated": str(stats.metadata_updated),
+                "tags_added": str(stats.tags_added),
+                "edges_created": str(stats.edges_created),
+                "cursor": stats.last_cursor or "",
+                "run_at": now_iso,
+                "duration_ms": str(stats.duration_ms),
+                "extra_instructions_active": (
+                    "true" if self.extra_instructions else "false"
+                ),
+            }
+            if maintenance is not None:
+                report_meta["maintain_graph_active"] = "true"
+                for key in (
+                    "entities_merged", "facts_merged", "orphans_pruned",
+                    "decisions_regraded", "decisions_deduped", "bridges_created",
+                    "edges_repointed", "llm_merges",
+                ):
+                    report_meta[key] = str(maintenance.get(key, 0))
+            revision = item.create_revision(metadata=report_meta)
             revision.create_artifact("report", str(artifact_path))
             return revision.kref.uri
         except Exception as exc:
@@ -989,6 +1237,7 @@ class DreamState:
         *,
         allow_published_deprecation: bool = False,
         extra_instructions: Optional[str] = None,
+        maintenance: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build a Markdown report of the Dream State run."""
         parts: List[str] = [
@@ -1075,6 +1324,34 @@ class DreamState:
         else:
             parts.append("_None_")
         parts.append("")
+
+        # Typed-graph maintenance (issue #59)
+        if maintenance is not None:
+            parts.extend([
+                "---",
+                "",
+                "## Graph Maintenance",
+                "",
+                f"**Entities scanned:** {maintenance.get('entities_scanned', 0)} "
+                f"→ merged {maintenance.get('entities_merged', 0)}, "
+                f"pruned {maintenance.get('orphans_pruned', 0)}  ",
+                f"**Facts scanned:** {maintenance.get('facts_scanned', 0)} "
+                f"→ merged {maintenance.get('facts_merged', 0)}  ",
+                f"**Decisions scanned:** {maintenance.get('decisions_scanned', 0)} "
+                f"→ re-graded {maintenance.get('decisions_regraded', 0)}, "
+                f"deduped {maintenance.get('decisions_deduped', 0)}  ",
+                f"**Cross-graph bridges:** {maintenance.get('bridges_created', 0)}  ",
+                f"**Edges repointed:** {maintenance.get('edges_repointed', 0)}  ",
+                f"**LLM entity merges:** {maintenance.get('llm_merges', 0)}",
+                "",
+            ])
+            maint_errors = maintenance.get("errors") or []
+            if maint_errors:
+                parts.append(f"### Maintenance Errors ({len(maint_errors)})")
+                parts.append("")
+                for err in maint_errors:
+                    parts.append(f"- {err}")
+                parts.append("")
 
         # Errors
         if stats.errors:
