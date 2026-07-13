@@ -37,6 +37,8 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from kumiho_memory._bounded import run_bounded_in_thread
+from kumiho_memory.evidence import parse_evidence
+from kumiho_memory.evidence_rank import DEFAULT_EVIDENCE_WEIGHTS
 from kumiho_memory.code_decisions import (
     CodeMemoryConfig,
     EDGE_DERIVED_FROM,
@@ -426,6 +428,14 @@ def _sort_candidates(
             prob = ce_by_kref[c["kref"]]
         else:
             prob = c["semantic_score"]
+        # Level-of-Evidence tie-break (§6): a well-substantiated decision
+        # outranks a thin one WITHIN the same factual tier.  The delta only
+        # touches the probabilistic slot, so anchor facts still dominate the
+        # sort; ungraded (pre-evidence) decisions resolve to None and are a
+        # strict no-op, preserving legacy ordering.
+        level = parse_evidence(meta)
+        if level:
+            prob += DEFAULT_EVIDENCE_WEIGHTS.get(level, 0.0)
         both = 1 if (c["anchor_hit"] and c["in_semantic"]) else 0
         commit_match = 1 if c.get("commit_match") else 0
         # Recency tiebreak through PARSED timestamps — author dates carry

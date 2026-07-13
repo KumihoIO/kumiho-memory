@@ -25,7 +25,24 @@ from kumiho_memory.code_capture import (
     prefilter,
     validate_decisions,
     _truncate_file_diff,
+    _evidence_grade,
 )
+
+
+def test_evidence_grade_from_atoms():
+    """§6: a code decision's Level-of-Evidence grade is derived
+    deterministically (keyless) from its evidence atoms."""
+    assert _evidence_grade([{"kind": "measurement"}]) == "corroborated"
+    assert _evidence_grade(
+        [{"kind": "review_finding"}, {"kind": "constraint"}]
+    ) == "corroborated"
+    assert _evidence_grade([{"kind": "benchmark"}]) == "corroborated"
+    assert _evidence_grade([{"kind": "incident"}]) == "corroborated"
+    assert _evidence_grade([{"kind": "constraint"}]) == "single_source"
+    assert _evidence_grade([{"kind": "rejected_alternative"}]) == "single_source"
+    assert _evidence_grade([{}]) == "single_source"   # default kind = constraint
+    assert _evidence_grade([]) == "unverified"
+    assert _evidence_grade(None) == "unverified"
 
 
 # ---------------- synthetic git repo ----------------

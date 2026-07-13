@@ -326,6 +326,34 @@ def _cand(kref, *, line_hit=False, anchor=False, status="active",
     }
 
 
+def test_evidence_grade_breaks_factual_tier_ties():
+    """§6: within one factual tier, a corroborated decision outranks an
+    unverified one — the LoE delta only moves the probabilistic slot, so
+    anchor facts still dominate the sort."""
+    def ev(kref, level, **kw):
+        c = _cand(kref, **kw)
+        c["meta"]["evidence_level"] = level
+        return c
+
+    ranked = _sort_candidates(
+        [ev("thin", "unverified", anchor=True),
+         ev("solid", "corroborated", anchor=True)],
+        None,
+    )
+    assert [c["kref"] for c in ranked] == ["solid", "thin"]
+
+
+def test_ungraded_decisions_keep_legacy_order():
+    """§6 strict no-op: ungraded (pre-evidence) candidates are untouched —
+    recency still breaks the anchor tie exactly as before."""
+    ranked = _sort_candidates(
+        [_cand("old", anchor=True, decided="2026-01-01"),
+         _cand("new", anchor=True, decided="2026-07-01")],
+        None,
+    )
+    assert [c["kref"] for c in ranked] == ["new", "old"]
+
+
 def test_sort_lexicographic_tiers():
     ranked = _sort_candidates(
         [

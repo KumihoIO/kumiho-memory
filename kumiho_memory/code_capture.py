@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import re
 
 from kumiho_memory._bounded import run_bounded_in_thread
+from kumiho_memory.evidence import CORROBORATED, SINGLE_SOURCE, UNVERIFIED
 from kumiho_memory.code_decisions import (
     CodeMemoryConfig,
     EDGE_DERIVED_FROM,
@@ -608,6 +609,32 @@ def _supersede_pass(
                     logger.debug("code capture: status demotion failed: %s", exc)
 
 
+#: Evidence atoms that empirically substantiate a decision (vs a bare stated
+#: constraint or rejected option).  Their presence lifts the decision's
+#: Level-of-Evidence grade so ``code_why`` ranks well-evidenced decisions
+#: ahead of thin ones within the same factual tier.
+_STRONG_EVIDENCE_KINDS = frozenset(
+    {"measurement", "review_finding", "benchmark", "incident"}
+)
+
+
+def _evidence_grade(evidence_atoms: List[Dict[str, Any]]) -> str:
+    """Deterministic Level-of-Evidence for a code decision from its atoms.
+
+    Keyless (no LLM): a measurement / review_finding / benchmark / incident
+    atom is empirical corroboration; a bare constraint / rejected_alternative
+    is a single stated source; no atoms is unverified.  ``official`` is never
+    auto-assigned — :mod:`kumiho_memory.evidence` reserves it for an explicit
+    operator flag.
+    """
+    kinds = {str(ev.get("kind", "constraint")) for ev in (evidence_atoms or [])}
+    if kinds & _STRONG_EVIDENCE_KINDS:
+        return CORROBORATED
+    if kinds:
+        return SINGLE_SOURCE
+    return UNVERIFIED
+
+
 def _sync_write_commit(
     project_name: str,
     config: CodeMemoryConfig,
@@ -652,6 +679,10 @@ def _sync_write_commit(
             "decided_at": commit.author_date,
             "confidence": str(d.get("confidence", "medium")),
             "status": "active",
+            # Level-of-Evidence grade, derived deterministically from the
+            # decision's evidence atoms (§6) — code_why weights it into
+            # ranking so well-substantiated decisions surface first.
+            "evidence_level": _evidence_grade(d["evidence"]),
             "schema_version": SCHEMA_VERSION,
         }
 
