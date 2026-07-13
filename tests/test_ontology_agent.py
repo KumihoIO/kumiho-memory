@@ -5,9 +5,14 @@ Uses in-memory graph fakes (no server) to assert the deterministic write layer:
 typed nodes, ABOUT/DERIVED_FROM/relation edges, idempotency, and structural
 validation. The live end-to-end proof is scripts/dogfood_ontology_agent.py.
 """
+import asyncio
+import time
+
 import kumiho
+from kumiho_memory import ontology
 from kumiho_memory.ontology import (
     _sync_decompose_agent, _predicate_edge_type, OntologySchema,
+    decompose_and_link_agent,
 )
 
 
@@ -132,3 +137,36 @@ def test_structural_validation(monkeypatch):
     assert stats["entities"] == 1
     assert stats["facts"] == 1
     assert stats["relations"] == 0
+
+
+def test_slow_write_reports_status_not_bare_empty(monkeypatch):
+    """A write that outruns the deadline must not report a bare ``{}``.
+
+    The daemon worker keeps writing after the timeout, so an empty ``{}`` reads
+    as a no-op when the graph is actually being populated. The wrapper returns a
+    status marker instead. Regression for the 25s-bound-vs-cloud-latency bug.
+    """
+    def _slow(*_a, **_k):
+        time.sleep(0.3)
+        return {"entities": 1, "facts": 0, "relations": 0, "edges": 1}
+
+    monkeypatch.setattr(ontology, "_sync_decompose_agent", _slow)
+    res = asyncio.run(decompose_and_link_agent(
+        "kref:/proj/conversations/c.conversation?r=1",
+        {"entities": [{"name": "a"}]}, project_name="proj", timeout=0.05,
+    ))
+    assert res != {}
+    assert res.get("status") == "in_progress"
+
+
+def test_fast_write_returns_real_counts(monkeypatch):
+    """Within the deadline, the real per-kind counts flow back unchanged."""
+    monkeypatch.setattr(
+        ontology, "_sync_decompose_agent",
+        lambda *_a, **_k: {"entities": 2, "facts": 1, "relations": 1, "edges": 5},
+    )
+    res = asyncio.run(decompose_and_link_agent(
+        "kref:/proj/conversations/c.conversation?r=1",
+        {"entities": [{"name": "a"}]}, project_name="proj",
+    ))
+    assert res == {"entities": 2, "facts": 1, "relations": 1, "edges": 5}

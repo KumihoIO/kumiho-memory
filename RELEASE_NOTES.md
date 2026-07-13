@@ -1,5 +1,22 @@
 # Release Notes — kumiho-memory
 
+## v0.14.1
+
+**Release Date:** 2026-07-13
+
+**Fix: `kumiho_memory_decompose` no longer reports a successful write as an empty
+`{}`.** Ontology decomposition is a run of blocking gRPC writes (one round-trip
+per node and per edge); against a cloud backend a decomposition takes ~25s, which
+tripped the old 25s bound. On timeout the wrapper returned an empty `{}` while the
+un-cancellable daemon worker kept writing in the background — so a fully
+successful decomposition looked like a no-op (a live audit saw the tool return
+`{}` even though 5 entities, 3 facts, and all ABOUT / typed-relation edges landed
+in the graph). The write bound is widened to the codebase's `write_timeout`
+convention (60s) so the common case returns real per-kind counts, and on the rare
+genuine overflow the wrapper returns `{"status": "in_progress"}` instead of a bare
+`{}`. Applies to both the keyless `decompose_and_link_agent` and the
+consolidation-time `decompose_and_link`.
+
 ## v0.14.0
 
 **Release Date:** 2026-07-13

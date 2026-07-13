@@ -391,13 +391,24 @@ def _sync_decompose(
     return stats
 
 
+#: Decomposition is a run of blocking gRPC writes (one round-trip per node and
+#: per edge). A full decomposition against a cloud backend takes ~25s and a
+#: large one more, so the old 25s bound made a *successful* write return an
+#: empty ``{}`` — indistinguishable from a no-op — while the un-cancellable
+#: daemon worker kept writing in the background. Widen to the codebase's write
+#: convention (``write_timeout = 60.0``) so the common case returns real counts,
+#: and on the rare genuine overflow report a status marker, never a bare ``{}``.
+_DECOMPOSE_TIMEOUT = 60.0
+_DECOMPOSE_TIMED_OUT: Dict[str, Any] = {"status": "in_progress"}
+
+
 async def decompose_and_link(
     conversation_kref: str,
     summary: Dict[str, Any],
     *,
     project_name: str,
     schema: Optional[OntologySchema] = None,
-    timeout: float = 25.0,
+    timeout: float = _DECOMPOSE_TIMEOUT,
 ) -> Dict[str, int]:
     """Decompose *summary* into a typed graph anchored on *conversation_kref*.
 
@@ -411,7 +422,7 @@ async def decompose_and_link(
         lambda: _sync_decompose(conversation_kref, summary, project_name, sch),
         timeout=timeout,
         label=f"ontology decomposition ({conversation_kref})",
-        on_timeout={},
+        on_timeout=dict(_DECOMPOSE_TIMED_OUT),
         on_error={},
     )
     stats = result or {}
@@ -563,7 +574,7 @@ async def decompose_and_link_agent(
     *,
     project_name: str,
     schema: Optional[OntologySchema] = None,
-    timeout: float = 25.0,
+    timeout: float = _DECOMPOSE_TIMEOUT,
 ) -> Dict[str, int]:
     """Keyless agent-driven decomposition (mirrors :func:`decompose_and_link`)."""
     if not conversation_kref or not decomposition:
@@ -573,7 +584,7 @@ async def decompose_and_link_agent(
         lambda: _sync_decompose_agent(conversation_kref, decomposition, project_name, sch),
         timeout=timeout,
         label=f"ontology decomposition [agent] ({conversation_kref})",
-        on_timeout={},
+        on_timeout=dict(_DECOMPOSE_TIMED_OUT),
         on_error={},
     )
     stats = result or {}
