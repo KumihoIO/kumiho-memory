@@ -118,13 +118,13 @@ def _cleanup_manager():
 
 
 def test_memory_tools_count():
-    """Should have 13 tools registered (10 base + engage + reflect + space_profile)."""
-    assert len(MEMORY_TOOLS) == 13
+    """Should have 14 tools registered (10 base + engage + reflect + space_profile + decompose)."""
+    assert len(MEMORY_TOOLS) == 14
 
 
 def test_memory_tool_handlers_count():
-    """Should have 13 handlers registered."""
-    assert len(MEMORY_TOOL_HANDLERS) == 13
+    """Should have 14 handlers registered."""
+    assert len(MEMORY_TOOL_HANDLERS) == 14
 
 
 def test_all_tools_have_handlers():
@@ -645,6 +645,11 @@ def test_memory_dream_state_dry_run():
     fake_sdk.get_client = lambda: None
     fake_sdk.Kref = FakeKref
 
+    # Restore (not pop) the displaced entry: a bare pop would delete the key and
+    # force the next `import kumiho` to build a fresh module object, breaking
+    # identity-based monkeypatching in sibling tests (see test_ontology_agent).
+    _missing = object()
+    saved = sys.modules.get("kumiho", _missing)
     sys.modules["kumiho"] = fake_sdk
     try:
         # Patch MemorySummarizer so DreamState doesn't need a real API key
@@ -656,7 +661,10 @@ def test_memory_dream_state_dry_run():
         assert result["success"] is True
         assert result["events_processed"] == 0
     finally:
-        sys.modules.pop("kumiho", None)
+        if saved is _missing:
+            sys.modules.pop("kumiho", None)
+        else:
+            sys.modules["kumiho"] = saved
 
 
 def test_memory_dream_state_accepts_gemini_and_base_url():
@@ -688,6 +696,11 @@ def test_memory_dream_state_accepts_gemini_and_base_url():
     fake_sdk.get_client = lambda: None
     fake_sdk.Kref = FakeKref
 
+    # Restore (not pop) the displaced entry: a bare pop would delete the key and
+    # force the next `import kumiho` to build a fresh module object, breaking
+    # identity-based monkeypatching in sibling tests (see test_ontology_agent).
+    _missing = object()
+    saved = sys.modules.get("kumiho", _missing)
     sys.modules["kumiho"] = fake_sdk
     try:
         with patch("kumiho_memory.summarization.MemorySummarizer", return_value=StubSummarizer()) as mock_summarizer:
@@ -712,7 +725,10 @@ def test_memory_dream_state_accepts_gemini_and_base_url():
         assert "gemini" in provider_schema["enum"]
         assert "base_url" in dream_tool["inputSchema"]["properties"]
     finally:
-        sys.modules.pop("kumiho", None)
+        if saved is _missing:
+            sys.modules.pop("kumiho", None)
+        else:
+            sys.modules["kumiho"] = saved
 
 
 # ---------------------------------------------------------------------------
