@@ -45,6 +45,30 @@ def test_evidence_grade_from_atoms():
     assert _evidence_grade(None) == "unverified"
 
 
+def test_run_git_is_bounded_by_timeout(monkeypatch):
+    """Every git subprocess must pass a timeout — the keyless capture resolves
+    git OUTSIDE the write bound, so an unbounded git hang would hang the whole
+    tool indefinitely (observed as a multi-minute no-op)."""
+    from kumiho_memory import code_capture as cc
+
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(stdout="ok")
+
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+    assert cc._run_git(".", "rev-parse", "HEAD") == "ok"
+    assert captured.get("timeout") == cc._GIT_TIMEOUT
+    # a real git hang now surfaces as TimeoutExpired, which the callers already
+    # convert into "git resolution failed" / a repo-id fallback (not a hang)
+    def hang(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=cc._GIT_TIMEOUT)
+
+    monkeypatch.setattr(cc.subprocess, "run", hang)
+    assert derive_repo_id(".")  # falls back to the dir name, does not raise
+
+
 # ---------------- synthetic git repo ----------------
 
 

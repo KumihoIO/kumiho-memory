@@ -127,13 +127,22 @@ def _validate_rev_range(rev_range: str) -> str:
     return rev_range
 
 
+#: Hard ceiling on any git subprocess. The keyless capture resolves git
+#: (derive_repo_id + _commit_info_for_ref) OUTSIDE the write bound, so a hung
+#: git — a stuck credential/fsmonitor helper, a locked or slow repo, a network
+#: mount — would otherwise hang the whole tool indefinitely (observed as a
+#: multi-minute no-op). A timeout turns that into a fast, reported failure that
+#: the callers already handle (git resolution failed / repo-id fallback).
+_GIT_TIMEOUT = 20.0
+
+
 def _run_git(repo_path: str, *args: str) -> str:
     if str(repo_path).startswith("-"):
         raise ValueError(f"unsafe repo path: {repo_path!r}")
     out = subprocess.run(
         ["git", "-C", repo_path, *args],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        check=True,
+        check=True, timeout=_GIT_TIMEOUT,
     )
     return out.stdout
 
