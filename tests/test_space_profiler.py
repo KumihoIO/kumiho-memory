@@ -486,11 +486,19 @@ def test_supersedes_chain_walked_from_true_latest_despite_desc_order():
 
 def _run_profiler(sdk, **kwargs):
     profiler = SpaceProfiler(**kwargs)
+    # Restore (not pop) the displaced entry: a bare pop would delete the key and
+    # force the next `import kumiho` to build a fresh module object, breaking
+    # identity-based monkeypatching in sibling tests (see test_ontology_agent).
+    _missing = object()
+    saved = sys.modules.get("kumiho", _missing)
     sys.modules["kumiho"] = sdk
     try:
         return asyncio.run(profiler.run())
     finally:
-        sys.modules.pop("kumiho", None)
+        if saved is _missing:
+            sys.modules.pop("kumiho", None)
+        else:
+            sys.modules["kumiho"] = saved
 
 
 def test_run_persists_profile_revision():

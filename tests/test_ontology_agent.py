@@ -8,7 +8,6 @@ validation. The live end-to-end proof is scripts/dogfood_ontology_agent.py.
 import asyncio
 import time
 
-import kumiho
 from kumiho_memory import ontology
 from kumiho_memory.ontology import (
     _sync_decompose_agent, _predicate_edge_type, OntologySchema,
@@ -65,9 +64,14 @@ class _FakeProject:
 
 
 def _patch(monkeypatch, conv_rev):
+    # ``_sync_decompose_agent`` does ``import kumiho`` at CALL time, binding to
+    # whatever object sits at ``sys.modules['kumiho']`` then. Resolve it here —
+    # also at call time — so the monkeypatch targets the exact object the code
+    # under test will use, regardless of how sibling tests swap that entry.
+    import kumiho
     proj = _FakeProject("proj")
-    monkeypatch.setattr(kumiho, "get_project", lambda name: proj)
-    monkeypatch.setattr(kumiho, "get_revision", lambda kref: conv_rev)
+    monkeypatch.setattr(kumiho, "get_project", lambda name: proj, raising=False)
+    monkeypatch.setattr(kumiho, "get_revision", lambda kref: conv_rev, raising=False)
     return proj
 
 

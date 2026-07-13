@@ -218,19 +218,31 @@ class StubAdapter:
 # ---------------------------------------------------------------------------
 
 
+_MISSING = object()
+_saved_kumiho = _MISSING  # entry displaced by _make_dream_state, restored by _cleanup_sdk
+
+
 def _make_dream_state(sdk_module, summarizer=None, **kwargs):
     """Build a DreamState and monkey-patch its kumiho import."""
     ds = DreamState(
         summarizer=summarizer or StubSummarizer(),
         **kwargs,
     )
-    # Patch `import kumiho` inside run() by injecting into sys.modules
+    # Inject a fake SDK for `import kumiho` inside run(), remembering what was
+    # there so _cleanup_sdk can restore it. A bare pop deletes the key, forcing
+    # the next `import kumiho` to build a fresh module object — which breaks
+    # identity-based monkeypatching in sibling tests (see test_ontology_agent).
+    global _saved_kumiho
+    _saved_kumiho = sys.modules.get("kumiho", _MISSING)
     sys.modules["kumiho"] = sdk_module
     return ds
 
 
 def _cleanup_sdk():
-    sys.modules.pop("kumiho", None)
+    if _saved_kumiho is _MISSING:
+        sys.modules.pop("kumiho", None)
+    else:
+        sys.modules["kumiho"] = _saved_kumiho
 
 
 def _make_item_with_revision(
