@@ -1,5 +1,35 @@
 # Release Notes — kumiho-memory
 
+## v0.14.0
+
+**Release Date:** 2026-07-13
+
+**Keyless, agent-driven ontology decomposition.** The plugin runs inside Claude
+with no external LLM key — but the ontology decomposition that turns a
+conversation into a typed entity/fact graph ran only via the summarizer LLM at
+consolidation, so under the keyless plugin the typed graph was never built
+(a live audit found 0 entity nodes). This release brings the same keyless
+pattern (the agent extracts, the tool validates + writes) to the ontology, so
+the graph-native typed graph is built with no key.
+
+### Added
+
+- `kumiho_memory_decompose` MCP tool + `UniversalMemoryManager.memory_decompose`
+  (gated on `KUMIHO_MEMORY_ONTOLOGY`): the in-loop agent passes
+  `{entities, facts, relations}` distilled from a memory's summary; the tool
+  validates structure and writes typed `entity`/`fact` nodes + `ABOUT` /
+  `DERIVED_FROM` / typed relation edges, reusing the exact `_Materializer`
+  writers and `slugify` identity as the LLM path — so recall / entity-resolution
+  use the nodes (no ghost nodes).
+- `scripts/dogfood_ontology_agent.py` — live keyless gate (entity 0→N,
+  idempotent, no API key).
+
+### Changed
+
+- `ontology._Materializer.edge` gains an idempotent, best-effort edge-dedup
+  precheck, so re-running a decomposition on the same memory adds no duplicate
+  edges.
+
 ## v0.13.0
 
 **Release Date:** 2026-07-12
