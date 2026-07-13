@@ -1,5 +1,34 @@
 # Release Notes — kumiho-memory
 
+## v0.15.0
+
+**Release Date:** 2026-07-13
+
+**Level-of-Evidence ranking in Decision Memory (`code_why`).** Code decisions
+carried no evidence grade, so `code_why` ranked a thin commit-message decision
+the same as an empirically-measured one. Two surgical, keyless changes close
+that gap:
+
+### Added
+
+- **`code_capture` grades each decision** — a deterministic `evidence_level` is
+  stamped on every code decision from its evidence atoms: a
+  `measurement` / `review_finding` / `benchmark` / `incident` atom is empirical
+  corroboration (`corroborated`); a bare `constraint` / `rejected_alternative`
+  is a single stated source (`single_source`); no atoms is `unverified`. No LLM;
+  `official` is never auto-assigned (reserved for an explicit operator flag).
+- **`code_why` weights evidence into ranking** — `_sort_candidates` folds the
+  evidence delta (reusing `evidence_rank.DEFAULT_EVIDENCE_WEIGHTS`) into the
+  probabilistic slot, so a well-substantiated decision outranks a thin one
+  **within the same factual tier**. Anchor facts still dominate the sort;
+  ungraded (pre-evidence) decisions resolve to `None` and are a **strict no-op**,
+  preserving legacy ordering.
+
+Proven end-to-end by `scripts/dogfood_loe_code.py` (keyless, live CE): the §6
+decision, captured with a measurement atom, self-graded `corroborated` and
+materialized as a `code_decision` node with 4 `IMPLEMENTED_IN` anchors and 3
+`MOTIVATED_BY` evidence atoms.
+
 ## v0.14.1
 
 **Release Date:** 2026-07-13
