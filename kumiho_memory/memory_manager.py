@@ -2063,6 +2063,37 @@ class UniversalMemoryManager:
         )
         return stats.as_dict()
 
+    async def memory_decompose(
+        self,
+        kref: str,
+        *,
+        entities: Optional[List[Dict[str, Any]]] = None,
+        facts: Optional[List[Dict[str, Any]]] = None,
+        relations: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Keyless agent-driven ontology decomposition of a stored memory.
+
+        The in-loop agent (Claude) — which already read the conversation —
+        extracts entities / facts / relations and passes them; this only
+        validates + writes the typed graph (entity/fact nodes, ABOUT /
+        DERIVED_FROM / relation edges), reusing the exact deterministic write
+        path the LLM decomposition uses.  No external LLM key — mirrors
+        :meth:`memory_reflect` / :meth:`code_capture`.  ``kref`` is the stored
+        memory revision (from consolidate/reflect) the typed nodes anchor to.
+        """
+        if not getattr(self, "ontology_enabled", False):
+            return {"errors": ["ontology is disabled (set KUMIHO_MEMORY_ONTOLOGY=1)"]}
+        if not kref:
+            return {"errors": ["kref is required (the stored memory revision to decompose)"]}
+        from kumiho_memory.ontology import decompose_and_link_agent
+
+        stats = await decompose_and_link_agent(
+            kref,
+            {"entities": entities or [], "facts": facts or [], "relations": relations or []},
+            project_name=self.project,
+        )
+        return {"decomposed": stats, "kref": kref}
+
     async def code_mine_session(
         self,
         session_id: str,

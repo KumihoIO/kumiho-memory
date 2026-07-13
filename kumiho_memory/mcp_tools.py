@@ -1386,6 +1386,19 @@ def tool_code_mine_session(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def tool_memory_decompose(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Keyless: store an agent-extracted ontology decomposition of a memory."""
+    manager = _get_manager()
+    return asyncio.run(
+        manager.memory_decompose(
+            args.get("kref", ""),
+            entities=args.get("entities") or [],
+            facts=args.get("facts") or [],
+            relations=args.get("relations") or [],
+        )
+    )
+
+
 _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
     {
         "name": "kumiho_code_why",
@@ -1582,3 +1595,84 @@ def _register_code_memory_tools() -> None:
 
 
 _register_code_memory_tools()
+
+
+_ONTOLOGY_TOOLS: List[Dict[str, Any]] = [
+    {
+        "name": "kumiho_memory_decompose",
+        "description": (
+            "Decompose a stored memory into the typed knowledge graph — KEYLESS "
+            "(no LLM API key: YOU already read the conversation, so extract the "
+            "structure yourself and pass it, exactly like kumiho_memory_reflect). "
+            "Call it after a substantive exchange, using the `kref` returned by "
+            "kumiho_memory_consolidate / kumiho_memory_reflect. Pass the entities "
+            "(reusable named hubs), facts (claims, each ABOUT some entities), and "
+            "entity->entity relations you distilled from the memory's SUMMARY — "
+            "not the raw transcript. Keep it lean (a handful of each)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kref": {"type": "string",
+                         "description": "The stored memory revision kref the typed nodes anchor to (from consolidate/reflect)."},
+                "entities": {
+                    "type": "array",
+                    "description": "Reusable named hubs (people, systems, files, concepts).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Canonical name (the entity hub identity)."},
+                            "type": {"type": "string", "description": "Optional category (person, system, file, concept...)."},
+                            "aliases": {"type": "array", "items": {"type": "string"},
+                                        "description": "Other names that resolve to this same entity."},
+                        },
+                        "required": ["name"],
+                    },
+                },
+                "facts": {
+                    "type": "array",
+                    "description": "Durable claims stated in the memory (each links ABOUT its entities).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "statement": {"type": "string", "description": "The claim, one sentence."},
+                            "about": {"type": "array", "items": {"type": "string"},
+                                      "description": "Entity names this fact is about."},
+                            "type": {"type": "string", "description": "Optional fact category."},
+                        },
+                        "required": ["statement"],
+                    },
+                },
+                "relations": {
+                    "type": "array",
+                    "description": "Typed entity->entity links (subject predicate object).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "subject": {"type": "string", "description": "Source entity name."},
+                            "predicate": {"type": "string", "description": "Relationship, e.g. 'depends on', 'owns', 'supersedes'."},
+                            "object": {"type": "string", "description": "Target entity name."},
+                        },
+                        "required": ["subject", "predicate", "object"],
+                    },
+                },
+            },
+            "required": ["kref"],
+        },
+    },
+]
+
+
+def _register_ontology_tools() -> None:
+    """Register the keyless ontology-decomposition tool (idempotent).
+
+    Ontology is on by default and the manager self-gates, so this is
+    unconditional — the tool returns a clear 'enable ontology' error if off.
+    """
+    if any(t["name"] == "kumiho_memory_decompose" for t in MEMORY_TOOLS):
+        return
+    MEMORY_TOOLS.extend(_ONTOLOGY_TOOLS)
+    MEMORY_TOOL_HANDLERS["kumiho_memory_decompose"] = tool_memory_decompose
+
+
+_register_ontology_tools()

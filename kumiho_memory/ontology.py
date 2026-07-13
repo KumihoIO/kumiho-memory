@@ -172,6 +172,18 @@ class _Materializer:
         if source_rev is None or target_rev is None:
             return False
         try:
+            # Idempotency precheck (server-side dedupe is NOT assumed): re-running
+            # a decomposition on the same kref must not duplicate edges. Best-
+            # effort — if the read is unsupported/transient, fall through and
+            # create rather than silently dropping the edge.
+            target_uri = getattr(getattr(target_rev, "kref", None), "uri", "")
+            if target_uri:
+                try:
+                    for existing in source_rev.get_edges(edge_type_filter=edge_type, direction=0):
+                        if getattr(getattr(existing, "target_kref", None), "uri", "") == target_uri:
+                            return False  # already linked
+                except Exception:  # noqa: BLE001 — no dedup available; create
+                    pass
             source_rev.create_edge(target_rev, edge_type, metadata=metadata or {})
             return True
         except Exception as exc:  # noqa: BLE001
@@ -405,4 +417,166 @@ async def decompose_and_link(
     stats = result or {}
     if stats:
         logger.debug("ontology decomposition of %s: %s", conversation_kref, stats)
+    return stats
+
+
+# --------------------------------------------------------------------------- #
+# Keyless, agent-driven decomposition                                         #
+#                                                                             #
+# The plugin must NEVER use an external LLM key.  The in-loop agent (which     #
+# already read the conversation) extracts entities/facts/relations and passes #
+# them; this only validates STRUCTURE + writes, reusing _Materializer + the   #
+# same slug identity as the LLM path — so a node written here is byte-        #
+# identical to what the summarizer path (and entity_promotion) would create   #
+# and the graph-augmented reader already knows how to traverse.  Mirrors the  #
+# keyless code_capture.capture_decisions pattern.                             #
+# --------------------------------------------------------------------------- #
+
+_PREDICATE_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def _predicate_edge_type(predicate: str) -> Optional[str]:
+    """Normalize an agent predicate to a safe ALL-CAPS edge token (or None)."""
+    tok = _PREDICATE_RE.sub("_", (predicate or "").strip()).strip("_").upper()
+    if not tok or not re.match(r"^[A-Z][A-Z0-9_]*$", tok):
+        return None
+    return tok
+
+
+def _sync_decompose_agent(
+    conversation_kref: str,
+    decomposition: Dict[str, Any],
+    project_name: str,
+    schema: OntologySchema,
+) -> Dict[str, int]:
+    """Materialize an AGENT-supplied ``{entities, facts, relations}``.
+
+    Content is accepted as-authored (the agent read the source — same trust
+    model as reflect/code_capture); only structure is validated: empty fields
+    dropped, relation endpoints must resolve to an entity, predicates must
+    normalize.  Entities dedupe cross-session by slug via ``_Materializer.node``
+    (get-or-create).
+    """
+    import kumiho
+
+    project = kumiho.get_project(project_name)
+    if project is None:
+        return {}
+    try:
+        conv_rev = kumiho.get_revision(conversation_kref)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ontology(agent): conversation %s unavailable: %s", conversation_kref, exc)
+        return {}
+
+    m = _Materializer(project, project_name, schema)
+    stats: Dict[str, int] = {"entities": 0, "facts": 0, "relations": 0, "edges": 0}
+
+    entity_anchors: Dict[str, Any] = {}   # slug -> anchor rev
+    alias_to_slug: Dict[str, str] = {}    # slug(name or alias) -> primary slug
+
+    def _ensure_entity(name: str, entity_type: str = "", aliases=None) -> Optional[str]:
+        name = (name or "").strip()
+        if not name:
+            return None
+        slug = slugify(name, hash_on_truncate=True)
+        if not slug:
+            return None
+        if slug not in entity_anchors:
+            md = {"display_name": name, "promoted_from": conversation_kref}
+            if entity_type:
+                md["entity_type"] = entity_type
+            alist = [str(a).strip() for a in (aliases or []) if str(a).strip()]
+            if alist:
+                md["aliases"] = ", ".join(alist)
+            anchor = m.node(schema.entities_space, "entity", slug, md)
+            if anchor is None:
+                return None
+            entity_anchors[slug] = anchor
+            alias_to_slug[slug] = slug
+            for a in alist:
+                a_slug = slugify(a, hash_on_truncate=True)
+                if a_slug:
+                    alias_to_slug.setdefault(a_slug, slug)
+            stats["entities"] += 1
+        return slug
+
+    def _resolve(name: str) -> Optional[str]:
+        s = slugify((name or "").strip(), hash_on_truncate=True)
+        return alias_to_slug.get(s) if s else None
+
+    for ent in (decomposition.get("entities") or [])[: schema.max_per_kind]:
+        if isinstance(ent, dict):
+            _ensure_entity(str(ent.get("name", "")), str(ent.get("type", "")), ent.get("aliases"))
+        else:
+            _ensure_entity(str(ent))
+
+    for fact in (decomposition.get("facts") or [])[: schema.max_per_kind]:
+        is_dict = isinstance(fact, dict)
+        statement = str(fact.get("statement", "")).strip() if is_dict else str(fact).strip()
+        if not statement:
+            continue
+        slug = slugify(statement, hash_on_truncate=True)
+        anchor = m.node(schema.facts_space, "fact", slug, {
+            "title": _title_of(statement), "summary": statement, "claim": statement,
+            "certainty": "", "fact_type": str(fact.get("type", "")) if is_dict else "",
+        })
+        if anchor is None:
+            continue
+        stats["facts"] += 1
+        if m.edge(anchor, conv_rev, schema.provenance_edge):
+            stats["edges"] += 1
+        for about_name in ((fact.get("about") or []) if is_dict else []):
+            # explicit ABOUT (no token-mention guessing); auto-create so facts
+            # still land their entity links.
+            s = _resolve(str(about_name)) or _ensure_entity(str(about_name))
+            if s and m.edge(anchor, entity_anchors[s], schema.about_edge, {"entity": s}):
+                stats["edges"] += 1
+
+    # conversation -> entity ABOUT (lets the entity-bridge reader hop out to
+    # sibling memories about the same entity — mirrors _sync_decompose).
+    for slug, anchor in entity_anchors.items():
+        if m.edge(conv_rev, anchor, schema.about_edge, {"entity": slug}):
+            stats["edges"] += 1
+
+    # relations: entity -> entity typed edges; drop if an endpoint doesn't
+    # resolve or the predicate can't normalize (referential integrity, the
+    # analog of code_capture dropping hallucinated anchors).
+    for rel in (decomposition.get("relations") or [])[: schema.max_per_kind]:
+        if not isinstance(rel, dict):
+            continue
+        subj = _resolve(str(rel.get("subject", "")))
+        obj = _resolve(str(rel.get("object", "")))
+        etype = _predicate_edge_type(str(rel.get("predicate", "")))
+        if not (subj and obj and etype) or subj == obj:
+            continue
+        if m.edge(entity_anchors[subj], entity_anchors[obj], etype,
+                  {"predicate": str(rel.get("predicate", "")).strip()}):
+            stats["relations"] += 1
+            stats["edges"] += 1
+
+    return stats
+
+
+async def decompose_and_link_agent(
+    conversation_kref: str,
+    decomposition: Dict[str, Any],
+    *,
+    project_name: str,
+    schema: Optional[OntologySchema] = None,
+    timeout: float = 25.0,
+) -> Dict[str, int]:
+    """Keyless agent-driven decomposition (mirrors :func:`decompose_and_link`)."""
+    if not conversation_kref or not decomposition:
+        return {}
+    sch = schema or OntologySchema()
+    result = await run_bounded_in_thread(
+        lambda: _sync_decompose_agent(conversation_kref, decomposition, project_name, sch),
+        timeout=timeout,
+        label=f"ontology decomposition [agent] ({conversation_kref})",
+        on_timeout={},
+        on_error={},
+    )
+    stats = result or {}
+    if stats:
+        logger.debug("ontology decomposition [agent] of %s: %s", conversation_kref, stats)
     return stats
