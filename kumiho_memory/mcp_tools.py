@@ -601,12 +601,34 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
     do_edges = args.get("discover_edges", True)
     stored_krefs: List[str] = []
     edges_total = 0
+    dropped_event_dates: List[Dict[str, str]] = []
 
     if captures:
         from kumiho.mcp_server import tool_memory_store
 
+        # Canonical valid-time validator, shared with the summarizer path so
+        # keyless (reflect) and LLM (consolidation) writes agree on shape.
+        from kumiho_memory.memory_manager import _ISO_EVENT_DATE_RE
+
         for cap in captures:
             cap_space = cap.get("space_hint", "") or space_path
+
+            # Valid-time: stamp a validated ISO event_date onto the revision
+            # metadata so temporal recall anchors on when the event actually
+            # happened, separate from the server-set created_at. A malformed
+            # or relative date is dropped and reported — reflect must never
+            # fail the loop over a bad date.
+            cap_metadata: Optional[Dict[str, str]] = None
+            raw_event_date = str(cap.get("event_date", "") or "").strip()
+            if raw_event_date:
+                if _ISO_EVENT_DATE_RE.match(raw_event_date):
+                    cap_metadata = {"event_date": raw_event_date}
+                else:
+                    dropped_event_dates.append({
+                        "title": cap.get("title", ""),
+                        "event_date": raw_event_date,
+                    })
+
             store_result = tool_memory_store(
                 project=manager.project,
                 space_path=cap_space,
@@ -617,6 +639,7 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                 source_revision_krefs=source_krefs if source_krefs else None,
                 edge_type="DERIVED_FROM",
                 tags=cap.get("tags"),
+                metadata=cap_metadata,
                 stack_revisions=True,
             )
             rev_kref = store_result.get("revision_kref", "")
@@ -639,12 +662,15 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     pass  # graceful — edge discovery is supplementary
 
-    return {
+    result: Dict[str, Any] = {
         "buffered": buffered,
         "captures_stored": len(stored_krefs),
         "edges_discovered": edges_total,
         "stored_krefs": stored_krefs,
     }
+    if dropped_event_dates:
+        result["dropped_event_dates"] = dropped_event_dates
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1191,18 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                                 "description": (
                                     "Space path hint for this capture. "
                                     "Overrides top-level space_path."
+                                ),
+                            },
+                            "event_date": {
+                                "type": "string",
+                                "description": (
+                                    "ISO-8601 calendar date the captured event "
+                                    "actually happened (YYYY, YYYY-MM, or "
+                                    "YYYY-MM-DD) — valid-time, kept separate "
+                                    "from storage time. Lets temporal recall "
+                                    "anchor on when it happened rather than "
+                                    "when it was written. Omit when unknown; "
+                                    "never guess."
                                 ),
                             },
                         },

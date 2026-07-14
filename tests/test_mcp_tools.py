@@ -568,6 +568,124 @@ def test_memory_reflect_with_captures():
         _cleanup_manager()
 
 
+def _fake_store_recorder(store_calls):
+    def fake_store(**kwargs):
+        store_calls.append(kwargs)
+        return {
+            "revision_kref": f"kref://memory/cap/{len(store_calls)}",
+            "item_kref": "kref://memory/item/1",
+        }
+    return fake_store
+
+
+def test_memory_reflect_capture_stamps_valid_event_date():
+    """A valid ISO event_date (full or partial) is passed into revision metadata."""
+    try:
+        _install_test_manager()
+        ingest = tool_memory_ingest({
+            "user_id": "user-reflect-ed",
+            "message": "We shipped bge-m3 back in March.",
+        })
+        store_calls = []
+        with patch("kumiho_memory.mcp_tools.tool_memory_reflect.__module__", "kumiho_memory.mcp_tools"):
+            with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)):
+                result = tool_memory_reflect({
+                    "session_id": ingest["session_id"],
+                    "response": "Noted.",
+                    "captures": [
+                        {
+                            "type": "fact",
+                            "title": "Shipped bge-m3 in March 2026",
+                            "content": "bge-m3 embedding backend shipped.",
+                            "event_date": "2026-03-14",
+                        },
+                        {
+                            "type": "fact",
+                            "title": "Founded in 2019",
+                            "content": "The project was founded.",
+                            "event_date": "2019",  # year-only is valid
+                        },
+                    ],
+                })
+        assert result["captures_stored"] == 2
+        assert "dropped_event_dates" not in result
+        assert store_calls[0]["metadata"] == {"event_date": "2026-03-14"}
+        assert store_calls[1]["metadata"] == {"event_date": "2019"}
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_reflect_capture_drops_invalid_event_date():
+    """A malformed/relative event_date is dropped and reported; capture still stored."""
+    try:
+        _install_test_manager()
+        ingest = tool_memory_ingest({
+            "user_id": "user-reflect-ed2",
+            "message": "Something happened last Tuesday.",
+        })
+        store_calls = []
+        with patch("kumiho_memory.mcp_tools.tool_memory_reflect.__module__", "kumiho_memory.mcp_tools"):
+            with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)):
+                result = tool_memory_reflect({
+                    "session_id": ingest["session_id"],
+                    "response": "Noted.",
+                    "captures": [
+                        {
+                            "type": "fact",
+                            "title": "Relative date capture",
+                            "content": "Happened at some point.",
+                            "event_date": "last Tuesday",
+                        },
+                        {
+                            "type": "fact",
+                            "title": "Wrong separator capture",
+                            "content": "Also happened.",
+                            "event_date": "2026/03/14",
+                        },
+                    ],
+                })
+        # Both captures are still stored — reflect never fails over a bad date.
+        assert result["captures_stored"] == 2
+        assert store_calls[0]["metadata"] is None
+        assert store_calls[1]["metadata"] is None
+        # ...but the drops are reported for the caller.
+        dropped = result.get("dropped_event_dates")
+        assert dropped is not None and len(dropped) == 2
+        assert dropped[0]["event_date"] == "last Tuesday"
+        assert dropped[1]["event_date"] == "2026/03/14"
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_reflect_capture_without_event_date_unchanged():
+    """A capture with no event_date behaves exactly as before (metadata None)."""
+    try:
+        _install_test_manager()
+        ingest = tool_memory_ingest({
+            "user_id": "user-reflect-ed3",
+            "message": "No dates here.",
+        })
+        store_calls = []
+        with patch("kumiho_memory.mcp_tools.tool_memory_reflect.__module__", "kumiho_memory.mcp_tools"):
+            with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)):
+                result = tool_memory_reflect({
+                    "session_id": ingest["session_id"],
+                    "response": "Noted.",
+                    "captures": [
+                        {
+                            "type": "preference",
+                            "title": "Prefers concise output",
+                            "content": "User likes short answers.",
+                        },
+                    ],
+                })
+        assert result["captures_stored"] == 1
+        assert "dropped_event_dates" not in result
+        assert store_calls[0]["metadata"] is None
+    finally:
+        _cleanup_manager()
+
+
 # ---------------------------------------------------------------------------
 # Tests — tool execution
 # ---------------------------------------------------------------------------
