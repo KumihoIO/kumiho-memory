@@ -1,5 +1,21 @@
 # Release Notes — kumiho-memory
 
+## v0.16.2
+
+**Release Date:** 2026-07-14
+
+**`kumiho_memory_reflect` captures can now carry `event_date` (valid-time) (#68).**
+Reflect is the keyless write path, but its capture schema had no `event_date` and
+the handler dropped metadata — so agent-written memories could record *what*
+happened but not *when*, and temporal recall had nothing to anchor on except prose
+in the title. Captures now accept an optional `event_date` (`YYYY` / `YYYY-MM` /
+`YYYY-MM-DD`), validated against the same `_ISO_EVENT_DATE_RE` the summarizer uses
+and written into the revision metadata, so recall surfacing and the valid-time
+rerank boost pick it up. A malformed or relative date is dropped and reported in
+`result["dropped_event_dates"]` — reflect never fails the loop over a bad date —
+and captures without `event_date` are byte-identical to before. Unblocks
+deterministic history backfill from timestamped transcripts. Additive; no API break.
+
 ## v0.16.1
 
 **Release Date:** 2026-07-14
