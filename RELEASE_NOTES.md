@@ -1,5 +1,19 @@
 # Release Notes — kumiho-memory
 
+## v0.16.1
+
+**Release Date:** 2026-07-14
+
+**`kumiho_code_capture` can no longer hang on git (#64).** The keyless
+Decision-Memory capture resolves git (`derive_repo_id` + `_commit_info_for_ref`)
+*outside* the write bound — the graph write is already bounded by
+`write_timeout` (60 s), but `_run_git` shelled out with **no** `subprocess`
+timeout, so a hung git (a stuck credential/fsmonitor helper, a locked or slow
+repo, a network mount, an odd ref) could hang the whole tool indefinitely
+(observed as a multi-minute no-op with no output). A 20 s ceiling on every git
+subprocess turns that into a fast, reported failure the callers already handle
+(`"git resolution failed"` / repo-id fallback). Bug-fix only; no API change.
+
 ## v0.16.0
 
 **Release Date:** 2026-07-13
