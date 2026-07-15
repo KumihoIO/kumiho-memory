@@ -604,20 +604,20 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
     dropped_event_dates: List[Dict[str, str]] = []
 
     if captures:
+        import kumiho as _kumiho
         from kumiho.mcp_server import tool_memory_store
 
         # Canonical valid-time validator, shared with the summarizer path so
         # keyless (reflect) and LLM (consolidation) writes agree on shape.
         from kumiho_memory.memory_manager import _ISO_EVENT_DATE_RE
 
+        # Valid-time: validate each capture's ISO event_date ONCE up front so the
+        # single-write and batched-write paths stamp identical, validated metadata
+        # onto the revision (temporal recall anchors on when the event happened,
+        # separate from the server-set created_at). A malformed or relative date is
+        # dropped and reported — reflect must never fail over a bad date.
+        prepared: List[Dict[str, Any]] = []
         for cap in captures:
-            cap_space = cap.get("space_hint", "") or space_path
-
-            # Valid-time: stamp a validated ISO event_date onto the revision
-            # metadata so temporal recall anchors on when the event actually
-            # happened, separate from the server-set created_at. A malformed
-            # or relative date is dropped and reported — reflect must never
-            # fail the loop over a bad date.
             cap_metadata: Optional[Dict[str, str]] = None
             raw_event_date = str(cap.get("event_date", "") or "").strip()
             if raw_event_date:
@@ -628,39 +628,80 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                         "title": cap.get("title", ""),
                         "event_date": raw_event_date,
                     })
+            prepared.append({"cap": cap, "metadata": cap_metadata})
 
-            store_result = tool_memory_store(
-                project=manager.project,
-                space_path=cap_space,
-                memory_type=cap.get("type", "summary"),
-                title=cap.get("title", ""),
-                summary=cap.get("content", ""),
-                assistant_text=cap.get("content", ""),
-                source_revision_krefs=source_krefs if source_krefs else None,
-                edge_type="DERIVED_FROM",
-                tags=cap.get("tags"),
-                metadata=cap_metadata,
-                stack_revisions=True,
-            )
-            rev_kref = store_result.get("revision_kref", "")
-            if rev_kref:
-                stored_krefs.append(rev_kref)
-
-            # 3. Edge discovery (best-effort, skipped if no server-side LLM)
-            if do_edges and rev_kref and cap.get("type") in (
+        def _discover(rev_kref: str, cap: Dict[str, Any]) -> None:
+            # Edge discovery (best-effort, skipped if no server-side LLM).
+            if not (do_edges and rev_kref and cap.get("type") in (
                 "decision", "architecture", "implementation",
                 "synthesis", "reflection",
-            ):
-                try:
-                    edges = asyncio.run(
-                        manager.discover_edges_post_consolidation(
-                            revision_kref=rev_kref,
-                            summary=cap.get("content", ""),
-                        )
+            )):
+                return
+            nonlocal edges_total
+            try:
+                edges = asyncio.run(
+                    manager.discover_edges_post_consolidation(
+                        revision_kref=rev_kref, summary=cap.get("content", ""),
                     )
-                    edges_total += len(edges)
-                except Exception:
-                    pass  # graceful — edge discovery is supplementary
+                )
+                edges_total += len(edges)
+            except Exception:
+                pass  # graceful — edge discovery is supplementary
+
+        # A ≥2-capture reflect (backfill and any bulk write) goes through ONE
+        # batched transaction: it removes the neo4j relationship-group deadlock
+        # that per-capture writes hit under load and collapses the heaviest
+        # create/revision RPCs into one. A single capture — the common live case —
+        # keeps the byte-identical per-capture path below. The guard also degrades
+        # gracefully if the installed kumiho core predates the batch helper.
+        try:
+            from kumiho.mcp_server import tool_memory_store_batch
+            _has_batch = hasattr(_kumiho, "batch_create_revisions")
+        except ImportError:
+            _has_batch = False
+
+        if len(prepared) >= 2 and _has_batch:
+            batch_out = tool_memory_store_batch(
+                captures=[{
+                    "type": p["cap"].get("type", "summary"),
+                    "title": p["cap"].get("title", ""),
+                    "content": p["cap"].get("content", ""),
+                    "tags": p["cap"].get("tags"),
+                    "metadata": p["metadata"],
+                    "space_hint": p["cap"].get("space_hint", "") or space_path,
+                } for p in prepared],
+                project=manager.project,
+                space_path=space_path,
+                source_revision_krefs=source_krefs if source_krefs else None,
+                edge_type="DERIVED_FROM",
+                stack_revisions=True,
+            )
+            for p, res in zip(prepared, batch_out.get("results", [])):
+                rev_kref = (res or {}).get("revision_kref", "")
+                if rev_kref:
+                    stored_krefs.append(rev_kref)
+                    _discover(rev_kref, p["cap"])
+        else:
+            for p in prepared:
+                cap = p["cap"]
+                cap_space = cap.get("space_hint", "") or space_path
+                store_result = tool_memory_store(
+                    project=manager.project,
+                    space_path=cap_space,
+                    memory_type=cap.get("type", "summary"),
+                    title=cap.get("title", ""),
+                    summary=cap.get("content", ""),
+                    assistant_text=cap.get("content", ""),
+                    source_revision_krefs=source_krefs if source_krefs else None,
+                    edge_type="DERIVED_FROM",
+                    tags=cap.get("tags"),
+                    metadata=p["metadata"],
+                    stack_revisions=True,
+                )
+                rev_kref = store_result.get("revision_kref", "")
+                if rev_kref:
+                    stored_krefs.append(rev_kref)
+                _discover(rev_kref, cap)
 
     result: Dict[str, Any] = {
         "buffered": buffered,

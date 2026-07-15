@@ -1,5 +1,25 @@
 # Release Notes — kumiho-memory
 
+## v0.16.3
+
+**Release Date:** 2026-07-14
+
+**`kumiho_memory_reflect` batches multi-capture writes through `BatchCreateRevisions`.**
+A reflect with **≥2 captures** (history backfill and any bulk write) now lands in a
+**single server transaction** via the new `tool_memory_store_batch` (kumiho core
+≥0.10.7 / `BatchCreateRevisions`, kumiho-server ≥1.6.3) instead of N per-capture
+writes. Measured against a local CE, naive per-capture concurrency intermittently
+**deadlocked** neo4j on relationship-group locks and capped at ~1.67× even at zero
+RTT; the batch write removes the deadlock (one transaction, no cross-item lock
+contention) and collapses the heaviest `create_item` + `create_revision` + artifact
+RPCs into one. A **single-capture** reflect — the common live case — keeps the
+byte-identical per-capture path, and the batch path preserves every per-capture
+semantic (credential screen, space resolution, fuzzy-stack, `event_date`, tags,
+`topic` bundle, `DERIVED_FROM` edges); only the create/revision writes are batched
+(the server has no batch RPC for tag/bundle/edge, so those stay per-item). Requires
+`kumiho>=0.10.7`; degrades gracefully to the per-capture loop on older cores.
+Additive; no API break.
+
 ## v0.16.2
 
 **Release Date:** 2026-07-14

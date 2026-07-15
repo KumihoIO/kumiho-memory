@@ -578,6 +578,29 @@ def _fake_store_recorder(store_calls):
     return fake_store
 
 
+def _fake_batch_recorder(batch_calls):
+    def fake_batch(captures, **kwargs):
+        batch_calls.append({"captures": captures, **kwargs})
+        return {
+            "results": [
+                {"revision_kref": f"kref://memory/batch/{i}",
+                 "item_kref": "kref://memory/item/b"}
+                for i in range(len(captures))
+            ],
+            "stored_krefs": [f"kref://memory/batch/{i}" for i in range(len(captures))],
+            "stacked": 0,
+        }
+    return fake_batch
+
+
+def _effective_metadata(store_calls, batch_calls):
+    """Per-capture metadata that reached the write layer, regardless of route
+    (the per-capture ``tool_memory_store`` loop vs one ``tool_memory_store_batch``)."""
+    if batch_calls:
+        return [c.get("metadata") for c in batch_calls[0]["captures"]]
+    return [k.get("metadata") for k in store_calls]
+
+
 def test_memory_reflect_capture_stamps_valid_event_date():
     """A valid ISO event_date (full or partial) is passed into revision metadata."""
     try:
@@ -586,31 +609,33 @@ def test_memory_reflect_capture_stamps_valid_event_date():
             "user_id": "user-reflect-ed",
             "message": "We shipped bge-m3 back in March.",
         })
-        store_calls = []
-        with patch("kumiho_memory.mcp_tools.tool_memory_reflect.__module__", "kumiho_memory.mcp_tools"):
-            with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)):
-                result = tool_memory_reflect({
-                    "session_id": ingest["session_id"],
-                    "response": "Noted.",
-                    "captures": [
-                        {
-                            "type": "fact",
-                            "title": "Shipped bge-m3 in March 2026",
-                            "content": "bge-m3 embedding backend shipped.",
-                            "event_date": "2026-03-14",
-                        },
-                        {
-                            "type": "fact",
-                            "title": "Founded in 2019",
-                            "content": "The project was founded.",
-                            "event_date": "2019",  # year-only is valid
-                        },
-                    ],
-                })
+        store_calls, batch_calls = [], []
+        with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)), \
+                patch("kumiho.mcp_server.tool_memory_store_batch", _fake_batch_recorder(batch_calls)):
+            result = tool_memory_reflect({
+                "session_id": ingest["session_id"],
+                "response": "Noted.",
+                "captures": [
+                    {
+                        "type": "fact",
+                        "title": "Shipped bge-m3 in March 2026",
+                        "content": "bge-m3 embedding backend shipped.",
+                        "event_date": "2026-03-14",
+                    },
+                    {
+                        "type": "fact",
+                        "title": "Founded in 2019",
+                        "content": "The project was founded.",
+                        "event_date": "2019",  # year-only is valid
+                    },
+                ],
+            })
         assert result["captures_stored"] == 2
         assert "dropped_event_dates" not in result
-        assert store_calls[0]["metadata"] == {"event_date": "2026-03-14"}
-        assert store_calls[1]["metadata"] == {"event_date": "2019"}
+        # Valid dates reach the write layer regardless of route (>=2 -> batch).
+        meta = _effective_metadata(store_calls, batch_calls)
+        assert meta[0] == {"event_date": "2026-03-14"}
+        assert meta[1] == {"event_date": "2019"}
     finally:
         _cleanup_manager()
 
@@ -623,31 +648,32 @@ def test_memory_reflect_capture_drops_invalid_event_date():
             "user_id": "user-reflect-ed2",
             "message": "Something happened last Tuesday.",
         })
-        store_calls = []
-        with patch("kumiho_memory.mcp_tools.tool_memory_reflect.__module__", "kumiho_memory.mcp_tools"):
-            with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)):
-                result = tool_memory_reflect({
-                    "session_id": ingest["session_id"],
-                    "response": "Noted.",
-                    "captures": [
-                        {
-                            "type": "fact",
-                            "title": "Relative date capture",
-                            "content": "Happened at some point.",
-                            "event_date": "last Tuesday",
-                        },
-                        {
-                            "type": "fact",
-                            "title": "Wrong separator capture",
-                            "content": "Also happened.",
-                            "event_date": "2026/03/14",
-                        },
-                    ],
-                })
+        store_calls, batch_calls = [], []
+        with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)), \
+                patch("kumiho.mcp_server.tool_memory_store_batch", _fake_batch_recorder(batch_calls)):
+            result = tool_memory_reflect({
+                "session_id": ingest["session_id"],
+                "response": "Noted.",
+                "captures": [
+                    {
+                        "type": "fact",
+                        "title": "Relative date capture",
+                        "content": "Happened at some point.",
+                        "event_date": "last Tuesday",
+                    },
+                    {
+                        "type": "fact",
+                        "title": "Wrong separator capture",
+                        "content": "Also happened.",
+                        "event_date": "2026/03/14",
+                    },
+                ],
+            })
         # Both captures are still stored — reflect never fails over a bad date.
         assert result["captures_stored"] == 2
-        assert store_calls[0]["metadata"] is None
-        assert store_calls[1]["metadata"] is None
+        meta = _effective_metadata(store_calls, batch_calls)
+        assert meta[0] is None
+        assert meta[1] is None
         # ...but the drops are reported for the caller.
         dropped = result.get("dropped_event_dates")
         assert dropped is not None and len(dropped) == 2
@@ -682,6 +708,51 @@ def test_memory_reflect_capture_without_event_date_unchanged():
         assert result["captures_stored"] == 1
         assert "dropped_event_dates" not in result
         assert store_calls[0]["metadata"] is None
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_reflect_bulk_routes_to_batch():
+    """>=2 captures go through ONE batched write, not the per-capture loop."""
+    try:
+        _install_test_manager()
+        ingest = tool_memory_ingest({"user_id": "user-reflect-bulk", "message": "bulk"})
+        store_calls, batch_calls = [], []
+        with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)), \
+                patch("kumiho.mcp_server.tool_memory_store_batch", _fake_batch_recorder(batch_calls)):
+            result = tool_memory_reflect({
+                "session_id": ingest["session_id"],
+                "response": "ok",
+                "captures": [
+                    {"type": "fact", "title": "A", "content": "aaa"},
+                    {"type": "fact", "title": "B", "content": "bbb"},
+                    {"type": "fact", "title": "C", "content": "ccc"},
+                ],
+            })
+        assert len(batch_calls) == 1                    # exactly one batched write
+        assert len(batch_calls[0]["captures"]) == 3
+        assert store_calls == []                        # per-capture loop NOT used
+        assert result["captures_stored"] == 3
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_reflect_single_capture_uses_store():
+    """A single capture keeps the byte-identical per-capture path (no batch)."""
+    try:
+        _install_test_manager()
+        ingest = tool_memory_ingest({"user_id": "user-reflect-one", "message": "one"})
+        store_calls, batch_calls = [], []
+        with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)), \
+                patch("kumiho.mcp_server.tool_memory_store_batch", _fake_batch_recorder(batch_calls)):
+            result = tool_memory_reflect({
+                "session_id": ingest["session_id"],
+                "response": "ok",
+                "captures": [{"type": "fact", "title": "solo", "content": "single"}],
+            })
+        assert len(store_calls) == 1                     # per-capture path used
+        assert batch_calls == []                         # batch NOT used
+        assert result["captures_stored"] == 1
     finally:
         _cleanup_manager()
 
