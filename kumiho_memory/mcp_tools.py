@@ -599,9 +599,11 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
     source_krefs = args.get("source_krefs") or []
     space_path = args.get("space_path", "")
     do_edges = args.get("discover_edges", True)
+    idempotency_prefix = args.get("idempotency_prefix", "") or ""
     stored_krefs: List[str] = []
     edges_total = 0
     dropped_event_dates: List[Dict[str, str]] = []
+    capture_results: Optional[List[Dict[str, Any]]] = None
 
     if captures:
         import kumiho as _kumiho
@@ -660,7 +662,9 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
         except ImportError:
             _has_batch = False
 
-        if len(prepared) >= 2 and _has_batch:
+        # An idempotency_prefix (bulk/backfill resume) forces the batched path even
+        # for a single capture, so the caller always gets positional capture_results.
+        if (len(prepared) >= 2 or idempotency_prefix) and _has_batch:
             batch_out = tool_memory_store_batch(
                 captures=[{
                     "type": p["cap"].get("type", "summary"),
@@ -675,8 +679,15 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                 source_revision_krefs=source_krefs if source_krefs else None,
                 edge_type="DERIVED_FROM",
                 stack_revisions=True,
+                idempotency_prefix=idempotency_prefix,
             )
-            for p, res in zip(prepared, batch_out.get("results", [])):
+            # Positionally-aligned per-capture results (each {revision_kref, ...} or
+            # {error}) so a bulk caller (history backfill) can map + mark each
+            # capture exactly — reflect's flat stored_krefs alone can't attribute a
+            # mid-batch failure. Rows the idempotency_prefix replayed as no-ops come
+            # back with their existing revision_kref just like fresh writes.
+            capture_results = batch_out.get("results") or []
+            for p, res in zip(prepared, capture_results):
                 rev_kref = (res or {}).get("revision_kref", "")
                 if rev_kref:
                     stored_krefs.append(rev_kref)
@@ -709,6 +720,8 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
         "edges_discovered": edges_total,
         "stored_krefs": stored_krefs,
     }
+    if capture_results is not None:
+        result["capture_results"] = capture_results
     if dropped_event_dates:
         result["dropped_event_dates"] = dropped_event_dates
     return result
@@ -1276,6 +1289,19 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "description": (
                         "Run edge discovery on stored captures. "
                         "Gracefully skipped if no server-side LLM."
+                    ),
+                },
+                "idempotency_prefix": {
+                    "type": "string",
+                    "description": (
+                        "Optional. Write the captures through one "
+                        "BatchCreateRevisions transaction keyed on "
+                        "{prefix}:{index}, so re-submitting the same captures "
+                        "replays committed rows as a no-op; the result carries a "
+                        "positionally-aligned capture_results list ("
+                        "{revision_kref} | {error} per capture) for exact "
+                        "per-capture mapping. Used by history backfill for "
+                        "resumable bulk ingest."
                     ),
                 },
             },

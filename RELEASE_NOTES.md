@@ -1,5 +1,29 @@
 # Release Notes — kumiho-memory
 
+## v0.17.0
+
+**Release Date:** 2026-07-14
+
+**`kumiho_memory_reflect` bulk-replay contract for resumable ingest.**
+Adds the two pieces history backfill needs to drive the batched write path
+(0.16.3 shipped the batch write itself but not the caller contract):
+- **`idempotency_prefix`** parameter — writing the captures through one
+  `BatchCreateRevisions` transaction keyed on `{prefix}:{index}`, so
+  re-submitting the same captures replays committed rows as a no-op (resumable
+  after an interrupted ingest). Passing it also forces the batched path for a
+  single capture, so the result shape is consistent.
+- **`capture_results`** in the result — a list positionally aligned with the
+  input captures, each `{revision_kref, …}` on success or `{error}` on failure,
+  so a bulk caller can map and mark each capture exactly (reflect's flat
+  `stored_krefs` alone can't attribute a mid-batch failure).
+
+Both are additive: a reflect without `idempotency_prefix` behaves exactly as in
+0.16.3 (single capture → per-capture path; ≥2 → batch, no `capture_results`
+unless the field is requested by prefix). This is the contract
+`kumiho-plugins` History Backfill feature-detects (`"idempotency_prefix" in`
+the reflect schema) to switch from per-capture replay to one batched reflect
+per session.
+
 ## v0.16.3
 
 **Release Date:** 2026-07-14

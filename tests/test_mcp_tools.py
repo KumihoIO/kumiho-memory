@@ -757,6 +757,39 @@ def test_memory_reflect_single_capture_uses_store():
         _cleanup_manager()
 
 
+def test_memory_reflect_idempotency_prefix_forces_batch_and_returns_capture_results():
+    """A single capture WITH idempotency_prefix takes the batch path and the
+    result carries a positional capture_results list (the 0.17.0 bulk contract
+    history backfill consumes)."""
+    try:
+        _install_test_manager()
+        ingest = tool_memory_ingest({"user_id": "user-reflect-idem", "message": "x"})
+        store_calls, batch_calls = [], []
+        with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)), \
+                patch("kumiho.mcp_server.tool_memory_store_batch", _fake_batch_recorder(batch_calls)):
+            result = tool_memory_reflect({
+                "session_id": ingest["session_id"],
+                "response": "ok",
+                "captures": [{"type": "fact", "title": "solo", "content": "single"}],
+                "idempotency_prefix": "backfill:sess1:abc123",
+            })
+        assert len(batch_calls) == 1                         # prefix forces batch even for 1 capture
+        assert batch_calls[0]["idempotency_prefix"] == "backfill:sess1:abc123"
+        assert store_calls == []
+        rows = result.get("capture_results")
+        assert isinstance(rows, list) and len(rows) == 1     # positionally aligned
+        assert rows[0].get("revision_kref")
+    finally:
+        _cleanup_manager()
+
+
+def test_reflect_schema_exposes_idempotency_prefix():
+    """batch_capable() in the backfill runner keys off this schema property."""
+    from kumiho_memory.mcp_tools import MEMORY_TOOLS
+    reflect = next(t for t in MEMORY_TOOLS if t["name"] == "kumiho_memory_reflect")
+    assert "idempotency_prefix" in reflect["inputSchema"]["properties"]
+
+
 # ---------------------------------------------------------------------------
 # Tests — tool execution
 # ---------------------------------------------------------------------------
