@@ -1,5 +1,13 @@
 # Release Notes — kumiho-memory
 
+## v0.17.2
+
+**Release Date:** 2026-07-15
+
+Corrects the package `__version__` string — 0.17.1 shipped reporting `"0.17.0"`
+(the `pyproject.toml` version was bumped but `__init__.py` was not). No functional
+change from 0.17.1 (same loop-aware Redis client).
+
 ## v0.17.1
 
 **Release Date:** 2026-07-15
