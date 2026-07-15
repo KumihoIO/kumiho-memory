@@ -179,3 +179,44 @@ def test_proxy_request_surfaces_non_auth_errors(mock_token):
             )
         # Only one call — no retry for non-auth errors
         assert mock_post.call_count == 1
+
+
+def test_owned_client_rebinds_across_event_loops():
+    """A self-created client is rebound to each new event loop.
+
+    redis.asyncio binds a connection to the loop of first use; History Backfill
+    runs one asyncio.run() per session, so a cached connection from a prior
+    (closed) loop would crash with "Event loop is closed" on the next session.
+    """
+    made = []
+
+    def fake_from_url(url, **kw):
+        client = MagicMock(name=f"client{len(made)}")
+        made.append(client)
+        return client
+
+    with patch("kumiho_memory.redis_memory.redis.from_url", side_effect=fake_from_url):
+        buffer = RedisMemoryBuffer(redis_url="redis://test", prefer_discovery=False)
+
+        async def get():
+            return buffer.client
+
+        first = asyncio.run(get())
+        second = asyncio.run(get())
+
+    assert first is not second, "owned client must rebind on a new event loop"
+
+
+def test_injected_client_is_never_rebound():
+    """A caller-injected client (e.g. a test double) is returned as-is and never
+    recreated from redis_url — even across event loops."""
+    fake = FakeRedis()
+    with patch("kumiho_memory.redis_memory.redis.from_url",
+               side_effect=AssertionError("must not recreate an injected client")):
+        buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+
+        async def get():
+            return buffer.client
+
+        assert asyncio.run(get()) is fake
+        assert asyncio.run(get()) is fake

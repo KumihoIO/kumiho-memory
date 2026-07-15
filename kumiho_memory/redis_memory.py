@@ -104,9 +104,48 @@ class RedisMemoryBuffer:
             )
 
         self.redis_url = resolved_url
-        self.client = client or (
-            redis.from_url(self.redis_url, decode_responses=True) if self.redis_url else None
-        )
+        self._client_loop = None
+        if client is not None:
+            # Caller-injected client (e.g. a test double) — never auto-recreate it.
+            self._client = client
+            self._owns_client = False
+        else:
+            self._client = (
+                redis.from_url(self.redis_url, decode_responses=True) if self.redis_url else None
+            )
+            self._owns_client = self._client is not None
+
+    @property
+    def client(self):
+        """The Redis client, rebound to the currently-running event loop.
+
+        ``redis.asyncio`` binds a connection to the loop it is first used on. A
+        caller that runs several ``asyncio.run()`` calls in one process (History
+        Backfill replays one ``reflect()`` per session, each under its own fresh
+        loop) would otherwise reuse a connection tied to an already-closed loop
+        and crash with "Event loop is closed" on the 2nd session. When we created
+        the client ourselves from ``redis_url`` we cheaply recreate it on loop
+        change (``from_url`` is lazy — no connection until first command). A
+        caller-injected client is left untouched.
+        """
+        if self._client is None or not self._owns_client:
+            return self._client
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return self._client
+        if self._client_loop is not loop:
+            self._client = redis.from_url(self.redis_url, decode_responses=True)
+            self._client_loop = loop
+        return self._client
+
+    @client.setter
+    def client(self, value) -> None:
+        self._client = value
+        self._client_loop = None
+        # An explicitly-assigned client is caller-owned (test double, or the
+        # backfill guard's fresh per-loop client) — do not auto-rebind it.
+        self._owns_client = False
 
     def _session_messages_key(self, project: str, session_id: str) -> str:
         tenant_prefix = self.tenant_id or self.tenant_hint
