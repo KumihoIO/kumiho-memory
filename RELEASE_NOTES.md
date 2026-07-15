@@ -1,5 +1,24 @@
 # Release Notes — kumiho-memory
 
+## v0.17.1
+
+**Release Date:** 2026-07-15
+
+**Loop-aware Redis client — repeated `reflect()` in one process no longer crashes.**
+`RedisMemoryBuffer` created its `redis.asyncio` client once and cached it. Because
+a `redis.asyncio` connection binds to the event loop of first use, a caller that
+runs several `asyncio.run()` calls in one process — History Backfill replays one
+`reflect()` per session, each under its own fresh loop — reused a connection tied
+to an already-closed loop and crashed on the 2nd session with *"Event loop is
+closed"* / *"'NoneType' object has no attribute 'send'"* (so a single ingest
+process could only store one session).
+
+`RedisMemoryBuffer.client` is now a **loop-aware property**: a client we created
+ourselves (from `redis_url`) is cheaply recreated on loop change (`from_url` is
+lazy — no connection until first command); a caller-injected client (e.g. a test
+double) is returned untouched. The long-lived MCP server (single persistent loop)
+is unaffected. Regression tests cover both paths.
+
 ## v0.17.0
 
 **Release Date:** 2026-07-14
