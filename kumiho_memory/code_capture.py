@@ -165,6 +165,12 @@ def _run_git(repo_path: str, *args: str) -> str:
             # unboundedly — every wait here must stay bounded.
             pass
         raise subprocess.TimeoutExpired(cmd, _GIT_TIMEOUT) from None
+    except BaseException:
+        # Parity with subprocess.run's bare-except: an interrupt (or any
+        # other escape) mid-communicate() must never leak a live git child
+        # with open pipes.
+        proc.kill()
+        raise
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(
             proc.returncode, cmd, output=stdout, stderr=stderr,

@@ -100,6 +100,42 @@ def test_run_git_kill_path_is_bounded(monkeypatch):
     assert derive_repo_id(".")  # falls back to the dir name, does not raise
 
 
+def test_run_git_kills_child_on_interrupt(monkeypatch):
+    """Parity with subprocess.run's bare-except: an interrupt (or any other
+    non-timeout escape) mid-communicate() must kill the child before
+    propagating — otherwise a live git process leaks with open pipes."""
+    from kumiho_memory import code_capture as cc
+
+    class _InterruptProc:
+        def __init__(self):
+            self.killed = False
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            raise KeyboardInterrupt()
+
+        def kill(self):
+            self.killed = True
+
+    procs = []
+
+    def fake_popen(*args, **kwargs):
+        proc = _InterruptProc()
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(cc.subprocess, "Popen", fake_popen)
+
+    try:
+        cc._run_git(".", "rev-parse", "HEAD")
+        raise AssertionError("expected KeyboardInterrupt")
+    except KeyboardInterrupt:
+        pass
+
+    (proc,) = procs
+    assert proc.killed  # the child was killed, not leaked
+
+
 # ---------------- synthetic git repo ----------------
 
 
