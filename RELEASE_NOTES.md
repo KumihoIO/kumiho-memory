@@ -1,5 +1,30 @@
 # Release Notes — kumiho-memory
 
+## v0.17.3
+
+**Release Date:** 2026-07-16
+
+**`_run_git` waits are now bounded on every path — fixes a 30-minute
+`kumiho_code_capture` hang on Windows (#79).**
+
+`subprocess.run(timeout=...)` is not actually bounded on Windows: its
+`TimeoutExpired` path calls `kill()` followed by a timeout-less
+`communicate()`, and `TerminateProcess` is asynchronous — a git child stuck
+in uninterruptible kernel I/O (Defender scan, disk stall) or a descendant
+holding the inherited pipe handles keeps the pipes open, so the drain blocks
+indefinitely. Observed in production as a 30-minute `kumiho_code_capture`
+MCP hang that only the client idle timeout ended; the capture was lost.
+
+`_run_git` now drives the subprocess explicitly: `communicate(timeout=20)`,
+on timeout `kill()` plus a bounded 5 s grace drain, then abandon the daemon
+reader threads instead of joining unboundedly. Any other escape (e.g.
+`KeyboardInterrupt`) kills the child before propagating — parity with
+`subprocess.run`'s bare-except. Exception surface is unchanged
+(`TimeoutExpired` / `CalledProcessError`), so callers keep their existing
+"git resolution failed" / repo-id fallback behavior. Everything that shells
+out through this helper is covered: capture, `code_why`, ingest, session
+mining. (#79, #80)
+
 ## v0.17.2
 
 **Release Date:** 2026-07-15
