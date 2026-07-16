@@ -1,5 +1,21 @@
 # Release Notes — kumiho-memory
 
+## v0.17.4
+
+**Release Date:** 2026-07-16
+
+Follow-up hardening on the v0.17.3 `_run_git` fix (adversarial-review LOW
+findings, #82):
+
+- The re-raised `TimeoutExpired` now carries the post-kill drained
+  output/stderr when the bounded grace drain succeeds — parity with
+  `subprocess.run`, so callers can see *why* git stalled.
+- The abandon path closes our pipe ends before abandoning the daemon
+  reader threads, so they exit promptly instead of accumulating in
+  long-lived MCP server processes.
+- Test fakes now model pipes end to end, including the grace-success
+  drain path.
+
 ## v0.17.3
 
 **Release Date:** 2026-07-16
