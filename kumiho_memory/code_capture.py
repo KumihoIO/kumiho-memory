@@ -157,14 +157,26 @@ def _run_git(repo_path: str, *args: str) -> str:
         stdout, stderr = proc.communicate(timeout=_GIT_TIMEOUT)
     except subprocess.TimeoutExpired:
         proc.kill()
+        out = err = None
         try:
-            proc.communicate(timeout=_GIT_KILL_GRACE)
+            # Bounded post-kill drain: parity with subprocess.run, which
+            # attaches whatever the child wrote before dying.
+            out, err = proc.communicate(timeout=_GIT_KILL_GRACE)
         except subprocess.TimeoutExpired:
             # The child (or a descendant holding its pipes) survived kill().
             # Abandon the daemon reader threads instead of joining them
-            # unboundedly — every wait here must stay bounded.
-            pass
-        raise subprocess.TimeoutExpired(cmd, _GIT_TIMEOUT) from None
+            # unboundedly — every wait here must stay bounded — but close
+            # our pipe ends first so the readers error out promptly instead
+            # of accumulating for the life of the process.
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
+        raise subprocess.TimeoutExpired(
+            cmd, _GIT_TIMEOUT, output=out, stderr=err,
+        ) from None
     except BaseException:
         # Parity with subprocess.run's bare-except: an interrupt (or any
         # other escape) mid-communicate() must never leak a live git child

@@ -45,6 +45,14 @@ def test_evidence_grade_from_atoms():
     assert _evidence_grade(None) == "unverified"
 
 
+class _FakePipe:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 class _StuckProc:
     """A git process whose pipes never close — kill() doesn't release them.
 
@@ -58,6 +66,8 @@ class _StuckProc:
         self.killed = False
         self.timeouts_seen = []
         self.returncode = None
+        self.stdout = _FakePipe()
+        self.stderr = _FakePipe()
 
     def communicate(self, timeout=None):
         self.timeouts_seen.append(timeout)
@@ -65,6 +75,16 @@ class _StuckProc:
 
     def kill(self):
         self.killed = True
+
+
+class _SlowDrainProc(_StuckProc):
+    """Times out once, then drains after kill() — the grace-success path."""
+
+    def communicate(self, timeout=None):
+        self.timeouts_seen.append(timeout)
+        if len(self.timeouts_seen) == 1:
+            raise subprocess.TimeoutExpired(cmd="git", timeout=timeout or 0)
+        return ("partial-out", "partial-err")
 
 
 def test_run_git_kill_path_is_bounded(monkeypatch):
@@ -94,10 +114,39 @@ def test_run_git_kill_path_is_bounded(monkeypatch):
     assert proc.killed
     # both waits — initial and post-kill grace — were explicitly bounded
     assert proc.timeouts_seen == [cc._GIT_TIMEOUT, cc._GIT_KILL_GRACE]
+    # abandon path closed our pipe ends so reader threads exit promptly
+    assert proc.stdout.closed and proc.stderr.closed
 
     # callers already convert TimeoutExpired into "git resolution failed" /
     # a repo-id fallback (not a hang)
     assert derive_repo_id(".")  # falls back to the dir name, does not raise
+
+
+def test_run_git_timeout_attaches_drained_output(monkeypatch):
+    """Parity with subprocess.run: when the post-kill grace drain succeeds,
+    the raised TimeoutExpired carries what the child wrote before dying —
+    callers diagnosing WHY git stalled get real bytes, not None."""
+    from kumiho_memory import code_capture as cc
+
+    procs = []
+
+    def fake_popen(*args, **kwargs):
+        proc = _SlowDrainProc()
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(cc.subprocess, "Popen", fake_popen)
+
+    try:
+        cc._run_git(".", "rev-parse", "HEAD")
+        raise AssertionError("expected TimeoutExpired")
+    except subprocess.TimeoutExpired as exc:
+        assert exc.output == "partial-out"
+        assert exc.stderr == "partial-err"
+
+    (proc,) = procs
+    assert proc.killed
+    assert proc.timeouts_seen == [cc._GIT_TIMEOUT, cc._GIT_KILL_GRACE]
 
 
 def test_run_git_kills_child_on_interrupt(monkeypatch):
