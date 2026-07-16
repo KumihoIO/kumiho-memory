@@ -135,16 +135,41 @@ def _validate_rev_range(rev_range: str) -> str:
 #: the callers already handle (git resolution failed / repo-id fallback).
 _GIT_TIMEOUT = 20.0
 
+#: Bounded wait for pipe drain after kill(). subprocess.run's own timeout
+#: handling is NOT enough: on Windows its TimeoutExpired path calls
+#: process.kill() and then a timeout-less communicate(), and TerminateProcess
+#: is asynchronous — a child stuck in uninterruptible kernel I/O (Defender
+#: scan, disk stall) or a descendant holding the inherited pipe handles keeps
+#: the pipes open, so that communicate() blocks forever (observed as a
+#: 30-minute kumiho_code_capture hang, KumihoIO/kumiho-SDKs#79).
+_GIT_KILL_GRACE = 5.0
+
 
 def _run_git(repo_path: str, *args: str) -> str:
     if str(repo_path).startswith("-"):
         raise ValueError(f"unsafe repo path: {repo_path!r}")
-    out = subprocess.run(
-        ["git", "-C", repo_path, *args],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        check=True, timeout=_GIT_TIMEOUT,
+    cmd = ["git", "-C", repo_path, *args]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
     )
-    return out.stdout
+    try:
+        stdout, stderr = proc.communicate(timeout=_GIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=_GIT_KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            # The child (or a descendant holding its pipes) survived kill().
+            # Abandon the daemon reader threads instead of joining them
+            # unboundedly — every wait here must stay bounded.
+            pass
+        raise subprocess.TimeoutExpired(cmd, _GIT_TIMEOUT) from None
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, output=stdout, stderr=stderr,
+        )
+    return stdout
 
 
 def derive_repo_id(repo_path: str) -> str:

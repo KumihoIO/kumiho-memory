@@ -45,27 +45,58 @@ def test_evidence_grade_from_atoms():
     assert _evidence_grade(None) == "unverified"
 
 
-def test_run_git_is_bounded_by_timeout(monkeypatch):
-    """Every git subprocess must pass a timeout — the keyless capture resolves
-    git OUTSIDE the write bound, so an unbounded git hang would hang the whole
-    tool indefinitely (observed as a multi-minute no-op)."""
+class _StuckProc:
+    """A git process whose pipes never close — kill() doesn't release them.
+
+    Models the Windows failure mode of KumihoIO/kumiho-SDKs#79: the child is
+    stuck in uninterruptible kernel I/O (or a descendant inherited its pipe
+    handles), so TerminateProcess doesn't close the pipes and any
+    timeout-less communicate() blocks forever.
+    """
+
+    def __init__(self):
+        self.killed = False
+        self.timeouts_seen = []
+        self.returncode = None
+
+    def communicate(self, timeout=None):
+        self.timeouts_seen.append(timeout)
+        raise subprocess.TimeoutExpired(cmd="git", timeout=timeout or 0)
+
+    def kill(self):
+        self.killed = True
+
+
+def test_run_git_kill_path_is_bounded(monkeypatch):
+    """#79: every wait in _run_git must carry an explicit bound — INCLUDING
+    the post-kill() pipe drain. subprocess.run's own timeout handling is not
+    enough: its Windows TimeoutExpired path calls kill() then a timeout-less
+    communicate(), which blocks forever while anything holds the pipes
+    (observed as a 30-minute kumiho_code_capture hang)."""
     from kumiho_memory import code_capture as cc
 
-    captured = {}
+    procs = []
 
-    def fake_run(*args, **kwargs):
-        captured.update(kwargs)
-        return types.SimpleNamespace(stdout="ok")
+    def fake_popen(*args, **kwargs):
+        proc = _StuckProc()
+        procs.append(proc)
+        return proc
 
-    monkeypatch.setattr(cc.subprocess, "run", fake_run)
-    assert cc._run_git(".", "rev-parse", "HEAD") == "ok"
-    assert captured.get("timeout") == cc._GIT_TIMEOUT
-    # a real git hang now surfaces as TimeoutExpired, which the callers already
-    # convert into "git resolution failed" / a repo-id fallback (not a hang)
-    def hang(*args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd="git", timeout=cc._GIT_TIMEOUT)
+    monkeypatch.setattr(cc.subprocess, "Popen", fake_popen)
 
-    monkeypatch.setattr(cc.subprocess, "run", hang)
+    try:
+        cc._run_git(".", "rev-parse", "HEAD")
+        raise AssertionError("expected TimeoutExpired")
+    except subprocess.TimeoutExpired:
+        pass
+
+    (proc,) = procs
+    assert proc.killed
+    # both waits — initial and post-kill grace — were explicitly bounded
+    assert proc.timeouts_seen == [cc._GIT_TIMEOUT, cc._GIT_KILL_GRACE]
+
+    # callers already convert TimeoutExpired into "git resolution failed" /
+    # a repo-id fallback (not a hang)
     assert derive_repo_id(".")  # falls back to the dir name, does not raise
 
 
