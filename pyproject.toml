@@ -47,9 +47,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://kumiho.io"
 Documentation = "https://docs.kumiho.io"
-Repository = "https://github.com/kumihoclouds/kumiho-python"
-Issues = "https://github.com/kumihoclouds/kumiho-python/issues"
-Changelog = "https://github.com/kumihoclouds/kumiho-python/blob/main/kumiho-memory/RELEASE_NOTES.md"
+Repository = "https://github.com/KumihoIO/kumiho-SDKs"
+Issues = "https://github.com/KumihoIO/kumiho-SDKs/issues"
+Changelog = "https://github.com/KumihoIO/kumiho-SDKs/blob/main/python/kumiho-memory/RELEASE_NOTES.md"
 
 [project.optional-dependencies]
 openai = [

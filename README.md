@@ -8,14 +8,18 @@
 
 ### Status
 
-> **Beta (0.11.x)**
+> **Beta (0.18.x)**
 > Actively developed; the public API is stabilizing but may still change
 > between minor versions.
-> Latest release: `0.11.0` (2026-07-11) — **Decision Memory**: a
-> git-anchored code-decision domain — mine commits into decision/evidence
-> nodes and ask *why* a file is the way it is (opt-in,
-> `KUMIHO_MEMORY_CODE=1`).
-> Recent highlights: `0.10.1` moved the cross-encoder rerank off the event
+> Latest release: `0.18.0` (2026-07-17) — **Ontology Phase 1**: canonical
+> relation predicate registry, a fetchable ontology spec policy Item, the
+> trust-vocabulary mapping, and opt-in relation traversal at recall
+> (`KUMIHO_MEMORY_RELATION_TRAVERSAL=1`).
+> See `RELEASE_NOTES.md` for the full version-by-version history — this
+> status block names only the latest release.
+> Earlier highlights: `0.16` Dream State graph maintenance · `0.11-0.13`
+> **Decision Memory** (git-anchored why-layer, `KUMIHO_MEMORY_CODE=1`) ·
+> `0.10.1` moved the cross-encoder rerank off the event
 > loop (pure perf; recall byte-identical) · `0.10.0` made the **write-time
 > ontology** the default — typed decomposition into facts/entities/
 > decisions/events plus entity-bridge and fact-recall legs (+0.042 overall /
