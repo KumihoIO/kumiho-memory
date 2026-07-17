@@ -799,6 +799,168 @@ def test_maintain_never_aborts_the_run(monkeypatch):
     assert any("kaboom" in e for e in result["errors"])
 
 
+# ---------------------------------------------------------------------------
+# (A) Grounding-staleness clear (#95)
+# ---------------------------------------------------------------------------
+
+
+def _stale_decision(g, slug, superseded_by):
+    """A conversation-ontology decision flagged grounding_stale."""
+    dec = g.add("Mem", "decision", slug, {
+        "title": slug, "decision": slug,
+        "grounding_stale": "true",
+        "grounding_stale_superseded_by": superseded_by,
+    })
+    g.tag(dec, "grounding:stale")
+    return dec
+
+
+def test_grounding_clear_when_superseding_fact_deleted():
+    """Clear condition 1a: the superseding fact's revision no longer exists."""
+    g = FakeGraph()
+    gone = "kref://Mem/facts/gone.fact?r=1"        # never added -> get_revision None
+    dec = _stale_decision(g, "keep-upstash", gone)
+
+    stats = MaintenanceStats()
+    _maintainer(g).run_keyless(stats)
+
+    assert stats.dependents_cleared == 1
+    assert stats.dependents_kept == 0
+    rev = dec.get_latest_revision()
+    assert rev.metadata["grounding_stale"] == "false"
+    assert rev.metadata["grounding_stale_superseded_by"] == ""
+    assert "grounding:stale" not in rev.tags
+
+
+def test_grounding_clear_when_superseding_fact_deprecated():
+    """Clear condition 1b: the superseding fact's item was deprecated (e.g.
+    fact-dedup folded it away)."""
+    g = FakeGraph()
+    sup = g.fact("Mem", "use redis for the bus")
+    sup.set_deprecated(True)
+    dec = _stale_decision(g, "adopt-bus", sup.get_latest_revision().kref.uri)
+
+    stats = MaintenanceStats()
+    _maintainer(g).run_keyless(stats)
+
+    assert stats.dependents_cleared == 1
+    assert dec.get_latest_revision().metadata["grounding_stale"] == "false"
+
+
+def test_grounding_clear_when_regrounded_onto_superseding_fact():
+    """Clear condition 2: the dependent now DEPENDS_ON the superseding fact."""
+    g = FakeGraph()
+    sup = g.fact("Mem", "use redis for the bus")
+    dec = _stale_decision(g, "adopt-bus", sup.get_latest_revision().kref.uri)
+    g.link(dec, sup, "DEPENDS_ON")               # grounding updated to the new fact
+
+    stats = MaintenanceStats()
+    _maintainer(g).run_keyless(stats)
+
+    assert stats.dependents_cleared == 1
+    assert stats.dependents_kept == 0
+    assert dec.get_latest_revision().metadata["grounding_stale"] == "false"
+
+
+def test_grounding_kept_when_still_stale():
+    """Keep: the superseding fact is live and the dependent has not re-grounded —
+    the decision is genuinely grounded in a superseded fact, awaiting re-grade."""
+    g = FakeGraph()
+    sup = g.fact("Mem", "use redis for the bus")
+    dec = _stale_decision(g, "adopt-bus", sup.get_latest_revision().kref.uri)
+
+    stats = MaintenanceStats()
+    _maintainer(g).run_keyless(stats)
+
+    assert stats.dependents_kept == 1
+    assert stats.dependents_cleared == 0
+    rev = dec.get_latest_revision()
+    assert rev.metadata["grounding_stale"] == "true"        # flag preserved
+    assert "grounding:stale" in rev.tags
+
+
+def test_grounding_clear_dry_run_counts_without_writing():
+    g = FakeGraph()
+    gone = "kref://Mem/facts/gone.fact?r=1"
+    dec = _stale_decision(g, "keep-upstash", gone)
+
+    stats = MaintenanceStats()
+    _maintainer(g, dry_run=True).run_keyless(stats)
+
+    assert stats.dependents_cleared == 1                     # previewed
+    rev = dec.get_latest_revision()
+    assert rev.metadata["grounding_stale"] == "true"         # but nothing written
+    assert "grounding:stale" in rev.tags
+
+
+def test_grounding_clear_unflagged_decision_untouched():
+    """A decision that was never flagged is neither counted nor written."""
+    g = FakeGraph()
+    g.add("Mem", "decision", "plain", {"title": "plain", "decision": "plain"})
+
+    stats = MaintenanceStats()
+    _maintainer(g).run_keyless(stats)
+
+    assert stats.dependents_cleared == 0
+    assert stats.dependents_kept == 0
+
+
+def test_grounding_cleared_on_not_found_fetch():
+    """A definitive grpc NOT_FOUND on the superseding fact means it was deleted:
+    clear (mirrors the production SDK, which RAISES NOT_FOUND, not returns None)."""
+    import grpc
+
+    class _NotFound(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.NOT_FOUND
+
+    g = FakeGraph()
+    dec = _stale_decision(g, "adopt-bus", "kref://Mem/facts/sup.fact?r=1")
+    m = _maintainer(g)
+
+    def _raise(_kref):
+        raise _NotFound()
+
+    m.sdk.get_revision = _raise
+
+    stats = MaintenanceStats()
+    m.run_keyless(stats)
+
+    assert stats.dependents_cleared == 1
+    assert dec.get_latest_revision().metadata["grounding_stale"] == "false"
+
+
+def test_grounding_kept_on_transient_fetch_error():
+    """A transient RPC error (not NOT_FOUND) must NOT clear a still-valid flag."""
+    import grpc
+
+    class _Transient(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.UNAVAILABLE
+
+    g = FakeGraph()
+    dec = _stale_decision(g, "adopt-bus", "kref://Mem/facts/sup.fact?r=1")
+    m = _maintainer(g)
+
+    def _raise(_kref):
+        raise _Transient()
+
+    m.sdk.get_revision = _raise
+
+    stats = MaintenanceStats()
+    m.run_keyless(stats)
+
+    assert stats.dependents_kept == 1
+    assert stats.dependents_cleared == 0
+    assert dec.get_latest_revision().metadata["grounding_stale"] == "true"
+
+
+def test_maintenance_stats_expose_grounding_fields():
+    d = MaintenanceStats().as_dict()
+    assert d["dependents_cleared"] == 0
+    assert d["dependents_kept"] == 0
+
+
 def _stub_summarizer():
     class _Adapter:
         async def chat(self, **kw):

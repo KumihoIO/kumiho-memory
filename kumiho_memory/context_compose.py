@@ -156,6 +156,10 @@ def compose_context(
                 # Carried only on the non-sibling branch, mirroring bridge /
                 # fact_recall (those additive markers ride here too).
                 "contested_by": mem.get("contested_by") or [],
+                # Grounding-staleness marker (#95): a dependent decision whose
+                # grounding fact was superseded gets a terse "grounding stale"
+                # note, so the answering model weighs it as possibly outdated.
+                "grounding_stale": bool(mem.get("grounding_stale")),
             })
 
     # --- Global ranking by score (best revisions first) ---
@@ -215,6 +219,12 @@ def compose_context(
             entry_text += (
                 f"\n[contested: disputed by {n} other stored "
                 f"memor{'y' if n == 1 else 'ies'}]"
+            )
+        # Grounding-stale dependents carry a terse note on the same block, so
+        # the answering model knows a fact this was based on has been superseded.
+        if rev.get("grounding_stale"):
+            entry_text += (
+                "\n[grounding stale: a fact this was based on was superseded]"
             )
         texts.append(entry_text)
 

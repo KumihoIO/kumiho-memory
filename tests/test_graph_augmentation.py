@@ -651,6 +651,51 @@ def test_contested_marker_matches_sibling_revision_kref(monkeypatch):
     assert base[0]["contested_by"] == [CT]
 
 
+# ---------------------------------------------------------------------------
+# Grounding-staleness recall marker (#95): a surfaced dependent whose grounding
+# fact was superseded carries an additive grounding_stale flag from metadata the
+# walk already fetches — mirrors the contested_by marker (zero extra round-trip).
+# ---------------------------------------------------------------------------
+
+GF = "kref://p/facts/gf.fact?r=1"           # a superseded fact (the seed)
+GD = "kref://p/decisions/gd.decision?r=1"    # decision grounded in GF (DEPENDS_ON)
+GNEW = "kref://p/facts/gnew.fact?r=1"        # the fact that superseded GF
+
+
+def test_grounding_stale_dependent_gets_recall_marker(monkeypatch):
+    # From the superseded fact seed, the walk hops the incoming DEPENDS_ON to the
+    # dependent decision and reads its grounding_stale metadata onto the entry.
+    graph = {
+        GF: _FakeRev(GF, {"title": "F", "summary": "old belief"},
+                     [_FakeEdge(GD, GF, "DEPENDS_ON")]),
+        GD: _FakeRev(GD, {"title": "D", "summary": "grounded decision",
+                          "grounding_stale": "true",
+                          "grounding_stale_superseded_by": GNEW}, []),
+    }
+    base = [{"kref": GF, "title": "F", "summary": "old belief", "score": 0.5}]
+    _found, augmented = _traverse(monkeypatch, graph, [GF], base)
+
+    surfaced = [m for m in augmented if m["kref"] == GD]
+    assert len(surfaced) == 1
+    assert surfaced[0]["edge_type"] == "DEPENDS_ON"
+    assert surfaced[0]["grounding_stale"] is True
+    assert surfaced[0]["superseded_by"] == GNEW
+
+
+def test_dependent_without_stale_flag_gets_no_marker(monkeypatch):
+    # An intact dependent (no grounding_stale metadata) surfaces unmarked.
+    graph = {
+        GF: _FakeRev(GF, {"title": "F", "summary": "belief"},
+                     [_FakeEdge(GD, GF, "DEPENDS_ON")]),
+        GD: _FakeRev(GD, {"title": "D", "summary": "grounded decision"}, []),
+    }
+    base = [{"kref": GF, "title": "F", "summary": "belief", "score": 0.5}]
+    _found, augmented = _traverse(monkeypatch, graph, [GF], base)
+
+    surfaced = [m for m in augmented if m["kref"] == GD]
+    assert surfaced and "grounding_stale" not in surfaced[0]
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

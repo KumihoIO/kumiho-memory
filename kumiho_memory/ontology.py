@@ -641,6 +641,17 @@ def _sync_decompose_agent(
             if m.edge(src_anchor, target_rev, edge_type, md):
                 stats[stat_key] += 1
                 stats["edges"] += 1
+                # Grounding-staleness ripple (#95): an agent-declared SUPERSEDES
+                # landed on the prior fact (target_rev) — flag the decisions
+                # grounded in it. Only for SUPERSEDES, never CONTRADICTS (a
+                # contested fact isn't a superseded grounding). Best-effort +
+                # bounded; mirrors the heuristic path in relations.link_supersedes.
+                if edge_type == "SUPERSEDES":
+                    from .grounding import ripple_grounding_stale
+                    ripple_grounding_stale(
+                        target_rev,
+                        getattr(getattr(src_anchor, "kref", None), "uri", ""),
+                    )
 
     _write_belief_edges(decomposition.get("supersedes"), "replaces",
                         "SUPERSEDES", "supersedes", track=True)

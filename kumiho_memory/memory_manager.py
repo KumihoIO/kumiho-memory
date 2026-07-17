@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from kumiho_memory.evidence import EVIDENCE_LEVELS, evidence_tag
+from kumiho_memory.grounding import apply_grounding_marker
 from kumiho_memory.privacy import PIIRedactor
 from kumiho_memory.redis_memory import RedisMemoryBuffer
 from kumiho_memory.retry import RetryQueue, retry_with_backoff
@@ -2275,6 +2276,10 @@ class UniversalMemoryManager:
                 entry["evidence_level"] = meta["evidence_level"]
             if meta.get("source"):
                 entry["source"] = meta["source"]
+            # Grounding-staleness marker (#95): a directly-recalled dependent
+            # whose grounding fact was superseded carries the flag in the
+            # metadata already fetched here — additive, zero extra round-trip.
+            apply_grounding_marker(entry, meta)
             # Semantic event date (valid-time). Surfaced BEFORE the
             # load_artifacts branch so it reaches summarized recall too —
             # the one mode that is otherwise date-blind (no content loaded).

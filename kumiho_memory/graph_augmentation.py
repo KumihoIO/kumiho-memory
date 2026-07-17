@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Union
 
 from kumiho_memory._bounded import run_bounded_in_thread
+from kumiho_memory.grounding import apply_grounding_marker
 from kumiho_memory.summarization import (
     LLMAdapter,
     build_string_array_wrapper_schema,
@@ -961,6 +962,12 @@ class GraphAugmentedRecall:
                             src = connected_rev.metadata.get("source", "")
                             if src:
                                 entry["source"] = src
+                            # Grounding-staleness marker (#95): a surfaced
+                            # dependent decision whose grounding fact was
+                            # superseded carries the flag in metadata already
+                            # fetched here — additive, zero extra round-trip
+                            # (mirrors evidence_level/source above).
+                            apply_grounding_marker(entry, connected_rev.metadata)
                             graph_augmented_results.append(entry)
                             found += 1
                         except Exception as e:

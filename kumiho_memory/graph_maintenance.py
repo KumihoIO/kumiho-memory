@@ -70,6 +70,12 @@ from kumiho_memory.evidence import (
     evidence_tag,
     parse_evidence,
 )
+from kumiho_memory.grounding import (
+    GROUNDING_STALE_META,
+    GROUNDING_STALE_SUPERSEDED_BY_META,
+    GROUNDING_STALE_TAG,
+    is_grounding_stale,
+)
 from kumiho_memory.ontology import OntologySchema, _mentions, _word_tokens
 from kumiho_memory.relations import _jaccard, _tokens
 
@@ -120,6 +126,10 @@ class MaintenanceStats:
     decisions_deduped: int = 0
     bridges_created: int = 0
     edges_repointed: int = 0
+    #: Grounding-staleness clear pass (#95): flagged DEPENDS_ON dependents whose
+    #: grounding was re-confirmed (flag cleared) vs. still stale (flag kept).
+    dependents_cleared: int = 0
+    dependents_kept: int = 0
     llm_merges: int = 0
     #: LLM-suggested, referentially-valid merges that couldn't run because the
     #: entity deprecation budget was exhausted this run — lets an operator
@@ -139,6 +149,8 @@ class MaintenanceStats:
             "decisions_deduped": self.decisions_deduped,
             "bridges_created": self.bridges_created,
             "edges_repointed": self.edges_repointed,
+            "dependents_cleared": self.dependents_cleared,
+            "dependents_kept": self.dependents_kept,
             "llm_merges": self.llm_merges,
             "llm_merges_skipped": self.llm_merges_skipped,
             "errors": list(self.errors),
@@ -264,6 +276,16 @@ class GraphMaintainer:
             self._prune_orphans(survivors, stats)
         except Exception as exc:  # noqa: BLE001
             stats.errors.append(f"prune_orphans: {exc}")
+
+        # Grounding-staleness clear (#95): runs AFTER the destructive passes so
+        # it sees their result — a superseding fact that fact-dedup just folded
+        # away reads as "gone" and clears its dependents. Non-destructive
+        # (un-flag only), so it takes no deprecation budget and needs no
+        # code_project.
+        try:
+            self._clear_stale_grounding(stats)
+        except Exception as exc:  # noqa: BLE001
+            stats.errors.append(f"clear_stale_grounding: {exc}")
 
     def apply_entity_merges(
         self, pairs: List[Tuple[str, str]], stats: MaintenanceStats
@@ -533,6 +555,106 @@ class GraphMaintainer:
                 break
             self._deprecate(ent.item, stats, f"orphan {ent.slug}")
             stats.orphans_pruned += 1
+
+    # ------------------------------------------------------------------
+    # (A) Ontology — grounding-staleness clear (#95)
+    # ------------------------------------------------------------------
+
+    def _clear_stale_grounding(self, stats: MaintenanceStats) -> None:
+        """Re-examine flagged DEPENDS_ON dependents; clear when re-grounded.
+
+        A ``decision`` flagged ``grounding_stale`` (its DEPENDS_ON fact was
+        superseded, stamped by :func:`grounding.ripple_grounding_stale`) is
+        cleared when the write-time ripple's premise no longer holds — EITHER:
+
+        1. the superseding fact's revision no longer exists (deleted, or its
+           item deprecated — e.g. fact-dedup folded it away), OR
+        2. the dependent now has its OWN ``DEPENDS_ON`` edge to the superseding
+           fact (its grounding was updated to the new belief).
+
+        Otherwise the flag stays: the decision is still grounded in a superseded
+        fact and awaits re-grading. Non-destructive (un-flag only), keyless,
+        deterministic. Metadata is canonical (set ``"false"`` — never deleted,
+        so a metadata-only reader sees a definite non-stale state); the mirrored
+        ``grounding:stale`` tag is removed best-effort.
+
+        (An optional LLM re-grade — does the superseding fact actually change
+        the decision's basis? — is future work and would slot in here as an
+        opt-in signal; the plugin's keyless path never uses it.)
+        """
+        scanned = 0
+        for item in self._search(self.project, "decision"):
+            if _is_deprecated(item):
+                continue
+            rev = _latest(item)
+            if rev is None:
+                continue
+            meta = _meta(rev)
+            if not is_grounding_stale(meta):
+                continue
+            if scanned >= _MAX_DEDUP_NODES:
+                logger.info(
+                    "maintenance: grounding-clear scan hit cap %d", _MAX_DEDUP_NODES,
+                )
+                break
+            scanned += 1
+            superseding_kref = str(
+                meta.get(GROUNDING_STALE_SUPERSEDED_BY_META, "") or ""
+            )
+            if not self._grounding_reconfirmed(rev, superseding_kref):
+                stats.dependents_kept += 1
+                continue
+            if not self.dry_run:
+                try:
+                    # Un-flag in place: metadata is canonical, so set "false"
+                    # (never delete) and drop the now-stale superseded_by pointer.
+                    self._get_client().update_revision_metadata(rev.kref, {
+                        GROUNDING_STALE_META: "false",
+                        GROUNDING_STALE_SUPERSEDED_BY_META: "",
+                    })
+                    try:
+                        self._get_client().untag_revision(rev.kref, GROUNDING_STALE_TAG)
+                    except Exception:  # noqa: BLE001
+                        pass  # untag is best-effort cleanup (tag is mirrored)
+                except Exception as exc:  # noqa: BLE001
+                    stats.errors.append(f"clear grounding {_uri(item)}: {exc}")
+                    continue
+            stats.dependents_cleared += 1
+
+    def _grounding_reconfirmed(self, rev: Any, superseding_kref: str) -> bool:
+        """True if a flagged dependent's grounding is re-confirmed (clearable)."""
+        if not superseding_kref:
+            # No pointer to check against — can't confirm re-grounding, so keep.
+            return False
+        # (1) superseding fact gone: deleted or its item deprecated (folded away
+        # by fact-dedup this run). The SDK RAISES grpc NOT_FOUND for a deleted
+        # revision (it does not return None), so ONLY a definitive NOT_FOUND (or
+        # a None from a fake) counts as "gone" — a transient RPC error must not
+        # clear a still-valid flag (keep it; re-examine next run).
+        try:
+            sup_rev = self.sdk.get_revision(superseding_kref)
+        except Exception as exc:  # noqa: BLE001
+            if _is_not_found(exc):
+                return True
+            logger.debug(
+                "grounding clear: get_revision %s failed (kept): %s",
+                superseding_kref, exc,
+            )
+        else:
+            if sup_rev is None:
+                return True
+            sup_item = _item_of(sup_rev)
+            if sup_item is not None and _is_deprecated(sup_item):
+                return True
+        # (2) dependent re-grounded onto the superseding fact itself. Compare on
+        # the base kref (typed nodes are anchored at one revision, so the ?r=N
+        # is stable — but strip it defensively). Independent of (1), so it still
+        # clears even when the superseding fact's existence couldn't be checked.
+        base = superseding_kref.split("?", 1)[0]
+        for edge in _edges(rev, "DEPENDS_ON", _OUTGOING):
+            if _edge_dst(edge).split("?", 1)[0] == base:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # (B) Decision Memory — evidence re-grade (headline)
@@ -853,6 +975,22 @@ def _uri(obj: Any) -> str:
 
 def _is_deprecated(item: Any) -> bool:
     return bool(getattr(item, "deprecated", False))
+
+
+def _is_not_found(exc: Exception) -> bool:
+    """True if *exc* is a gRPC NOT_FOUND — a definitive "revision deleted".
+
+    Distinguishes a deleted revision (clear the stale flag) from a transient RPC
+    error (keep it). Tolerant of non-grpc environments (returns False)."""
+    code = getattr(exc, "code", None)
+    if not callable(code):
+        return False
+    try:
+        import grpc
+
+        return code() == grpc.StatusCode.NOT_FOUND
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _item_of(rev: Any) -> Any:

@@ -269,3 +269,29 @@ def test_contested_note_in_full_mode():
     out = compose_context([contested], mode="full")
     assert out.startswith("the raw content")
     assert "[contested: disputed by 1 other stored memory]" in out
+
+
+# ---------------------------------------------------------------------------
+# Grounding-staleness note (#95) — additive, mirrors the contested note
+# ---------------------------------------------------------------------------
+
+def test_grounding_stale_memory_gets_note():
+    stale = _mem("d", "keep Upstash", score=0.5)
+    stale["grounding_stale"] = True
+    out = compose_context([stale])
+    assert out == "d: keep Upstash\n[grounding stale: a fact this was based on was superseded]"
+
+
+def test_no_grounding_note_without_flag():
+    # Strictly additive: an ordinary memory renders exactly as before.
+    out = compose_context([_mem("d", "keep Upstash", score=0.5)])
+    assert out == "d: keep Upstash"
+    assert "grounding stale" not in out
+
+
+def test_grounding_note_in_full_mode():
+    stale = _mem("d", "sum", score=0.5, content="the raw decision")
+    stale["grounding_stale"] = True
+    out = compose_context([stale], mode="full")
+    assert out.startswith("the raw decision")
+    assert "[grounding stale: a fact this was based on was superseded]" in out
