@@ -47,8 +47,21 @@ from pathlib import Path
 from typing import Any, Optional
 
 from kumiho_memory.evidence import evidence_tag
+from kumiho_memory.skill_scan import (
+    QUARANTINE_META_KEY,
+    QUARANTINE_REASONS_KEY,
+    QUARANTINE_TAG,
+    is_quarantined,
+    scan_content,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Agents a *clean* skill revision is published for.  This is the semantic
+#: "agents may consume this" marker (issue #100): a quarantined revision is
+#: created WITHOUT it, so the content is never advertised as agent-consumable
+#: until an operator clears it via :func:`clear_quarantine`.
+DEFAULT_AGENT_COMPAT = ["claude", "zeroclaw", "openclaw"]
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -269,6 +282,12 @@ class IngestResult:
     revision_kref: str
     artifact_kref: Optional[str] = None
     created_new_item: bool = False
+    quarantined: bool = False
+    """``True`` when the static scan flagged the content — the revision was
+    stored for audit but withheld from the agent-consumable markers."""
+
+    quarantine_reasons: list[str] = field(default_factory=list)
+    """Scan reasons behind quarantine (empty when clean)."""
 
 
 def ingest_skill(
@@ -312,10 +331,12 @@ def ingest_skill(
     if dry_run:
         results: list[IngestResult] = []
         for section in to_ingest:
+            verdict = scan_content(section.content)
             logger.info(
-                "[DRY RUN] Would ingest: %s (%d chars)",
+                "[DRY RUN] Would ingest: %s (%d chars)%s",
                 section.name,
                 len(section.content),
+                " [QUARANTINE: " + ", ".join(verdict.reasons) + "]" if verdict.flagged else "",
             )
             results.append(
                 IngestResult(
@@ -323,6 +344,8 @@ def ingest_skill(
                     item_kref=f"kref://{project}/{space_name}/{section.name}.skill",
                     revision_kref=f"kref://{project}/{space_name}/{section.name}.skill?r=<new>",
                     created_new_item=False,
+                    quarantined=verdict.flagged,
+                    quarantine_reasons=list(verdict.reasons),
                 )
             )
         return results
@@ -394,20 +417,31 @@ def _ingest_section(
         else:
             raise
 
-    # 2. Create revision (all metadata values must be str)
+    # 2. Static scan BEFORE storage (issue #100) — external skill text is an
+    # agent-instruction supply chain; flagged content is stored for audit but
+    # withheld from the agent-consumable markers.
+    verdict = scan_content(section.content)
+
+    # 3. Create revision (all metadata values must be str)
     metadata = {
         "title": section.title,
         "summary": f"Skill: {section.title} — {skill_description}",
         "tags": json.dumps(skill_tags + ["skill"]),
-        "agent_compat": json.dumps(["claude", "zeroclaw", "openclaw"]),
+        "agent_compat": json.dumps(DEFAULT_AGENT_COMPAT),
         "source_skill": skill_name,
         "content": section.content,
     }
     if evidence_level:
         metadata["evidence_level"] = evidence_level
+    if verdict.flagged:
+        # Withhold the "agents may consume this" marker and record the audit
+        # trail.  Clean content keeps the exact metadata above (byte-identical).
+        metadata.pop("agent_compat", None)
+        metadata[QUARANTINE_META_KEY] = "true"
+        metadata[QUARANTINE_REASONS_KEY] = json.dumps(verdict.reasons)
     revision = item.create_revision(metadata=metadata)
 
-    # 3. Attach source file as artifact
+    # 4. Attach source file as artifact
     artifact = revision.create_artifact(
         name=f"{section.name}.md",
         location=str(source_file),
@@ -417,12 +451,18 @@ def _ingest_section(
         },
     )
 
-    # 4. Tag evidence grade BEFORE published — the server freezes a
+    # 5. Tag evidence grade BEFORE published — the server freezes a
     # revision as immutable once "published" lands, silently rejecting
     # any tag applied afterward.
     if evidence_level:
         revision.tag(evidence_tag(evidence_level))
-    revision.tag("published")  # server auto-moves from previous revision
+    if verdict.flagged:
+        # Mirrored quarantine tag (best-effort); the "published" tag — which
+        # marks the canonical revision recall surfaces — is deliberately NOT
+        # applied, so the flagged revision never becomes agent-consumable.
+        revision.tag(QUARANTINE_TAG)
+    else:
+        revision.tag("published")  # server auto-moves from previous revision
 
     return IngestResult(
         item_name=section.name,
@@ -430,6 +470,8 @@ def _ingest_section(
         revision_kref=str(revision.kref),
         artifact_kref=str(artifact.kref) if artifact else None,
         created_new_item=created_new,
+        quarantined=verdict.flagged,
+        quarantine_reasons=list(verdict.reasons),
     )
 
 
@@ -485,18 +527,24 @@ def ingest_file(
 
     all_tags = list(tags or []) + ["skill"]
 
+    # Static scan BEFORE storage (issue #100).
+    verdict = scan_content(text)
+
     if dry_run:
         logger.info(
-            "[DRY RUN] Would ingest file: %s as %s (%d chars)",
+            "[DRY RUN] Would ingest file: %s as %s (%d chars)%s",
             path.name,
             item_name,
             len(text),
+            " [QUARANTINE: " + ", ".join(verdict.reasons) + "]" if verdict.flagged else "",
         )
         return IngestResult(
             item_name=item_name,
             item_kref=f"kref://{project}/{space_name}/{item_name}.skill",
             revision_kref=f"kref://{project}/{space_name}/{item_name}.skill?r=<new>",
             created_new_item=False,
+            quarantined=verdict.flagged,
+            quarantine_reasons=list(verdict.reasons),
         )
 
     import grpc
@@ -519,11 +567,15 @@ def ingest_file(
         "title": title,
         "summary": summary or f"Reference: {title}",
         "tags": json.dumps(all_tags),
-        "agent_compat": json.dumps(["claude", "zeroclaw", "openclaw"]),
+        "agent_compat": json.dumps(DEFAULT_AGENT_COMPAT),
         "content": text,
     }
     if evidence_level:
         file_metadata["evidence_level"] = evidence_level
+    if verdict.flagged:
+        file_metadata.pop("agent_compat", None)
+        file_metadata[QUARANTINE_META_KEY] = "true"
+        file_metadata[QUARANTINE_REASONS_KEY] = json.dumps(verdict.reasons)
     revision = item.create_revision(metadata=file_metadata)
 
     artifact = revision.create_artifact(
@@ -535,7 +587,10 @@ def ingest_file(
     # _ingest_section: a published revision is server-side immutable.
     if evidence_level:
         revision.tag(evidence_tag(evidence_level))
-    revision.tag("published")
+    if verdict.flagged:
+        revision.tag(QUARANTINE_TAG)  # mirrored; "published" withheld
+    else:
+        revision.tag("published")
 
     return IngestResult(
         item_name=item_name,
@@ -543,6 +598,8 @@ def ingest_file(
         revision_kref=str(revision.kref),
         artifact_kref=str(artifact.kref) if artifact else None,
         created_new_item=created_new,
+        quarantined=verdict.flagged,
+        quarantine_reasons=list(verdict.reasons),
     )
 
 
@@ -595,6 +652,118 @@ def ingest_batch(
         results.append(result)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Quarantine clearance — operator flow (issue #100)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ClearQuarantineResult:
+    """Result of :func:`clear_quarantine`."""
+
+    revision_kref: str
+    cleared: bool
+    detail: str = ""
+    published_reapplied: bool = False
+    """``True`` when the ``published`` tag was re-applied to the cleared
+    revision.  ``False`` on a no-op, or when a NEWER revision already
+    carries ``published`` (re-tagging would move the canonical pointer
+    backward — see the race guard in :func:`clear_quarantine`)."""
+
+
+def clear_quarantine(
+    revision_kref: str,
+    *,
+    agents: Optional[list[str]] = None,
+) -> ClearQuarantineResult:
+    """Clear quarantine on a flagged skill revision after human review.
+
+    Re-applies the agent-consumable markers that ingestion withheld: the
+    ``agent_compat`` metadata is restored and the ``published`` tag is
+    applied (last, since it freezes the revision immutable server-side).
+    The quarantine metadata keys and mirrored tag are removed.
+
+    Race guard: if a NEWER revision of the same item was published while
+    the flagged one sat in quarantine, re-tagging ``published`` here would
+    move the canonical pointer *backward* onto older content.  In that
+    case the quarantine is still cleared and ``agent_compat`` restored,
+    but the ``published`` re-tag is skipped (``published_reapplied`` is
+    ``False`` and ``detail`` says why).
+
+    This is the *only* path back to consumability — an operator explicitly
+    vouching for content the static scan flagged.
+
+    Args:
+        revision_kref: The flagged revision's kref (from the ingest output).
+        agents: Agent list to restore into ``agent_compat``
+            (default :data:`DEFAULT_AGENT_COMPAT`).
+
+    Returns:
+        :class:`ClearQuarantineResult`. ``cleared`` is ``False`` (a no-op)
+        when the revision is not quarantined.
+    """
+    import kumiho
+
+    revision = kumiho.get_revision(revision_kref)
+    if not is_quarantined(getattr(revision, "metadata", {})):
+        return ClearQuarantineResult(
+            revision_kref=str(revision.kref),
+            cleared=False,
+            detail="revision is not quarantined - nothing to clear",
+        )
+
+    # Drop the quarantine audit keys.
+    revision.delete_attribute(QUARANTINE_META_KEY)
+    revision.delete_attribute(QUARANTINE_REASONS_KEY)
+    # Mirrored tag removal is best-effort (metadata is canonical).
+    try:
+        revision.untag(QUARANTINE_TAG)
+    except Exception as exc:  # noqa: BLE001 — tag ops are best-effort
+        logger.debug("untag %s failed (best-effort): %s", QUARANTINE_TAG, exc)
+
+    # Restore the consumable markers. Metadata first, then "published" last —
+    # once published lands the revision is immutable, so no further writes.
+    revision.set_metadata({"agent_compat": json.dumps(agents or DEFAULT_AGENT_COMPAT)})
+
+    # Race guard (issue #100 review F3): only re-tag "published" if no NEWER
+    # revision of this item already carries it.  Best-effort — if the check
+    # itself fails we proceed with the tag, matching the operator's intent.
+    newer_published = None
+    try:
+        current = revision.get_item().get_revision_by_tag("published")
+        if current is not None and getattr(current, "number", 0) > getattr(revision, "number", 0):
+            newer_published = current
+    except Exception as exc:  # noqa: BLE001 — guard is best-effort
+        logger.debug("published-race check failed (proceeding to tag): %s", exc)
+
+    if newer_published is not None:
+        logger.info(
+            "clear_quarantine: skipping published re-tag on %s - newer revision "
+            "r=%s already published (re-tagging would move the canonical "
+            "pointer backward)",
+            revision.kref,
+            getattr(newer_published, "number", "?"),
+        )
+        return ClearQuarantineResult(
+            revision_kref=str(revision.kref),
+            cleared=True,
+            detail=(
+                "re-applied agent_compat; published re-tag skipped - newer "
+                f"revision r={getattr(newer_published, 'number', '?')} is already published"
+            ),
+            published_reapplied=False,
+        )
+
+    revision.tag("published")
+
+    return ClearQuarantineResult(
+        revision_kref=str(revision.kref),
+        cleared=True,
+        detail="re-applied agent_compat + published",
+        published_reapplied=True,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -84,14 +84,47 @@ def _configure_llm_from_prefs(prefs: dict, section: str = "dreamState") -> None:
             os.environ[env_var] = val
 
 
+def _print_ingest_results(results: list) -> None:
+    """Print one line per result plus a quarantine summary (issue #100)."""
+    for r in results:
+        marker = "[NEW]" if r.created_new_item else "[REV]"
+        quarantine = " [QUARANTINED]" if getattr(r, "quarantined", False) else ""
+        print(f"  {marker} {r.item_name} → {r.revision_kref}{quarantine}")
+
+    flagged = [r for r in results if getattr(r, "quarantined", False)]
+    if flagged:
+        print(
+            f"\n  WARNING: {len(flagged)} section(s) quarantined - stored for audit "
+            "but withheld from agent_compat/published (not agent-consumable)."
+        )
+        for r in flagged:
+            print(f"    - {r.item_name}: {', '.join(r.quarantine_reasons)}")
+        print(
+            "  Review, then clear with: "
+            "kumiho-memory ingest-skill --clear-quarantine <revision_kref>"
+        )
+
+
 def cmd_ingest_skill(args: argparse.Namespace) -> int:
     """Ingest a SKILL.md or reference doc(s) into the Kumiho graph."""
     from kumiho_memory.skill_ingest import (
+        clear_quarantine,
         ingest_batch,
         ingest_file,
         ingest_skill,
         parse_skill,
     )
+
+    # --clear-quarantine: operator vouches for a flagged revision after review.
+    if args.clear_quarantine:
+        result = clear_quarantine(args.clear_quarantine)
+        status = "[CLEARED]" if result.cleared else "[SKIP]"
+        print(f"  {status} {result.revision_kref} — {result.detail}")
+        return 0 if result.cleared else 1
+
+    if not args.path:
+        print("ERROR: path is required (or use --clear-quarantine <kref>)", file=sys.stderr)
+        return 1
 
     target = Path(args.path)
 
@@ -124,9 +157,7 @@ def cmd_ingest_skill(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             evidence_level=args.evidence_level,
         )
-        for r in results:
-            tag = "[NEW]" if r.created_new_item else "[REV]"
-            print(f"  {tag} {r.item_name} → {r.revision_kref}")
+        _print_ingest_results(results)
         print(f"\nIngested {len(results)} files from {target}")
         return 0
 
@@ -144,8 +175,7 @@ def cmd_ingest_skill(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             evidence_level=args.evidence_level,
         )
-        tag = "[NEW]" if result.created_new_item else "[REV]"
-        print(f"  {tag} {result.item_name} → {result.revision_kref}")
+        _print_ingest_results([result])
         return 0
 
     # Default: parse a SKILL.md and ingest sections
@@ -176,9 +206,7 @@ def cmd_ingest_skill(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         evidence_level=args.evidence_level,
     )
-    for r in results:
-        tag = "[NEW]" if r.created_new_item else "[REV]"
-        print(f"  {tag} {r.item_name} → {r.revision_kref}")
+    _print_ingest_results(results)
     action = "Would ingest" if args.dry_run else "Ingested"
     print(f"\n{action} {len(results)} sections into {args.project}/{args.space}")
     return 0
@@ -337,7 +365,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     ingest.add_argument(
         "path",
+        nargs="?",
+        default=None,
         help="Path to SKILL.md file, standalone .md file, or directory (with --batch)",
+    )
+    ingest.add_argument(
+        "--clear-quarantine",
+        default=None,
+        metavar="KREF",
+        help="Clear quarantine on a flagged skill revision after human review "
+        "(re-applies the agent_compat + published consumable markers). "
+        "Takes a revision kref; no path argument needed.",
     )
     ingest.add_argument(
         "--project",
