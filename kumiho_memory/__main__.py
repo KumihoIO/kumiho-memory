@@ -95,6 +95,22 @@ def cmd_ingest_skill(args: argparse.Namespace) -> int:
 
     target = Path(args.path)
 
+    # Seed the ontology spec alongside skill ingestion at onboarding — the
+    # spec is a policy Item agents commit to, seeded like the skills it sits
+    # next to. Idempotent (re-seed at same version is a no-op) and best-effort
+    # (logged, never fatal); skipped on preview-only runs (--list / --dry-run).
+    if not args.dry_run and not args.list:
+        from kumiho_memory.ontology_spec import seed_ontology_spec
+
+        seeded = seed_ontology_spec(project_name=args.project)
+        if seeded is not None:
+            logger.debug(
+                "ontology spec %s: %s (v=%s)",
+                "seeded" if seeded.created_revision else "current",
+                seeded.revision_kref,
+                seeded.version,
+            )
+
     # --batch: ingest all .md files in a directory
     if args.batch:
         if not target.is_dir():

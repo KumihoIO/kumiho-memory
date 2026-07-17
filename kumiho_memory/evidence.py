@@ -4,7 +4,10 @@ Memories carry an *evidence grade* describing how trustworthy they are.
 The grade lives in two places:
 
 - revision metadata key ``evidence_level`` (with optional ``source`` and
-  ``confidence`` companions) — the canonical value
+  ``confidence`` companions) — the canonical value. ``evidence_level`` is a
+  PROVENANCE grade; the self-reported ``confidence``/``certainty`` companions
+  are a different axis — see :mod:`kumiho_memory.trust_vocab` for the one
+  defined mapping between them and its limits.
 - mirrored graph tag ``evidence:<level>`` — tags get server-side
   time-range history and can be filtered/resolved, while metadata cannot
 
