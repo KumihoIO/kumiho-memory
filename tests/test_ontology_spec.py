@@ -181,20 +181,40 @@ def test_build_spec_covers_node_kinds_and_edges():
     assert "grounding:stale" in edges["DEPENDS_ON"]["grounding_staleness"]
 
 
+def test_build_spec_documents_traversal_order_contract():
+    # #105: the deterministic belief-safety-first read contract is stated in the
+    # spec artifact so agents can commit to it (belief edges before positive
+    # edges within every budget window, stable kref tiebreak).
+    spec = build_spec()
+    contract = spec["traversal_order"]
+    # Class 1 is belief-safety (CONTRADICTS/SUPERSEDES); class 2 the positives.
+    by_class = {c["class"]: c for c in contract["classes"]}
+    assert by_class[1]["edge_types"] == ["CONTRADICTS", "SUPERSEDES"]
+    assert "SUPPORTS" in by_class[2]["edge_types"]
+    assert "DEPENDS_ON" in by_class[2]["edge_types"]
+    # The stable tiebreak and the marker-completeness guarantee are documented.
+    assert "edge_type" in contract["tiebreak"]
+    assert "kref" in contract["tiebreak"]
+    assert "before any cap" in contract["marker_completeness"]
+    # Survives JSON serialization unchanged (persisted as JSON metadata).
+    restored = json.loads(json.dumps(spec, ensure_ascii=False))
+    assert restored["traversal_order"] == contract
+
+
 def test_build_spec_embeds_trust_mapping():
     spec = build_spec()
     assert spec["trust_vocabulary"] == mapping_as_dict()
 
 
-def test_default_schema_version_is_v2():
-    # Phase 2 (SUPERSEDES dual-basis, CONTRADICTS, grounding staleness) bumped
-    # the contract: re-seeding must mint a new tagged revision.
-    assert OntologySchema().version == "kumiho.agent_memory.ontology.v2"
+def test_default_schema_version_is_v3():
+    # #105 bumped the contract to v3 (deterministic belief-safety-first
+    # traversal order): re-seeding must mint a new tagged revision.
+    assert OntologySchema().version == "kumiho.agent_memory.ontology.v3"
 
 
 def test_build_spec_honors_schema_version():
-    spec = build_spec(OntologySchema(version="kumiho.agent_memory.ontology.v3"))
-    assert spec["spec_version"] == "kumiho.agent_memory.ontology.v3"
+    spec = build_spec(OntologySchema(version="kumiho.agent_memory.ontology.v9"))
+    assert spec["spec_version"] == "kumiho.agent_memory.ontology.v9"
 
 
 # ---------------------------------------------------------------------------

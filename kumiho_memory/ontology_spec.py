@@ -67,6 +67,7 @@ def build_spec(schema: Optional[OntologySchema] = None) -> Dict[str, Any]:
         ),
         "node_kinds": _node_kinds(sch),
         "edge_types": _edge_types(sch),
+        "traversal_order": _traversal_order(),
         "relation_registry": _relation_registry(),
         "trust_vocabulary": trust_vocab.mapping_as_dict(),
     }
@@ -187,6 +188,66 @@ def _edge_types(sch: OntologySchema) -> Dict[str, Any]:
                      "disputes; the reader ignores them for contested "
                      "marking.",
         },
+    }
+
+
+def _traversal_order() -> Dict[str, Any]:
+    """The deterministic belief-safety-first read contract (#105).
+
+    Mirrors ``graph_augmentation._edge_sort_key``: every budget window that
+    consumes enumerated edges sorts candidates by this priority BEFORE applying
+    its fan-out / result / sibling cap, so which edges survive is a property of
+    the graph, never of the order the server returned them.
+    """
+    return {
+        "guarantee": (
+            "Within every traversal budget window, candidate edges are "
+            "processed in a deterministic priority order, not server arrival "
+            "order — so a belief-change edge can never be crowded out of a cap "
+            "by luck, and identical graphs traverse byte-identically."
+        ),
+        "classes": [
+            {
+                "class": 1,
+                "name": "belief-safety",
+                "edge_types": ["CONTRADICTS", "SUPERSEDES"],
+                "note": "Scoped to fact-level belief edges: CONTRADICTS "
+                        "qualifies only with dispute basis (edge metadata "
+                        "basis in {agent, evidence-assessor}); entity->entity "
+                        "CONTRADICTS/SUPERSEDES relation edges (predicate "
+                        "metadata, no basis) are domain claims, not belief "
+                        "edges, and never get this priority. (In code, "
+                        "Class 1 is sort integer 0 — it sorts first.)",
+            },
+            {
+                "class": 2,
+                "name": "positive",
+                "edge_types": ["DERIVED_FROM", "DEPENDS_ON", "REFERENCED",
+                               "CONTAINS", "CREATED_FROM", "SUPPORTS"],
+            },
+            {
+                "class": 3,
+                "name": "relational",
+                "note": "ABOUT/INVOLVES sibling hops and the entity->entity "
+                        "relation traversal keep their own internal rules "
+                        "(specific relations before the RELATES_TO fallback) "
+                        "with the stable tiebreak. Belief-TYPED domain-claim "
+                        "relation edges (entity->entity CONTRADICTS/"
+                        "SUPERSEDES, no dispute basis) are demoted below the "
+                        "specific positive relations and above the RELATES_TO "
+                        "fallback — deprioritized, not excluded — so they "
+                        "cannot crowd discriminative relations out of the "
+                        "relation caps.",
+            },
+        ],
+        "tiebreak": "(edge_type, reached-node kref uri) lexicographic, "
+                    "applied within every class.",
+        "marker_completeness": (
+            "Contested (CONTRADICTS) and grounding-staleness markers are "
+            "recorded from the FULL enumerated edge list before any cap "
+            "truncation, so the sort reorders survival but never drops a "
+            "marker."
+        ),
     }
 
 

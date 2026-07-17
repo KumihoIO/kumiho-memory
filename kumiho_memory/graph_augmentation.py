@@ -19,6 +19,7 @@ The two main capabilities are:
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import re
@@ -43,6 +44,79 @@ logger = logging.getLogger(__name__)
 #: surfaced by the dispute path. The SDK Edge object carries ``metadata``
 #: (proto map), so this check reuses data already on the fetched edges.
 _DISPUTE_BASES = frozenset({"agent", "evidence-assessor"})
+
+#: Deterministic belief-safety-first traversal order (#105). Every budget
+#: window that consumes enumerated edges (fan-out / result / sibling caps)
+#: sorts its candidates by this contract BEFORE applying the cap, so WHICH
+#: edges survive is a property of the graph, never of the order the server
+#: happened to return them. Spec Class 1 = belief-change edges (CONTRADICTS —
+#: dispute-basis scoped per #94 at the call site — and SUPERSEDES): a
+#: contradiction can then never be crowded out of the budget by luck, the same
+#: guarantee memory-bank ships, generalized from the #90 sibling-cap fix to the
+#: whole reader. Spec Class 2 = the positive whitelist. (The sort key encodes
+#: Class 1 as integer 0 and Class 2 as integer 1 — Class 1 sorts first.)
+#: Within a class the tiebreak is ``(edge_type, reached-node uri)`` so
+#: identical graphs traverse byte-identically. The relational pass (spec
+#: Class 3: entity ABOUT/INVOLVES hops + relation traversal) keeps its own
+#: internal priority (specific-before-RELATES_TO) with the same stable
+#: tiebreak — and NOTE that belief-TYPED edges DO hang off entity anchors:
+#: CONTRADICTS/SUPERSEDES are canonical relation predicates, so an anchor can
+#: carry entity->entity domain claims of those types. Those carry ``predicate``
+#: metadata and no dispute ``basis`` — they are NOT belief edges (#94), so the
+#: relational pass uses :func:`_anchor_edge_sort_key`, which grants belief
+#: priority only on dispute basis and DEMOTES basis-less belief-typed domain
+#: claims below the ordinary specific relations (still above the RELATES_TO
+#: fallback — deprioritized, not excluded, mirroring RELATES_TO's own rule).
+_BELIEF_EDGE_TYPES = frozenset({"CONTRADICTS", "SUPERSEDES"})
+
+
+def _endpoint_uri(kref_obj: Any) -> str:
+    """URI of one edge endpoint kref, tolerating a missing/None side."""
+    return getattr(kref_obj, "uri", "") or ""
+
+
+def _reached_uri(edge: Any, pivot_uri: str) -> str:
+    """The endpoint of *edge* the traversal reaches: the side that is not the
+    revision the edges were fetched from. For a self-loop both sides are the
+    pivot, so it returns the pivot."""
+    src = _endpoint_uri(getattr(edge, "source_kref", None))
+    dst = _endpoint_uri(getattr(edge, "target_kref", None))
+    return dst if src == pivot_uri else src
+
+
+def _edge_sort_key(edge: Any, pivot_uri: str) -> Tuple[int, str, str]:
+    """Priority-then-stable sort key for one enumerated edge (see
+    :data:`_BELIEF_EDGE_TYPES`). Spec Class 1 (belief, sort integer 0) sorts
+    before Class 2 (positive, sort integer 1); ties break on
+    ``(edge_type, reached uri)``. Used by the generic walk, whose loop body
+    #94-scopes CONTRADICTS itself (a non-dispute CONTRADICTS is skipped
+    outright, so its promotion here consumes no budget)."""
+    etype = getattr(edge, "edge_type", "") or ""
+    cls = 0 if etype in _BELIEF_EDGE_TYPES else 1
+    return (cls, etype, _reached_uri(edge, pivot_uri))
+
+
+def _anchor_edge_sort_key(edge: Any, pivot_uri: str) -> Tuple[int, str, str]:
+    """`_edge_sort_key` variant for the entity-anchor (relational) scans.
+
+    Belief priority (tier 0) applies ONLY to edges carrying a fact-level
+    dispute ``basis`` (#94 ``_DISPUTE_BASES`` scoping). CONTRADICTS/SUPERSEDES
+    are ALSO canonical relation predicates, so entity->entity belief-TYPED
+    domain claims (``predicate`` metadata, no basis) do hang off anchors —
+    those must not ride the belief class (or the belief alphabet: "C..." beats
+    "DEPENDS_ON"/"USES" lexicographically) into the relation caps, so they are
+    demoted to tier 2, below the ordinary specific relations (tier 1) and
+    above the RELATES_TO fallback, which the per-anchor partition already
+    orders last. Deprioritized, not excluded — mirroring RELATES_TO's rule.
+    """
+    etype = getattr(edge, "edge_type", "") or ""
+    if etype in _BELIEF_EDGE_TYPES:
+        basis = str((getattr(edge, "metadata", None) or {}).get("basis", ""))
+        tier = 0 if basis in _DISPUTE_BASES else 2
+    else:
+        tier = 1
+    return (tier, etype, _reached_uri(edge, pivot_uri))
+
 
 # Type alias for the recall callable injected by the memory manager.
 # It must accept (query, *, limit, space_paths, memory_types) and return a
@@ -947,7 +1021,20 @@ class GraphAugmentedRecall:
                     continue
                 try:
                     rev = kumiho.get_revision(kref_str)
-                    edges = rev.get_edges(direction=kumiho.BOTH)
+                    # Materialize + priority-sort before the budget loop (#105):
+                    # belief edges (CONTRADICTS/SUPERSEDES) first, stable
+                    # (edge_type, reached uri) tiebreak. The downstream context
+                    # cap in `recall()` keeps whichever entries were appended
+                    # first, so this — not server arrival order — decides which
+                    # edges survive a tight budget. contested_map is still built
+                    # from the FULL list below (no in-loop truncation), so
+                    # markers stay complete regardless of the sort. Full sort,
+                    # not a top-k heap: the loop consumes the whole list (no
+                    # in-walk cap) and the markers need every edge.
+                    edges = sorted(
+                        rev.get_edges(direction=kumiho.BOTH),
+                        key=lambda e: _edge_sort_key(e, kref_str),
+                    )
                     for edge in edges:
                         if edge.edge_type not in edge_filter:
                             continue
@@ -1139,8 +1226,18 @@ class GraphAugmentedRecall:
             def _surface(link_score: float, anchor: str,
                          candidates: List[Tuple[int, str, str]]) -> None:
                 nonlocal found
-                candidates.sort(key=lambda c: c[0])
-                for _prio, src, etype in candidates[:2]:  # <=2 nodes/bridge
+                # Kind priority first (fact/event/decision), then a stable
+                # (edge_type, src uri) tiebreak (#105) so the <=2 surfaced
+                # nodes are deterministic under the budget, not arrival-ordered.
+                # nsmallest, not a full sort (F6): only the top 2 are consumed
+                # (a failed fetch is not backfilled from rank 3), and it is
+                # deterministic — the key includes the src uri, so distinct
+                # candidates never tie, and a duplicate (src, etype) pair
+                # yields the identical entry either way.
+                top2 = heapq.nsmallest(
+                    2, candidates, key=lambda c: (c[0], c[2], c[1]),
+                )
+                for _prio, src, etype in top2:  # <=2 nodes/bridge
                     if found >= max_results:
                         return
                     seen_krefs.add(src)
@@ -1457,14 +1554,21 @@ class GraphAugmentedRecall:
                 try:
                     rev = kumiho.get_revision(kref_str)
                     # Hop 1: this memory -> entity anchors (memory is source).
-                    anchor_uris: List[str] = []
-                    for edge in rev.get_edges(direction=kumiho.BOTH):
-                        if edge.edge_type != "ABOUT":
-                            continue
-                        if edge.source_kref.uri == kref_str:
-                            anchor_uris.append(edge.target_kref.uri)
-                        if len(anchor_uris) >= max_entities:
-                            break
+                    # Deterministic fan-out (#105): the smallest `max_entities`
+                    # anchor uris win the cap — a property of the graph, not of
+                    # server edge order. nsmallest, not a full sort (F6): only
+                    # the top-k are consumed, and it is deterministic here — it
+                    # compares the full uri, and equal uris (duplicate ABOUT
+                    # edges) are interchangeable, so ties cannot change the
+                    # selected set.
+                    anchor_uris: List[str] = heapq.nsmallest(
+                        max_entities,
+                        (edge.target_kref.uri
+                         for edge in rev.get_edges(direction=kumiho.BOTH)
+                         if edge.edge_type == "ABOUT"
+                         and edge.source_kref.uri == kref_str
+                         and edge.target_kref.uri),
+                    )
                 except Exception as exc:
                     logger.debug("entity recall: edges for %s failed: %s", kref_str, exc)
                     continue
@@ -1482,7 +1586,24 @@ class GraphAugmentedRecall:
                         siblings = 0
                         rel_here: List[Tuple[str, str]] = []
                         sibs_capped = False
-                        for edge in anchor_rev.get_edges(direction=kumiho.BOTH):
+                        # Materialize + sort the anchor's edges before the
+                        # sibling cap (#105): stable (edge_type, reached uri)
+                        # order so WHICH siblings survive `max_siblings` — and
+                        # which relation edges get queued — is deterministic.
+                        # Anchor-scoped key: entity->entity CONTRADICTS/
+                        # SUPERSEDES relation edges (domain claims, no dispute
+                        # basis) DO hang off anchors — they sort BELOW the
+                        # ordinary specific relations, not in the belief class
+                        # (see _anchor_edge_sort_key). Full sort (not a top-k
+                        # heap): the whole ordered list is consumed — sibling
+                        # fill continues past seen-kref skips and, with
+                        # relation_traversal on, the scan also collects every
+                        # relation edge.
+                        anchor_edges = sorted(
+                            anchor_rev.get_edges(direction=kumiho.BOTH),
+                            key=lambda e: _anchor_edge_sort_key(e, anchor_uri),
+                        )
+                        for edge in anchor_edges:
                             etype = edge.edge_type
                             # Relation traversal: note the entity->entity relation
                             # edges from this anchor (either direction) for the
@@ -1572,8 +1693,12 @@ class GraphAugmentedRecall:
                 # Global specific-over-fallback ordering: the per-anchor slice
                 # alone lets an EARLIER anchor's RELATES_TO consume the global
                 # caps ahead of a later anchor's specific relation. Stable
-                # partition — arrival order is preserved within each class.
-                relation_candidates.sort(key=lambda c: c[0] == relates_to)
+                # (is_fallback, relation_type, neighbour uri) tiebreak (#105) so
+                # the queue is deterministic even when two candidates share the
+                # fallback class.
+                relation_candidates.sort(
+                    key=lambda c: (c[0] == relates_to, c[0], c[1]),
+                )
                 rel_found = 0
                 neighbours_expanded = 0
                 for (relation_type, neighbour_uri,
@@ -1628,7 +1753,12 @@ class GraphAugmentedRecall:
                         continue
                     if incoming > hub_max:
                         continue  # ubiquitous neighbour — its memories are generic
-                    cands.sort(key=lambda c: c[0])  # fact/event/decision first
+                    # Kind first, then a stable (edge_type, sib uri) tiebreak
+                    # (#105) so the neighbour's siblings are deterministic.
+                    # Full sort, not a top-k heap: the loop below skips
+                    # seen krefs, so later-ranked candidates can backfill the
+                    # caps — a k-slice would lose them.
+                    cands.sort(key=lambda c: (c[0], c[2], c[1]))
                     sib_here = 0
                     for _prio, sib_uri, sib_edge_type in cands:
                         if rel_found >= rel_max_results or sib_here >= max_siblings:

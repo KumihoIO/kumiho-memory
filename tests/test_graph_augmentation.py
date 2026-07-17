@@ -11,6 +11,7 @@ server is needed. ``monkeypatch.setitem`` (never pop) per repo convention.
 """
 
 import asyncio
+import itertools
 
 from kumiho_memory.graph_augmentation import (
     GraphAugmentationConfig,
@@ -293,6 +294,91 @@ def test_global_caps_prefer_specific_over_earlier_relates_to(monkeypatch):
     )
     assert [m["kref"] for m in augmented] == [NMEM]   # specific wins globally
     assert augmented[0]["via_relation"] == "USES"
+
+
+# ---------------------------------------------------------------------------
+# #105/F3 — entity->entity belief-TYPED relation edges are domain claims, not
+# belief edges: CONTRADICTS/SUPERSEDES are canonical relation predicates, so
+# they DO hang off anchors, and without dispute basis they must neither ride
+# the belief class nor the belief alphabet ("C..." < "DEPENDS_ON"/"USES") into
+# the relation caps. Demoted below the specifics, above RELATES_TO.
+# ---------------------------------------------------------------------------
+
+def test_entity_relation_contradicts_does_not_outcompete_specifics(monkeypatch):
+    # A carries an entity->entity CONTRADICTS domain claim (predicate metadata,
+    # NO basis) plus DEPENDS_ON and USES. With the per-anchor edge budget = 2,
+    # the two positive specifics win the slots and the CONTRADICTS neighbour is
+    # never expanded — in BOTH arrival orders (the class demotion, not the
+    # alphabet or arrival order, decides: "CONTRADICTS" < "DEPENDS_ON" < "USES"
+    # lexicographically, so an undemoted CONTRADICTS would always win).
+    CE = "kref://p/entities/rival.entity?r=1"
+    CEM = "kref://p/notes/rival-note.conversation?r=1"
+    D = "kref://p/entities/postgres.entity?r=1"
+    DMEM = "kref://p/notes/postgres-note.conversation?r=1"
+    rel_edges = [
+        _FakeEdge(A, CE, "CONTRADICTS", {"predicate": "conflicts_with"}),
+        _FakeEdge(A, D, "DEPENDS_ON"),
+        _FakeEdge(A, N, "USES"),
+    ]
+    for order in (rel_edges, list(reversed(rel_edges))):
+        graph = {
+            M1: _FakeRev(M1, {"title": "M1"}, [_FakeEdge(M1, A, "ABOUT")]),
+            A: _FakeRev(A, {"display_name": "Acme"},
+                        [_FakeEdge(M1, A, "ABOUT")] + order),
+            CE: _FakeRev(CE, {"display_name": "Rival"},
+                         [_FakeEdge(CEM, CE, "ABOUT")]),
+            CEM: _FakeRev(CEM, {"title": "Rival note", "summary": "r"}, []),
+            D: _FakeRev(D, {"display_name": "Postgres"},
+                        [_FakeEdge(DMEM, D, "ABOUT")]),
+            DMEM: _FakeRev(DMEM, {"title": "Pg note", "summary": "d"}, []),
+            N: _FakeRev(N, {"display_name": "Redis"},
+                        [_FakeEdge(NMEM, N, "ABOUT")]),
+            NMEM: _FakeRev(NMEM, {"title": "Redis note", "summary": "n"}, []),
+        }
+        found, augmented = _run(
+            monkeypatch, graph, relation_traversal=True,
+            relation_traversal_max_edges_per_anchor=2,
+        )
+        krefs = {m["kref"] for m in augmented}
+        assert krefs == {DMEM, NMEM}   # the positive specifics win the budget
+        assert CEM not in krefs        # domain claim starved by the cap
+
+
+def test_entity_relation_contradicts_still_followed_when_budget_allows(monkeypatch):
+    # Demoted, not excluded (mirrors the RELATES_TO rule): with room in the
+    # per-anchor budget the CONTRADICTS domain claim is still crossed, and it
+    # still outranks the RELATES_TO fallback.
+    CE = "kref://p/entities/rival.entity?r=1"
+    CEM = "kref://p/notes/rival-note.conversation?r=1"
+    R = "kref://p/entities/misc.entity?r=1"
+    RMEM = "kref://p/notes/misc-note.conversation?r=1"
+    graph = {
+        M1: _FakeRev(M1, {"title": "M1"}, [_FakeEdge(M1, A, "ABOUT")]),
+        A: _FakeRev(A, {"display_name": "Acme"}, [
+            _FakeEdge(M1, A, "ABOUT"),
+            _FakeEdge(A, R, "RELATES_TO"),   # fallback, listed first
+            _FakeEdge(A, CE, "CONTRADICTS", {"predicate": "conflicts_with"}),
+            _FakeEdge(A, N, "USES"),
+        ]),
+        CE: _FakeRev(CE, {"display_name": "Rival"},
+                     [_FakeEdge(CEM, CE, "ABOUT")]),
+        CEM: _FakeRev(CEM, {"title": "Rival note", "summary": "r"}, []),
+        R: _FakeRev(R, {"display_name": "Misc"},
+                    [_FakeEdge(RMEM, R, "ABOUT")]),
+        RMEM: _FakeRev(RMEM, {"title": "Misc", "summary": "m"}, []),
+        N: _FakeRev(N, {"display_name": "Redis"},
+                    [_FakeEdge(NMEM, N, "ABOUT")]),
+        NMEM: _FakeRev(NMEM, {"title": "Redis note", "summary": "n"}, []),
+    }
+    found, augmented = _run(
+        monkeypatch, graph, relation_traversal=True,
+        relation_traversal_max_edges_per_anchor=2,
+    )
+    krefs = {m["kref"] for m in augmented}
+    assert krefs == {NMEM, CEM}    # USES first, then the domain claim
+    assert RMEM not in krefs       # fallback still last, starved by the cap
+    assert next(m for m in augmented if m["kref"] == CEM)[
+        "via_relation"] == "CONTRADICTS"
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +877,278 @@ def test_traversal_times_out_and_returns_empty(monkeypatch):
     assert elapsed < 0.35, (
         f"timeout wait took {elapsed:.3f}s — should be ~= the 0.1s timeout"
     )
+
+
+# ---------------------------------------------------------------------------
+# #105 — deterministic belief-safety-first traversal contract
+#
+# Same graph, edges delivered in every (sampled) arrival order ⇒ byte-identical
+# traversal results AND markers. Belief edges (CONTRADICTS/SUPERSEDES) are
+# processed before positive edges within each budget window, so a contradiction
+# can never be crowded out of a fan-out / result / sibling cap by luck. Mirrors
+# the #90 sibling-cap regression-test pattern, generalized to the whole reader.
+# ---------------------------------------------------------------------------
+
+def _sample_perms(seq, cap=24):
+    """All permutations of *seq* (≤ ``cap``), else a deterministic subsample
+    that always includes the identity and reversed orders."""
+    perms = list(itertools.permutations(seq))
+    if len(perms) <= cap:
+        return perms
+    step = max(1, len(perms) // cap)
+    sub = perms[::step][:cap]
+    if perms[-1] not in sub:      # keep a fully-reversed arrival order too
+        sub[-1] = perms[-1]
+    return sub
+
+
+# --- (a) generic walk: belief edges surface first, stable within a class -----
+
+PW_S = "kref://p/notes/pw-seed.conversation?r=1"
+PW_CT = "kref://p/facts/pw-a.fact?r=1"     # CONTRADICTS (dispute basis)
+PW_SUP = "kref://p/facts/pw-b.fact?r=1"    # SUPERSEDES
+PW_REF = "kref://p/facts/pw-c.fact?r=1"    # REFERENCED (positive)
+PW_SPT = "kref://p/facts/pw-d.fact?r=1"    # SUPPORTS (positive)
+
+
+def test_generic_walk_is_arrival_order_invariant(monkeypatch):
+    # The seed's four whitelisted edges, delivered in all 24 arrival orders,
+    # must yield an identical surfaced sequence and identical contested marker.
+    base_edges = [
+        _FakeEdge(PW_S, PW_SUP, "SUPERSEDES"),
+        _FakeEdge(PW_S, PW_REF, "REFERENCED"),
+        _FakeEdge(PW_S, PW_SPT, "SUPPORTS"),
+        _FakeEdge(PW_S, PW_CT, "CONTRADICTS", {"basis": "agent"}),
+    ]
+    # Belief class first (CONTRADICTS < SUPERSEDES by edge_type), then the
+    # positives (REFERENCED < SUPPORTS), each tiebroken by (edge_type, uri).
+    expected_seq = [
+        (PW_CT, "CONTRADICTS"), (PW_SUP, "SUPERSEDES"),
+        (PW_REF, "REFERENCED"), (PW_SPT, "SUPPORTS"),
+    ]
+    signatures = set()
+    for perm in _sample_perms(base_edges):
+        graph = {PW_S: _FakeRev(PW_S, {"title": "S", "summary": "seed"},
+                                list(perm))}
+        for k in (PW_CT, PW_SUP, PW_REF, PW_SPT):
+            graph[k] = _FakeRev(k, {"title": k, "summary": ""}, [])
+        base = [{"kref": PW_S, "title": "S", "summary": "seed", "score": 0.5}]
+        _found, augmented = _traverse(monkeypatch, graph, [PW_S], base)
+        seq = tuple((m["kref"], m["edge_type"])
+                    for m in augmented if m.get("graph_augmented"))
+        signatures.add((seq, tuple(base[0].get("contested_by", ()))))
+
+    assert len(signatures) == 1, "arrival order changed the traversal result"
+    (seq, contested), = signatures
+    assert seq == tuple(expected_seq)
+    assert contested == (PW_CT,)   # marker recorded regardless of arrival order
+
+
+# --- (b) entity-neighbor sibling cap: which siblings survive is deterministic -
+
+EN_M1 = "kref://p/notes/en-m1.conversation?r=1"   # seed
+EN_A = "kref://p/entities/en-a.entity?r=1"
+EN_S1 = "kref://p/notes/en-s1.conversation?r=1"
+EN_S2 = "kref://p/notes/en-s2.conversation?r=1"
+EN_S3 = "kref://p/notes/en-s3.conversation?r=1"
+
+
+def test_entity_sibling_cap_is_arrival_order_invariant(monkeypatch):
+    # A has three sibling ABOUT edges but max_siblings=2. In every arrival order
+    # the SAME two siblings survive (lexicographically smallest source uris) —
+    # arrival order no longer decides who gets starved (the #90 class of bug).
+    anchor_incoming = [
+        _FakeEdge(EN_M1, EN_A, "ABOUT"),   # the seed itself (already seen)
+        _FakeEdge(EN_S1, EN_A, "ABOUT"),
+        _FakeEdge(EN_S2, EN_A, "ABOUT"),
+        _FakeEdge(EN_S3, EN_A, "ABOUT"),
+    ]
+    signatures = set()
+    for perm in _sample_perms(anchor_incoming):
+        graph = {
+            EN_M1: _FakeRev(EN_M1, {"title": "M1"},
+                            [_FakeEdge(EN_M1, EN_A, "ABOUT")]),
+            EN_A: _FakeRev(EN_A, {"display_name": "A"}, list(perm)),
+            EN_S1: _FakeRev(EN_S1, {"title": "S1", "summary": "s1"}, []),
+            EN_S2: _FakeRev(EN_S2, {"title": "S2", "summary": "s2"}, []),
+            EN_S3: _FakeRev(EN_S3, {"title": "S3", "summary": "s3"}, []),
+        }
+        _install_graph(monkeypatch, graph)
+        gr = GraphAugmentedRecall(config=GraphAugmentationConfig(
+            entity_recall=True, entity_recall_max_siblings=2,
+        ))
+        augmented = []
+        asyncio.run(gr._traverse_entity_neighbors(
+            [EN_M1], {EN_M1}, augmented, query="",
+        ))
+        signatures.add(tuple((m["kref"], m["edge_type"]) for m in augmented))
+
+    assert len(signatures) == 1, "arrival order changed which siblings survived"
+    (seq,) = signatures
+    assert seq == ((EN_S1, "ABOUT"), (EN_S2, "ABOUT"))
+
+
+# --- (b') entity-bridge join: which connecting nodes surface is deterministic -
+
+BJ_M1 = "kref://p/notes/bj-m1.conversation?r=1"
+BJ_M2 = "kref://p/notes/bj-m2.conversation?r=1"
+BJ_X = "kref://p/entities/bj-x.entity?r=1"
+BJ_F1 = "kref://p/facts/bj-f1.fact?r=1"
+BJ_F2 = "kref://p/facts/bj-f2.fact?r=1"
+BJ_F3 = "kref://p/facts/bj-f3.fact?r=1"
+
+
+def test_entity_bridge_candidates_are_arrival_order_invariant(monkeypatch):
+    # X bridges two angles; it has three incoming fact candidates but only two
+    # surface (<=2 nodes/bridge). In every arrival order the SAME two facts win
+    # (lexicographically smallest uris), not whichever the server listed first.
+    x_incoming = [
+        _FakeEdge(BJ_M1, BJ_X, "ABOUT"),   # the two angle hits (already seen)
+        _FakeEdge(BJ_M2, BJ_X, "ABOUT"),
+        _FakeEdge(BJ_F1, BJ_X, "ABOUT"),
+        _FakeEdge(BJ_F2, BJ_X, "ABOUT"),
+        _FakeEdge(BJ_F3, BJ_X, "ABOUT"),
+    ]
+    signatures = set()
+    for perm in _sample_perms(x_incoming):
+        graph = {
+            BJ_M1: _FakeRev(BJ_M1, {"title": "M1"},
+                            [_FakeEdge(BJ_M1, BJ_X, "ABOUT")]),
+            BJ_M2: _FakeRev(BJ_M2, {"title": "M2"},
+                            [_FakeEdge(BJ_M2, BJ_X, "ABOUT")]),
+            BJ_X: _FakeRev(BJ_X, {"display_name": "X"}, list(perm)),
+            BJ_F1: _FakeRev(BJ_F1, {"title": "F1", "summary": "f1"}, []),
+            BJ_F2: _FakeRev(BJ_F2, {"title": "F2", "summary": "f2"}, []),
+            BJ_F3: _FakeRev(BJ_F3, {"title": "F3", "summary": "f3"}, []),
+        }
+        _install_graph(monkeypatch, graph)
+        gr = GraphAugmentedRecall(
+            config=GraphAugmentationConfig(entity_recall=True),
+        )
+        augmented = []
+        angle_hits = [[(BJ_M1, 0.9)], [(BJ_M2, 0.8)]]
+        asyncio.run(gr._entity_bridge_join(
+            angle_hits, {BJ_M1, BJ_M2}, augmented,
+        ))
+        signatures.add(tuple(m["kref"] for m in augmented))
+
+    assert len(signatures) == 1, "arrival order changed the surfaced bridges"
+    (seq,) = signatures
+    assert seq == (BJ_F1, BJ_F2)
+
+
+# --- (c) tight budget: belief edges always survive the cap first -------------
+
+TB_S = "kref://p/notes/tb-seed.conversation?r=1"
+TB_CT = "kref://p/facts/tb-ct.fact?r=1"    # CONTRADICTS (dispute basis)
+TB_SUP = "kref://p/facts/tb-sup.fact?r=1"   # SUPERSEDES
+TB_P1 = "kref://p/facts/tb-p1.fact?r=1"     # SUPPORTS (positive)
+TB_P2 = "kref://p/facts/tb-p2.fact?r=1"     # REFERENCED (positive)
+
+
+def test_tight_budget_never_starves_belief_edges(monkeypatch):
+    # base_limit=1 ⇒ cap=3 ⇒ one base seed + room for only TWO graph entries.
+    # The seed has two belief + two positive edges. Under arrival order the
+    # survivors used to be luck; now the two belief edges ALWAYS take the room
+    # and the positives are the ones crowded out — belief-safety first.
+    seed_edges = [
+        _FakeEdge(TB_S, TB_CT, "CONTRADICTS", {"basis": "agent"}),
+        _FakeEdge(TB_S, TB_SUP, "SUPERSEDES"),
+        _FakeEdge(TB_S, TB_P1, "SUPPORTS"),
+        _FakeEdge(TB_S, TB_P2, "REFERENCED"),
+    ]
+
+    async def _recall_fn(q, *, limit, space_paths=None, memory_types=None):
+        return [{"kref": TB_S, "title": "S", "summary": "seed", "score": 0.9}]
+
+    survivors_seen = set()
+    for perm in _sample_perms(seed_edges):
+        graph = {TB_S: _FakeRev(TB_S, {"title": "S", "summary": "seed"},
+                                list(perm))}
+        for k, s in ((TB_CT, "ct"), (TB_SUP, "sup"), (TB_P1, "p1"),
+                     (TB_P2, "p2")):
+            graph[k] = _FakeRev(k, {"title": k, "summary": s}, [])
+        _install_graph(monkeypatch, graph)
+        gr = GraphAugmentedRecall(
+            recall_fn=_recall_fn, config=GraphAugmentationConfig(),
+        )
+        result = asyncio.run(gr.recall("q", limit=1))
+        survivors = frozenset(
+            m["kref"] for m in result if m.get("graph_augmented")
+        )
+        survivors_seen.add(survivors)
+
+    assert survivors_seen == {frozenset({TB_CT, TB_SUP})}, (
+        "a tight budget let arrival order decide which edges survived"
+    )
+
+
+# --- (F4) cap truncation × marker identity: jointly pinned ------------------
+
+MK_S = "kref://p/notes/mk-seed.conversation?r=1"
+MK_CT = "kref://p/facts/mk-ct.fact?r=1"        # CONTRADICTS (dispute basis)
+MK_SUP = "kref://p/facts/mk-sup.fact?r=1"       # SUPERSEDES
+MK_DEP = "kref://p/decisions/mk-dep.decision?r=1"  # DEPENDS_ON, grounding-stale
+MK_NEW = "kref://p/facts/mk-new.fact?r=1"       # what superseded DEP's ground
+MK_R = "kref://p/facts/mk-r.fact?r=1"           # REFERENCED (truncated)
+MK_P = "kref://p/facts/mk-p.fact?r=1"           # SUPPORTS (truncated)
+
+
+def test_cap_truncation_and_markers_are_jointly_order_invariant(monkeypatch):
+    # The spec's marker_completeness clause, pinned WITH truncation: run the
+    # full recall path under a cap that cuts two positive edges, across permuted
+    # edge arrival orders, and assert the surviving entries AND both marker
+    # kinds (contested_by, grounding_stale/superseded_by) are byte-identical.
+    seed_edges = [
+        _FakeEdge(MK_S, MK_CT, "CONTRADICTS", {"basis": "agent"}),
+        _FakeEdge(MK_S, MK_SUP, "SUPERSEDES"),
+        _FakeEdge(MK_DEP, MK_S, "DEPENDS_ON"),   # incoming: dependent decision
+        _FakeEdge(MK_S, MK_R, "REFERENCED"),
+        _FakeEdge(MK_S, MK_P, "SUPPORTS"),
+    ]
+
+    async def _recall_fn(q, *, limit, space_paths=None, memory_types=None):
+        # Fresh dict per call: markers are stamped onto result entries, so a
+        # shared dict would leak contested_by between permutation runs.
+        return [{"kref": MK_S, "title": "S", "summary": "seed", "score": 0.9}]
+
+    signatures = set()
+    for perm in _sample_perms(seed_edges):
+        graph = {MK_S: _FakeRev(MK_S, {"title": "S", "summary": "seed"},
+                                list(perm))}
+        for k in (MK_CT, MK_SUP, MK_R, MK_P):
+            graph[k] = _FakeRev(k, {"title": k, "summary": "x"}, [])
+        graph[MK_DEP] = _FakeRev(MK_DEP, {
+            "title": "D", "summary": "grounded decision",
+            "grounding_stale": "true",
+            "grounding_stale_superseded_by": MK_NEW,
+        }, [])
+        _install_graph(monkeypatch, graph)
+        gr = GraphAugmentedRecall(
+            recall_fn=_recall_fn, config=GraphAugmentationConfig(),
+        )
+        result = asyncio.run(gr.recall("q", limit=1, max_total=4))
+        signatures.add(tuple(
+            (m["kref"], m.get("edge_type", ""),
+             tuple(m.get("contested_by", ())),
+             m.get("grounding_stale"), m.get("superseded_by", ""))
+            for m in result
+        ))
+
+    assert len(signatures) == 1, (
+        "cap truncation or markers varied with edge arrival order"
+    )
+    (sig,) = signatures
+    # Survivors: base seed + belief edges + the smallest positive (DEPENDS_ON);
+    # REFERENCED and SUPPORTS are the ones deterministically truncated.
+    assert [e[0] for e in sig] == [MK_S, MK_CT, MK_SUP, MK_DEP]
+    by_kref = {e[0]: e for e in sig}
+    # Contested marker: recorded from the FULL list, present on both endpoints.
+    assert by_kref[MK_S][2] == (MK_CT,)
+    assert by_kref[MK_CT][2] == (MK_S,)
+    # Grounding-staleness marker rides the surviving dependent entry.
+    assert by_kref[MK_DEP][3] is True
+    assert by_kref[MK_DEP][4] == MK_NEW
 
 
 if __name__ == "__main__":

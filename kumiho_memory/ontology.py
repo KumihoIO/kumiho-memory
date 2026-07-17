@@ -88,9 +88,13 @@ class OntologySchema:
 
     # v2 (Phase 2): SUPERSEDES became dual-basis (agent-declared preferred,
     # lexical fallback), CONTRADICTS is a first-class read edge with the basis
-    # convention, and DEPENDS_ON gained the grounding-staleness ripple. The bump
-    # makes seed_ontology_spec mint a new tagged spec revision on next seeding.
-    version: str = "kumiho.agent_memory.ontology.v2"
+    # convention, and DEPENDS_ON gained the grounding-staleness ripple.
+    # v3 (#105): the reader adopted a deterministic belief-safety-first
+    # traversal contract (belief edges before positive edges within every
+    # budget window, stable kref tiebreak) — documented under `traversal_order`.
+    # A bump makes seed_ontology_spec mint a new tagged spec revision on next
+    # seeding.
+    version: str = "kumiho.agent_memory.ontology.v3"
 
     #: extraction field -> (item kind, space under the project root)
     entities_space: str = "entities"
