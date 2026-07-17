@@ -118,6 +118,19 @@ _SIBLING_CHAR_BUDGET = 20_000
 # fall back to char-budget mode which keeps all siblings that fit.
 _SIBLING_STRONG_SCORE = 0.40
 
+# Per-recall cap on sibling-rerank LLM calls (#102). Sibling enrichment issues
+# one LLM round-trip per stacked item; unbounded, N stacked items = N calls
+# added to answer latency. Beyond the cap, items use the existing deterministic
+# in-process fallback instead of the LLM. This is a SAFETY VALVE against
+# pathological recalls that stack many items — NOT a relevance-tuning knob. The
+# default sits well above any typical/benchmark recall (default recall limit is
+# 5; ~10 stacked items is a generous ceiling), so results are byte-identical
+# there. <= 0 disables the cap (unlimited), matching the sibling_top_k=0 idiom.
+_SIBLING_LLM_CAP = 16
+# Bounded concurrency for the capped set: the LLM calls are independent per
+# item, so they run concurrently under this semaphore instead of serially.
+_SIBLING_LLM_CONCURRENCY = 4
+
 # A stored event_date must be a clean ISO-8601 calendar date (YYYY, YYYY-MM, or
 # YYYY-MM-DD). Guards against the summarizer emitting prose ("last week") into the
 # structured event_date field despite the prompt asking for normalized ISO.
@@ -199,6 +212,7 @@ class UniversalMemoryManager:
         sibling_char_budget: int = _SIBLING_CHAR_BUDGET,
         sibling_similarity_threshold: float = 0.0,
         sibling_top_k: int = 0,
+        sibling_llm_cap: int = _SIBLING_LLM_CAP,
         embedding_adapter: Optional[Any] = None,
         sibling_score_fields: Optional[List[str]] = None,
         auto_assess_fn: Optional[AutoAssessFn] = None,
@@ -320,6 +334,14 @@ class UniversalMemoryManager:
         self.sibling_char_budget = sibling_char_budget
         self.sibling_similarity_threshold = sibling_similarity_threshold
         self.sibling_top_k = sibling_top_k
+        # Per-recall sibling-rerank LLM-call cap (#102). Env override for the
+        # safety valve; <= 0 means unlimited. Falls back to the constructor arg
+        # (default _SIBLING_LLM_CAP) when the env var is unset or non-integer.
+        cap_env = os.getenv("KUMIHO_MEMORY_SIBLING_LLM_CAP", "").strip()
+        try:
+            self.sibling_llm_cap = int(cap_env) if cap_env else sibling_llm_cap
+        except ValueError:
+            self.sibling_llm_cap = sibling_llm_cap
         self.embedding_adapter = embedding_adapter
         self.sibling_score_fields = sibling_score_fields
         # Evidence-weighted recall reranking (deterministic, default on;
@@ -1775,16 +1797,22 @@ class UniversalMemoryManager:
         to *that* angle — with only the original query, a multi-topic
         question (multi-hop) selects siblings for its dominant topic and
         drops the other hop's evidence.
+
+        Per-item sibling selection is independent (each item's revisions and
+        the shared query/angles are its only inputs), so the enrichment work
+        runs concurrently under a bounded semaphore instead of one serial LLM
+        round-trip per item (#102). Results are written back to each ``mem`` in
+        place and ``memories`` is returned in its original order, so completion
+        order does not affect output. Beyond ``sibling_llm_cap`` LLM-eligible
+        items the reranker's existing deterministic fallback is used; the cap
+        is a safety valve (default well above typical recalls), not a knob.
         """
         _load_arts = self.recall_mode == "full"
+        cap = self.sibling_llm_cap
 
-        for mem in memories:
-            item_kref = mem.pop("_item_kref", "")
-            if not item_kref:
-                # Graph-augmented results from edge traversal don't
-                # have _item_kref — skip sibling enrichment for them.
-                continue
-
+        async def _enrich_one(
+            mem: Dict[str, Any], item_kref: str, allow_llm: bool,
+        ) -> None:
             # Load artifact for the primary revision if in full mode.
             if _load_arts and "content" not in mem:
                 kref = mem.get("kref", "")
@@ -1811,9 +1839,38 @@ class UniversalMemoryManager:
                 load_artifacts=_load_arts,
                 alt_queries=alt_queries,
                 primary_score=float(primary_score),
+                allow_llm_rerank=allow_llm,
             )
             if siblings:
                 mem["sibling_revisions"] = siblings
+
+        # Assign the LLM-call budget deterministically in list order so the
+        # cap decision never depends on gather completion order. Items without
+        # _item_kref (graph-traversal results) are skipped entirely.
+        pending: List[Tuple[Dict[str, Any], str, bool]] = []
+        llm_ordinal = 0
+        for mem in memories:
+            item_kref = mem.pop("_item_kref", "")
+            if not item_kref:
+                # Graph-augmented results from edge traversal don't
+                # have _item_kref — skip sibling enrichment for them.
+                continue
+            allow_llm = cap <= 0 or llm_ordinal < cap
+            llm_ordinal += 1
+            pending.append((mem, item_kref, allow_llm))
+
+        if pending:
+            sem = asyncio.Semaphore(_SIBLING_LLM_CONCURRENCY)
+
+            async def _bounded(
+                mem: Dict[str, Any], item_kref: str, allow_llm: bool,
+            ) -> None:
+                async with sem:
+                    await _enrich_one(mem, item_kref, allow_llm)
+
+            await asyncio.gather(
+                *[_bounded(m, ik, al) for (m, ik, al) in pending]
+            )
 
         return memories
 
@@ -2702,6 +2759,7 @@ class UniversalMemoryManager:
         current_rev_kref: str = "",
         alt_queries: Optional[List[str]] = None,
         primary_score: float = 0.0,
+        allow_llm_rerank: bool = True,
     ) -> List[Dict[str, Any]]:
         """Select relevant siblings: LLM reranker primary, deterministic fallback.
 
@@ -2733,8 +2791,15 @@ class UniversalMemoryManager:
             return siblings
 
         # --- Primary: LLM reranking (semantic inversion) ---
-        llm_result = await self._rerank_siblings_with_llm(
-            siblings, query, alt_queries=alt_queries,
+        # Beyond the per-recall LLM-call cap (#102), allow_llm_rerank is False:
+        # skip the round-trip and take exactly the same deterministic fallback
+        # path below that fires when the LLM returns None / errors.
+        llm_result = (
+            await self._rerank_siblings_with_llm(
+                siblings, query, alt_queries=alt_queries,
+            )
+            if allow_llm_rerank
+            else None
         )
         if llm_result:
             # Bounded union: recover one strong lexical match the LLM missed.
@@ -2799,6 +2864,7 @@ class UniversalMemoryManager:
         load_artifacts: bool = True,
         alt_queries: Optional[List[str]] = None,
         primary_score: float = 0.0,
+        allow_llm_rerank: bool = True,
     ) -> List[Dict[str, str]]:
         """Fetch title+summary from sibling revisions of a stacked item.
 
@@ -2877,6 +2943,7 @@ class UniversalMemoryManager:
                         siblings, query, item_kref, current_rev_kref,
                         alt_queries=alt_queries,
                         primary_score=primary_score,
+                        allow_llm_rerank=allow_llm_rerank,
                     )
 
                 # Clean up internal keys before loading artifacts.

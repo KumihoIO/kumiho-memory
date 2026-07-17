@@ -23,7 +23,6 @@ import json
 import logging
 import re
 import threading
-import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Union
 
@@ -716,6 +715,13 @@ class GraphAugmentedRecall:
                             break
 
         done_event = threading.Event()
+        # Event-driven completion (#97): the worker bridges its threading.Event
+        # to the running loop via call_soon_threadsafe, so the awaiting
+        # coroutine wakes the instant the daemon finishes rather than on a fixed
+        # poll cadence. The old 0.5s poll set an artificial ~0.25s-avg latency
+        # floor per call even though the work usually finishes in ms.
+        loop = asyncio.get_running_loop()
+        completed = asyncio.Event()
 
         def _worker() -> None:
             try:
@@ -724,15 +730,22 @@ class GraphAugmentedRecall:
                 logger.debug("Edge creation thread error: %s", e)
             finally:
                 done_event.set()
+                try:
+                    loop.call_soon_threadsafe(completed.set)
+                except RuntimeError:
+                    # Loop already closed (interpreter shutdown) — the awaiting
+                    # coroutine is gone, so signalling completion is moot.
+                    pass
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
-        deadline = time.monotonic() + timeout
-        while not done_event.is_set():
-            if time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(0.5)
+        # Same deadline as the old poll loop (timeout seconds), but woken by the
+        # completion event instead of re-checking every 0.5s.
+        try:
+            await asyncio.wait_for(completed.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
 
         if not done_event.is_set():
             logger.warning(
@@ -1002,6 +1015,12 @@ class GraphAugmentedRecall:
             return found
 
         done_event = threading.Event()
+        # Event-driven completion (#97): bridge the daemon's threading.Event to
+        # the running loop via call_soon_threadsafe and await it, instead of
+        # polling every 0.5s. Traversal finishes in ms against local CE, so the
+        # old poll cadence — not graph work — set the recall latency floor.
+        loop = asyncio.get_running_loop()
+        completed = asyncio.Event()
 
         def _worker() -> None:
             try:
@@ -1010,16 +1029,23 @@ class GraphAugmentedRecall:
                 logger.debug("Graph traversal thread error: %s", e)
             finally:
                 done_event.set()
+                try:
+                    loop.call_soon_threadsafe(completed.set)
+                except RuntimeError:
+                    # Loop already closed (interpreter shutdown) — nothing waits.
+                    pass
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
-        # Poll from the event loop — doesn't consume thread pool threads.
-        deadline = time.monotonic() + timeout
-        while not done_event.is_set():
-            if time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(0.5)
+        # Wake the instant the worker completes, or after `timeout` seconds.
+        # A raw daemon thread (not an executor future) means the loop is free to
+        # service this timer — the same reason the old asyncio.sleep poll worked
+        # on the Windows ProactorEventLoop.
+        try:
+            await asyncio.wait_for(completed.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
 
         if done_event.is_set() and traverse_result:
             if contested_map:

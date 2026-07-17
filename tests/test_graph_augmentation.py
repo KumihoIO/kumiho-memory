@@ -736,6 +736,63 @@ def test_dependent_without_stale_flag_gets_no_marker(monkeypatch):
     assert surfaced and "grounding_stale" not in surfaced[0]
 
 
+# ---------------------------------------------------------------------------
+# #97 — event-driven traversal completion (no 0.5s poll floor)
+# ---------------------------------------------------------------------------
+
+def _run_traverse_with_delay(monkeypatch, *, worker_delay, timeout):
+    """Drive ``_traverse_edges`` over a trivial one-seed graph whose
+    ``get_revision`` blocks for ``worker_delay`` s inside the daemon worker.
+
+    Returns ``(found, elapsed_seconds, augmented)``.
+    """
+    import time as _time
+
+    seed = "kref://p/notes/seed.conversation?r=1"
+    graph = {seed: _FakeRev(seed, {"title": "S", "summary": "s"}, [])}
+
+    def _delay(_kref):
+        _time.sleep(worker_delay)
+
+    _install_graph(monkeypatch, graph, on_get=_delay)
+    gr = GraphAugmentedRecall(
+        config=GraphAugmentationConfig(traversal_timeout=timeout),
+    )
+    augmented = []
+    start = _time.monotonic()
+    found = asyncio.run(gr._traverse_edges([seed], set(), augmented))
+    elapsed = _time.monotonic() - start
+    return found, elapsed, augmented
+
+
+def test_traversal_wait_wakes_promptly_when_worker_finishes_fast(monkeypatch):
+    # Worker finishes in ~50ms; the event-driven wait must return well under the
+    # old 0.5s poll cadence, which floored every recall at ~0.5s here regardless
+    # of how fast the traversal actually was.
+    found, elapsed, _ = _run_traverse_with_delay(
+        monkeypatch, worker_delay=0.05, timeout=30,
+    )
+    assert found == 0  # seed has no matching edges -> nothing surfaced
+    assert elapsed < 0.45, (
+        f"event-driven wait took {elapsed:.3f}s — should be far below the "
+        f"old 0.5s poll floor"
+    )
+
+
+def test_traversal_times_out_and_returns_empty(monkeypatch):
+    # Worker blocks longer than the timeout: current semantics preserved —
+    # return 0 (empty), leave `augmented` untouched, and give up at ~timeout
+    # rather than waiting out the full worker duration.
+    found, elapsed, augmented = _run_traverse_with_delay(
+        monkeypatch, worker_delay=0.4, timeout=0.1,
+    )
+    assert found == 0
+    assert augmented == []
+    assert elapsed < 0.35, (
+        f"timeout wait took {elapsed:.3f}s — should be ~= the 0.1s timeout"
+    )
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
