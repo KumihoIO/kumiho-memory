@@ -19,9 +19,11 @@ class _FakeRev:
     def __init__(self, uri):
         self.kref = type("K", (), {"uri": uri})()
         self.edges = []  # (edge_type, target_uri)
+        self.edge_meta = []  # (edge_type, target_uri, metadata) — for metadata asserts
 
     def create_edge(self, target, edge_type, metadata=None):
         self.edges.append((edge_type, target.kref.uri))
+        self.edge_meta.append((edge_type, target.kref.uri, dict(metadata or {})))
 
     def get_edges(self, edge_type_filter=None, direction=0):
         out = []
@@ -174,3 +176,59 @@ def test_fast_write_returns_real_counts(monkeypatch):
         {"entities": [{"name": "a"}]}, project_name="proj",
     ))
     assert res == {"entities": 2, "facts": 1, "relations": 1, "edges": 5}
+
+
+# --- Predicate registry: folding + RELATES_TO fallback (relations not dropped) ---
+
+_DECOMP_PREDICATES = {
+    "entities": [{"name": "Alpha"}, {"name": "Beta"}, {"name": "Gamma"}],
+    "facts": [],
+    "relations": [
+        {"subject": "Alpha", "predicate": "utilizes", "object": "Beta"},    # fold -> USES
+        {"subject": "Beta", "predicate": "frobnicates", "object": "Gamma"},  # unknown -> RELATES_TO
+        {"subject": "Gamma", "predicate": "관련", "object": "Alpha"},         # CJK -> RELATES_TO
+    ],
+}
+
+
+def _entity_meta(proj, slug):
+    return proj._items[("/proj/entities", slug)]._rev.edge_meta
+
+
+def test_predicate_folding_and_fallback_are_lossless(monkeypatch):
+    conv = _FakeRev("kref:/proj/conversations/c.conversation?r=1")
+    proj = _patch(monkeypatch, conv)
+    stats = _sync_decompose_agent(
+        "kref:/proj/conversations/c.conversation?r=1", _DECOMP_PREDICATES, "proj", OntologySchema())
+
+    # No relation is dropped for an unrecognized/CJK predicate.
+    assert stats["relations"] == 3
+
+    # Synonym folds onto the canonical edge type; normalized token preserved.
+    (et, _turi, md), = _entity_meta(proj, "alpha")
+    assert et == "USES"
+    assert md["predicate"] == "utilizes"
+    assert md["predicate_token"] == "UTILIZES"
+
+    # Unknown predicate -> RELATES_TO, verbatim + normalized token both kept.
+    (et, _turi, md), = _entity_meta(proj, "beta")
+    assert et == "RELATES_TO"
+    assert md["predicate"] == "frobnicates"
+    assert md["predicate_token"] == "FROBNICATES"
+
+    # CJK predicate normalizes to nothing -> RELATES_TO, verbatim kept, no token.
+    (et, _turi, md), = _entity_meta(proj, "gamma")
+    assert et == "RELATES_TO"
+    assert md["predicate"] == "관련"
+    assert "predicate_token" not in md
+
+
+def test_relates_to_relations_are_idempotent(monkeypatch):
+    conv = _FakeRev("kref:/proj/conversations/c.conversation?r=1")
+    _patch(monkeypatch, conv)
+    kref = "kref:/proj/conversations/c.conversation?r=1"
+    _sync_decompose_agent(kref, _DECOMP_PREDICATES, "proj", OntologySchema())
+    second = _sync_decompose_agent(kref, _DECOMP_PREDICATES, "proj", OntologySchema())
+    # folded + fallback edges dedupe on re-decompose exactly like canonical ones.
+    assert second["relations"] == 0
+    assert second["edges"] == 0

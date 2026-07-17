@@ -464,9 +464,9 @@ def _sync_decompose_agent(
 
     Content is accepted as-authored (the agent read the source — same trust
     model as reflect/code_capture); only structure is validated: empty fields
-    dropped, relation endpoints must resolve to an entity, predicates must
-    normalize.  Entities dedupe cross-session by slug via ``_Materializer.node``
-    (get-or-create).
+    dropped, relation endpoints must resolve to an entity, predicates fold onto
+    a canonical edge type (unregistered → RELATES_TO, never dropped).  Entities
+    dedupe cross-session by slug via ``_Materializer.node`` (get-or-create).
     """
     import kumiho
 
@@ -549,19 +549,27 @@ def _sync_decompose_agent(
         if m.edge(conv_rev, anchor, schema.about_edge, {"entity": slug}):
             stats["edges"] += 1
 
-    # relations: entity -> entity typed edges; drop if an endpoint doesn't
-    # resolve or the predicate can't normalize (referential integrity, the
-    # analog of code_capture dropping hallucinated anchors).
+    # relations: entity -> entity typed edges; drop only if an endpoint doesn't
+    # resolve (referential integrity, the analog of code_capture dropping
+    # hallucinated anchors). The predicate never drops a relation — it folds
+    # onto a canonical edge type, or RELATES_TO when unregistered.
+    from .predicate_registry import resolve_predicate
+
     for rel in (decomposition.get("relations") or [])[: schema.max_per_kind]:
         if not isinstance(rel, dict):
             continue
         subj = _resolve(str(rel.get("subject", "")))
         obj = _resolve(str(rel.get("object", "")))
-        etype = _predicate_edge_type(str(rel.get("predicate", "")))
-        if not (subj and obj and etype) or subj == obj:
+        if not (subj and obj) or subj == obj:
             continue
-        if m.edge(entity_anchors[subj], entity_anchors[obj], etype,
-                  {"predicate": str(rel.get("predicate", "")).strip()}):
+        verbatim = str(rel.get("predicate", "")).strip()
+        etype, folding = resolve_predicate(verbatim)
+        md = {"predicate": verbatim}
+        # Folded/fallback edges keep the normalized original token so the
+        # canonical edge stays lossless about what the agent actually said.
+        if folding.normalized and (folding.folded or folding.fallback):
+            md["predicate_token"] = folding.normalized
+        if m.edge(entity_anchors[subj], entity_anchors[obj], etype, md):
             stats["relations"] += 1
             stats["edges"] += 1
 
