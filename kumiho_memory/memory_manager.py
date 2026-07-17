@@ -2082,6 +2082,8 @@ class UniversalMemoryManager:
         entities: Optional[List[Dict[str, Any]]] = None,
         facts: Optional[List[Dict[str, Any]]] = None,
         relations: Optional[List[Dict[str, Any]]] = None,
+        supersedes: Optional[List[Dict[str, Any]]] = None,
+        contradicts: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Keyless agent-driven ontology decomposition of a stored memory.
 
@@ -2101,7 +2103,8 @@ class UniversalMemoryManager:
 
         stats = await decompose_and_link_agent(
             kref,
-            {"entities": entities or [], "facts": facts or [], "relations": relations or []},
+            {"entities": entities or [], "facts": facts or [], "relations": relations or [],
+             "supersedes": supersedes or [], "contradicts": contradicts or []},
             project_name=self.project,
         )
         return {"decomposed": stats, "kref": kref}

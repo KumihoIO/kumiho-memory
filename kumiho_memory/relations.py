@@ -149,7 +149,10 @@ def link_supersedes(
             best_rev = cand_rev
 
     if best_rev is not None and best_overlap >= _SUPERSEDE_JACCARD:
-        if m.edge(anchor, best_rev, edge_type, {"reason": "belief update"}):
+        # basis labels the heuristic provenance (vs agent-declared belief edges,
+        # which record basis: agent); trigger logic + threshold unchanged.
+        if m.edge(anchor, best_rev, edge_type,
+                  {"reason": "belief update", "basis": "lexical-overlap"}):
             logger.debug("SUPERSEDES: %s replaces %s (overlap=%.2f)",
                          self_slug, getattr(best_item, "kref", "?"), best_overlap)
             return 1

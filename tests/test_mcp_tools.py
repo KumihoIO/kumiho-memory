@@ -790,6 +790,16 @@ def test_reflect_schema_exposes_idempotency_prefix():
     assert "idempotency_prefix" in reflect["inputSchema"]["properties"]
 
 
+def test_decompose_schema_exposes_belief_change_fields():
+    """Agents learn the two optional belief-change lists from the schema."""
+    from kumiho_memory.mcp_tools import MEMORY_TOOLS
+    decompose = next(t for t in MEMORY_TOOLS if t["name"] == "kumiho_memory_decompose")
+    props = decompose["inputSchema"]["properties"]
+    assert "supersedes" in props and "contradicts" in props
+    assert props["supersedes"]["items"]["required"] == ["statement", "replaces"]
+    assert props["contradicts"]["items"]["required"] == ["statement", "conflicts_with"]
+
+
 # ---------------------------------------------------------------------------
 # Tests — tool execution
 # ---------------------------------------------------------------------------
