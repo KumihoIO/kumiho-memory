@@ -544,6 +544,113 @@ def test_relation_traversal_env_default_off_and_opt_in(monkeypatch):
     assert m.graph_augmentation_config.relation_traversal is False
 
 
+# ---------------------------------------------------------------------------
+# CONTRADICTS: first-class edge (whitelist) + contested_by recall marker
+# ---------------------------------------------------------------------------
+
+# Krefs for the contested-marker walk. The seed is a conversation; the opposing
+# nodes are facts (kind is irrelevant to the walk, but mirrors real usage).
+CS = "kref://p/notes/cs.conversation?r=1"
+CT = "kref://p/facts/ct.fact?r=1"
+
+
+def _traverse(monkeypatch, graph, seeds, base, seen=None, **cfg_kw):
+    """Drive _traverse_edges against the fake graph seam."""
+    _install_graph(monkeypatch, graph)
+    gr = GraphAugmentedRecall(config=GraphAugmentationConfig(**cfg_kw))
+    augmented = list(base)  # shallow copy: entry dicts are shared with `base`
+    seen = set(seen if seen is not None else {m["kref"] for m in base})
+    found = asyncio.run(gr._traverse_edges(seeds, seen, augmented))
+    return found, augmented
+
+
+def test_default_edge_types_include_contradicts():
+    # Whitelist: CONTRADICTS is traversable/visible like SUPERSEDES.
+    assert "CONTRADICTS" in GraphAugmentationConfig().edge_types
+
+
+def test_contradicts_edge_surfaces_opposing_and_marks_both(monkeypatch):
+    # Outgoing CONTRADICTS (seed -> target): the opposing revision is surfaced
+    # by the walk (like SUPERSEDES) AND both endpoints gain `contested_by`.
+    graph = {
+        CS: _FakeRev(CS, {"title": "S", "summary": "X is true"},
+                     [_FakeEdge(CS, CT, "CONTRADICTS")]),
+        CT: _FakeRev(CT, {"title": "T", "summary": "X is false"}, []),
+    }
+    base = [{"kref": CS, "title": "S", "summary": "X is true", "score": 0.5}]
+    _found, augmented = _traverse(monkeypatch, graph, [CS], base)
+
+    surfaced = [m for m in augmented if m["kref"] == CT]
+    assert len(surfaced) == 1
+    assert surfaced[0]["edge_type"] == "CONTRADICTS"
+    assert surfaced[0]["contested_by"] == [CS]
+    # The seed result entry is marked as contested by the opposing revision.
+    assert base[0]["contested_by"] == [CT]
+
+
+def test_contradicts_edge_incoming_direction_also_marks(monkeypatch):
+    # Incoming CONTRADICTS (target -> seed): both directions must mark.
+    graph = {
+        CS: _FakeRev(CS, {"title": "S", "summary": "X is true"},
+                     [_FakeEdge(CT, CS, "CONTRADICTS")]),
+        CT: _FakeRev(CT, {"title": "T", "summary": "X is false"}, []),
+    }
+    base = [{"kref": CS, "title": "S", "summary": "X is true", "score": 0.5}]
+    _found, augmented = _traverse(monkeypatch, graph, [CS], base)
+
+    assert base[0]["contested_by"] == [CT]
+    surfaced = [m for m in augmented if m["kref"] == CT]
+    assert surfaced and surfaced[0]["contested_by"] == [CS]
+
+
+def test_contested_by_is_bounded(monkeypatch):
+    # A heavily-contested seed surfaces at most the first 3 disputing krefs.
+    targets = [f"kref://p/facts/t{i}.fact?r=1" for i in range(5)]
+    graph = {
+        CS: _FakeRev(CS, {"title": "S", "summary": "X"},
+                     [_FakeEdge(CS, t, "CONTRADICTS") for t in targets]),
+    }
+    for t in targets:
+        graph[t] = _FakeRev(t, {"title": t, "summary": "not X"}, [])
+    base = [{"kref": CS, "title": "S", "summary": "X", "score": 0.5}]
+    _traverse(monkeypatch, graph, [CS], base)
+
+    assert base[0]["contested_by"] == targets[:3]
+
+
+def test_no_contested_marker_without_contradicts(monkeypatch):
+    # A non-CONTRADICTS edge (SUPPORTS) surfaces the node but adds no marker.
+    graph = {
+        CS: _FakeRev(CS, {"title": "S", "summary": "X"},
+                     [_FakeEdge(CS, CT, "SUPPORTS")]),
+        CT: _FakeRev(CT, {"title": "T", "summary": "also X"}, []),
+    }
+    base = [{"kref": CS, "title": "S", "summary": "X", "score": 0.5}]
+    _found, augmented = _traverse(monkeypatch, graph, [CS], base)
+
+    assert "contested_by" not in base[0]
+    surfaced = [m for m in augmented if m["kref"] == CT]
+    assert surfaced and "contested_by" not in surfaced[0]
+
+
+def test_contested_marker_matches_sibling_revision_kref(monkeypatch):
+    # The CONTRADICTS edge hangs off a sibling revision; the item-level result
+    # entry is still marked (the marker matches own kref OR any sibling kref).
+    sib = "kref://p/notes/cs.conversation?r=2"
+    graph = {
+        sib: _FakeRev(sib, {"title": "S", "summary": "X"},
+                      [_FakeEdge(sib, CT, "CONTRADICTS")]),
+        CT: _FakeRev(CT, {"title": "T", "summary": "not X"}, []),
+    }
+    base = [{
+        "kref": CS, "title": "S", "summary": "X", "score": 0.5,
+        "sibling_revisions": [{"kref": sib, "title": "S", "summary": "X"}],
+    }]
+    _traverse(monkeypatch, graph, [sib], base, seen={CS, sib})
+
+    assert base[0]["contested_by"] == [CT]
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

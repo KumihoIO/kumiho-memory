@@ -150,6 +150,12 @@ def compose_context(
                 "bridge": bool(mem.get("bridge")),
                 # Fact-recall leg entries get the same additive treatment.
                 "fact_recall": bool(mem.get("fact_recall")),
+                # CONTRADICTS marker (graph_augmentation): a one-line "disputed"
+                # note is appended to this memory's block so the answering model
+                # sees the fact is contested instead of one side unmarked.
+                # Carried only on the non-sibling branch, mirroring bridge /
+                # fact_recall (those additive markers ride here too).
+                "contested_by": mem.get("contested_by") or [],
             })
 
     # --- Global ranking by score (best revisions first) ---
@@ -196,8 +202,20 @@ def compose_context(
         content = rev.get("content", "")
 
         if full_mode and content:
-            texts.append(content[:char_limit])
+            entry_text = content[:char_limit]
         elif summary:
-            texts.append(f"{title}: {summary}" if title else summary)
+            entry_text = f"{title}: {summary}" if title else summary
+        else:
+            continue
+        # Contested memories carry a terse "disputed" note on the same block,
+        # so the marker travels with the fact it qualifies.
+        contested = rev.get("contested_by")
+        if contested:
+            n = len(contested)
+            entry_text += (
+                f"\n[contested: disputed by {n} other stored "
+                f"memor{'y' if n == 1 else 'ies'}]"
+            )
+        texts.append(entry_text)
 
     return "\n\n".join(texts) if texts else ""

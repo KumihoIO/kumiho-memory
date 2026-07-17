@@ -54,6 +54,12 @@ class GraphAugmentationConfig:
     edge_types: List[str] = field(default_factory=lambda: [
         "DERIVED_FROM", "DEPENDS_ON", "REFERENCED",
         "CONTAINS", "CREATED_FROM", "SUPERSEDES", "SUPPORTS",
+        # CONTRADICTS is a belief-change edge like SUPERSEDES: the walk surfaces
+        # the opposing revision the same way, and additionally derives the
+        # additive ``contested_by`` recall marker from these edges (reusing the
+        # seed edges the walk already fetches — no extra round-trip). See
+        # ``_traverse_edges``.
+        "CONTRADICTS",
     ])
     # NOTE: "ABOUT" (memory -> entity anchor, from entity_promotion.py) is
     # deliberately NOT in the generic single-hop `edge_types`. Entity anchors
@@ -894,6 +900,18 @@ class GraphAugmentedRecall:
         # Mutable containers shared with the daemon thread.
         graph_augmented_results: List[Dict[str, Any]] = []
         traverse_result: List[int] = []
+        # kref -> revisions it CONTRADICTS (either direction), for the additive
+        # ``contested_by`` recall marker. Built from the seed edges the walk
+        # already fetches below, so surfacing contestation costs no extra
+        # round-trip.
+        contested_map: Dict[str, List[str]] = {}
+
+        def _mark_contested(a: str, b: str) -> None:
+            # Symmetric: a CONTRADICTS edge disputes both endpoints.
+            for src, dst in ((a, b), (b, a)):
+                bucket = contested_map.setdefault(src, [])
+                if dst not in bucket:
+                    bucket.append(dst)
 
         def _sync_graph_traverse() -> int:
             """Run all synchronous gRPC calls in a plain thread."""
@@ -912,7 +930,14 @@ class GraphAugmentedRecall:
                             if edge.source_kref.uri == kref_str
                             else edge.source_kref.uri
                         )
-                        if not connected_uri or connected_uri in seen_krefs:
+                        if not connected_uri:
+                            continue
+                        # Record contestation BEFORE the seen-check so both a
+                        # freshly-surfaced opposing revision and one already in
+                        # the base results get marked.
+                        if edge.edge_type == "CONTRADICTS":
+                            _mark_contested(kref_str, connected_uri)
+                        if connected_uri in seen_krefs:
                             continue
                         seen_krefs.add(connected_uri)
                         try:
@@ -968,6 +993,10 @@ class GraphAugmentedRecall:
             await asyncio.sleep(0.5)
 
         if done_event.is_set() and traverse_result:
+            if contested_map:
+                _attach_contested_markers(
+                    augmented, graph_augmented_results, contested_map,
+                )
             augmented.extend(graph_augmented_results)
             return traverse_result[0]
 
@@ -1615,6 +1644,35 @@ class GraphAugmentedRecall:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _attach_contested_markers(
+    base: List[Dict[str, Any]],
+    graph_results: List[Dict[str, Any]],
+    contested_map: Dict[str, List[str]],
+    limit: int = 3,
+) -> None:
+    """Stamp a bounded ``contested_by`` field on entries with CONTRADICTS edges.
+
+    Purely additive — no entry removed, no score changed, no reordering. A
+    graph-walk entry matches on its own kref; a base memory matches on its own
+    kref OR any sibling revision kref (a CONTRADICTS edge hangs off a specific
+    revision, which may be a sibling rather than the item shell). ``limit``
+    bounds the surfaced disputing krefs so a heavily-contested memory can't
+    balloon the entry.
+    """
+    for entry in graph_results:
+        marks = contested_map.get(entry.get("kref", ""))
+        if marks:
+            entry["contested_by"] = marks[:limit]
+    for mem in base:
+        marks = list(contested_map.get(mem.get("kref", ""), []))
+        for sib in mem.get("sibling_revisions") or []:
+            for k in contested_map.get(sib.get("kref", ""), []):
+                if k not in marks:
+                    marks.append(k)
+        if marks:
+            mem["contested_by"] = marks[:limit]
 
 
 def _traversal_seed_krefs(

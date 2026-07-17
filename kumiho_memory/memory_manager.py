@@ -585,6 +585,15 @@ class UniversalMemoryManager:
                 await self._create_support_edges(
                     new_kref, assess_result.supporting_krefs,
                 )
+
+            # CONTRADICTS edges bridge the assessor's conflict verdicts into
+            # the graph (the ``conflicts_with`` metadata above is untouched —
+            # this is purely additive), so recall can surface "this fact is
+            # contested" instead of returning one side unmarked.
+            if new_kref and assess_result.conflicting_krefs:
+                await self._create_contradicts_edges(
+                    new_kref, assess_result.conflicting_krefs,
+                )
         except Exception as exc:  # pragma: no cover
             logger.debug("_background_assess error for session %s: %s", session_id, exc)
 
@@ -637,6 +646,81 @@ class UniversalMemoryManager:
         if created:
             logger.debug(
                 "Created %d SUPPORTS edge(s) from %s", created, revision_kref,
+            )
+        return created
+
+    async def _create_contradicts_edges(
+        self,
+        revision_kref: str,
+        conflicting_krefs: List[str],
+        timeout: float = 60.0,
+    ) -> int:
+        """Bridge assessor conflicts into ``CONTRADICTS`` graph edges.
+
+        The conflict-side twin of :meth:`_create_support_edges`: one directed
+        ``CONTRADICTS`` edge (new revision -> each conflicting revision) with
+        ``basis: evidence-assessor``, turning the assessor's ``conflicts_with``
+        metadata into graph structure the recall reader can traverse and
+        surface as a contested marker.
+
+        Best-effort (each failure logged at debug level and skipped — conflict
+        edges are enrichment, never a store blocker) and idempotent: a target
+        already linked by ``CONTRADICTS`` is skipped, mirroring
+        ``ontology._Materializer.edge``'s precheck so a re-assess of the same
+        window can't duplicate.  Runs the synchronous gRPC calls in a bounded
+        daemon thread.  Returns the number of edges created.
+        """
+        from kumiho_memory._bounded import run_bounded_in_thread
+
+        def _sync_create() -> int:
+            import kumiho
+
+            source_rev = kumiho.get_revision(revision_kref)
+            created = 0
+            for target_kref in conflicting_krefs:
+                try:
+                    # Idempotency precheck (server-side dedupe is NOT assumed):
+                    # skip a target already linked by CONTRADICTS. Best-effort —
+                    # if the edge read is unsupported/transient, fall through
+                    # and create rather than silently dropping the edge.
+                    already = False
+                    try:
+                        for existing in source_rev.get_edges(
+                            edge_type_filter="CONTRADICTS", direction=0,
+                        ):
+                            if getattr(
+                                getattr(existing, "target_kref", None), "uri", "",
+                            ) == target_kref:
+                                already = True
+                                break
+                    except Exception:  # noqa: BLE001 — no dedup available; create
+                        pass
+                    if already:
+                        continue
+                    target_rev = kumiho.get_revision(target_kref)
+                    source_rev.create_edge(
+                        target_rev,
+                        "CONTRADICTS",
+                        metadata={"basis": "evidence-assessor"},
+                    )
+                    created += 1
+                except Exception as exc:
+                    logger.debug(
+                        "CONTRADICTS edge %s -> %s failed: %s",
+                        revision_kref, target_kref, exc,
+                    )
+            return created
+
+        created = await run_bounded_in_thread(
+            _sync_create,
+            timeout=timeout,
+            label=f"CONTRADICTS edges ({revision_kref})",
+            on_timeout=0,
+            on_error=0,
+        ) or 0
+        if created:
+            logger.debug(
+                "Created %d CONTRADICTS edge(s) from %s", created, revision_kref,
             )
         return created
 

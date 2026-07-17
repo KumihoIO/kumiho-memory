@@ -348,6 +348,132 @@ def test_background_assess_queued_store_skips_edges(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# CONTRADICTS bridge — assessor conflicts become graph edges (issue #94)
+# ---------------------------------------------------------------------------
+
+
+def test_background_assess_bridges_conflicts_to_edges(monkeypatch):
+    """conflicting_krefs -> a CONTRADICTS edge AND the metadata stays (additive)."""
+    from kumiho_memory.memory_manager import MemoryAssessResult
+
+    stored, revisions = _run_background_assess(
+        MemoryAssessResult(
+            should_store=True, content="Conflicting claim", memory_type="fact",
+            evidence_level="unverified", conflicting_krefs=["kref://m/1"],
+        ),
+        {"item_kref": "kref://m/new", "revision_kref": "kref://m/new/rev/1"},
+        monkeypatch,
+    )
+    # Existing conflicts_with metadata persistence is untouched (additive).
+    assert stored["metadata"]["conflicts_with"] == "kref://m/1"
+    # AND a CONTRADICTS edge is bridged from the new revision.
+    new_rev = revisions["kref://m/new/rev/1"]
+    assert ("kref://m/1", "CONTRADICTS") in new_rev.edges
+
+
+class _ContradictKref:
+    def __init__(self, uri):
+        self.uri = uri
+
+
+class _ContradictEdge:
+    def __init__(self, target_uri, edge_type):
+        self.target_kref = _ContradictKref(target_uri)
+        self.edge_type = edge_type
+
+
+class _ContradictRev:
+    """Fake revision recording created edges (with metadata) and prechecks."""
+
+    def __init__(self, kref, existing_edges=None):
+        self.kref = kref
+        self._existing = existing_edges or []
+        self.created = []  # (target_uri, edge_type, metadata)
+
+    def get_edges(self, edge_type_filter=None, direction=None):
+        return [
+            e for e in self._existing
+            if edge_type_filter is None or e.edge_type == edge_type_filter
+        ]
+
+    def create_edge(self, target, edge_type, metadata=None):
+        self.created.append((str(target.kref), edge_type, metadata))
+
+
+def _install_contradict_kumiho(monkeypatch, graph, bad=frozenset()):
+    fake = types.ModuleType("kumiho")
+
+    def get_revision(kref):
+        if kref in bad:
+            raise RuntimeError("resolve failed")
+        return graph[kref]
+
+    fake.get_revision = get_revision
+    monkeypatch.setitem(sys.modules, "kumiho", fake)
+
+
+def _bare_manager():
+    # _create_contradicts_edges touches no manager state, so a default-
+    # constructed manager is enough to exercise it in isolation.
+    return UniversalMemoryManager()
+
+
+def test_create_contradicts_edges_writes_basis_metadata(monkeypatch):
+    src = _ContradictRev("kref://m/new/rev/1")
+    _install_contradict_kumiho(monkeypatch, {
+        "kref://m/new/rev/1": src,
+        "kref://m/1": _ContradictRev("kref://m/1"),
+    })
+    n = asyncio.run(
+        _bare_manager()._create_contradicts_edges(
+            "kref://m/new/rev/1", ["kref://m/1"],
+        )
+    )
+    assert n == 1
+    assert src.created == [
+        ("kref://m/1", "CONTRADICTS", {"basis": "evidence-assessor"}),
+    ]
+
+
+def test_create_contradicts_edges_idempotent(monkeypatch):
+    # A pre-existing CONTRADICTS edge to the same target -> no duplicate.
+    src = _ContradictRev(
+        "kref://m/new/rev/1",
+        existing_edges=[_ContradictEdge("kref://m/1", "CONTRADICTS")],
+    )
+    _install_contradict_kumiho(monkeypatch, {
+        "kref://m/new/rev/1": src,
+        "kref://m/1": _ContradictRev("kref://m/1"),
+    })
+    n = asyncio.run(
+        _bare_manager()._create_contradicts_edges(
+            "kref://m/new/rev/1", ["kref://m/1"],
+        )
+    )
+    assert n == 0
+    assert src.created == []
+
+
+def test_create_contradicts_edges_swallows_failure(monkeypatch):
+    # One target fails to resolve; the loop swallows it and continues.
+    src = _ContradictRev("kref://m/new/rev/1")
+    _install_contradict_kumiho(
+        monkeypatch,
+        {"kref://m/new/rev/1": src, "kref://m/2": _ContradictRev("kref://m/2")},
+        bad={"kref://m/1"},
+    )
+    n = asyncio.run(
+        _bare_manager()._create_contradicts_edges(
+            "kref://m/new/rev/1", ["kref://m/1", "kref://m/2"],
+        )
+    )
+    assert n == 1  # m/1 swallowed, m/2 still bridged
+    assert src.created == [
+        ("kref://m/2", "CONTRADICTS", {"basis": "evidence-assessor"}),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Review-hardening tests (adversarial review round 1)
 # ---------------------------------------------------------------------------
 

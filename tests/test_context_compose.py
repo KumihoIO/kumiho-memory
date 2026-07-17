@@ -235,3 +235,37 @@ def test_fact_budget_kwarg_mirrors_config():
     blocks = out.split("\n\n")
     assert len(blocks) == 8                           # 5 base + all 3 facts
     assert blocks[5:] == [f"fact{i}: claim{i}" for i in range(3)]
+
+
+# ---------------------------------------------------------------------------
+# Contested marker (CONTRADICTS edges, threaded from graph_augmentation)
+# ---------------------------------------------------------------------------
+
+def test_contested_memory_gets_disputed_note():
+    contested = _mem("c", "X is true", score=0.5)
+    contested["contested_by"] = ["kref://other"]
+    out = compose_context([contested])
+    assert out == "c: X is true\n[contested: disputed by 1 other stored memory]"
+
+
+def test_contested_note_pluralizes_and_is_bounded_by_marker():
+    contested = _mem("c", "X is true", score=0.5)
+    contested["contested_by"] = ["kref://a", "kref://b"]
+    out = compose_context([contested])
+    assert "[contested: disputed by 2 other stored memories]" in out
+
+
+def test_no_contested_note_without_marker():
+    # Regression: an ordinary memory renders exactly as before — the note is
+    # strictly additive.
+    out = compose_context([_mem("c", "X is true", score=0.5)])
+    assert out == "c: X is true"
+    assert "contested" not in out
+
+
+def test_contested_note_in_full_mode():
+    contested = _mem("c", "sum", score=0.5, content="the raw content")
+    contested["contested_by"] = ["kref://other"]
+    out = compose_context([contested], mode="full")
+    assert out.startswith("the raw content")
+    assert "[contested: disputed by 1 other stored memory]" in out
