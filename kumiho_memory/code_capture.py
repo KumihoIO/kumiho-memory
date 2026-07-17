@@ -40,6 +40,7 @@ import re
 
 from kumiho_memory._bounded import run_bounded_in_thread
 from kumiho_memory.evidence import CORROBORATED, SINGLE_SOURCE, UNVERIFIED
+from kumiho_memory.privacy import PIIRedactor
 from kumiho_memory.code_decisions import (
     CodeMemoryConfig,
     EDGE_DERIVED_FROM,
@@ -107,6 +108,7 @@ class IngestStats:
     edges: int = 0
     superseded: int = 0
     deprecated: int = 0
+    credentials_dropped: int = 0
     failed_commits: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
@@ -451,21 +453,90 @@ async def _structure_batch(
 
 
 # ---------------------------------------------------------------------------
-# [5] validation — hallucination defenses
+# [5] validation — hallucination defenses + privacy boundary
 # ---------------------------------------------------------------------------
+
+def _drop_if_credential(redactor: Any, text: str, stats: IngestStats) -> bool:
+    """Per-atom credential screen — the commit-path twin of
+    :func:`code_session._drop_if_credential`.  ``reject_credentials`` RAISES;
+    applied per atom the atom drops (counted) and the rest of the capture
+    survives, where a whole-commit reject would make one hardcoded key
+    permanently unmineable (every retry hits the same raise)."""
+    if redactor is None:
+        return False
+    try:
+        redactor.reject_credentials(str(text or ""))
+        return False
+    except Exception:  # noqa: BLE001 — CredentialDetectedError et al.
+        stats.credentials_dropped += 1
+        return True
+
 
 def validate_decisions(
     commit: CommitInfo,
     decisions: List[Dict[str, Any]],
     config: CodeMemoryConfig,
+    *,
+    redactor: Any = None,
+    stats: Optional[IngestStats] = None,
 ) -> List[Dict[str, Any]]:
+    stats = stats or IngestStats()  # direct calls may omit it — never crash
     changed = {normalize_path(f) for f in commit.files}
     out: List[Dict[str, Any]] = []
     for d in decisions[: config.max_decisions_per_commit]:
-        evidence = [
-            e for e in (d.get("evidence") or [])[: config.max_evidence_per_decision]
-            if str(e.get("text", "")).strip()
-        ]
+        d = dict(d)
+        if not str(d.get("title", "")).strip():
+            continue
+        # Privacy boundary — parity with
+        # :func:`code_session.validate_session_decisions` (issue #99): the
+        # commit path must cross into the cloud graph through the SAME door as
+        # the session path.  Same primitives (``reject_credentials`` /
+        # ``anonymize_summary``), same per-atom semantics — a credential in the
+        # decision's OWN prose drops the whole decision; PII in the stored
+        # prose fields is redacted in place.  ``redactor is None`` (direct unit
+        # calls) leaves text untouched, exactly as the session path does.
+        if redactor is not None:
+            core_text = " ".join(
+                str(d.get(k, "")) for k in
+                ("title", "decision", "rationale", "why_question")
+            )
+            if _drop_if_credential(redactor, core_text, stats):
+                continue
+            for k in ("title", "decision", "rationale", "why_question"):
+                if d.get(k):
+                    d[k] = redactor.anonymize_summary(str(d[k]))
+            # symbols are code identifiers, not prose: the credential gate
+            # applies per entry (a pasted key stored as a "symbol" would reach
+            # metadata AND the embedding text), but PII redaction does not —
+            # rewriting identifiers would corrupt the correlation coordinates
+            # for no privacy gain (an identifier is not PII).
+            d["symbols"] = [
+                s for s in (d.get("symbols") or [])
+                if not _drop_if_credential(redactor, str(s), stats)
+            ]
+        evidence = []
+        for e in (d.get("evidence") or [])[: config.max_evidence_per_decision]:
+            text = str(e.get("text", "")).strip()
+            if not text:
+                continue
+            # credential-bearing evidence DROPS (counted); PII is redacted in
+            # place.  An all-evidence-dropped decision still survives (its
+            # anchors carry it), matching the session path's all-dropped rule.
+            if redactor is not None:
+                if _drop_if_credential(redactor, text, stats):
+                    continue
+                e = dict(e)
+                e["text"] = redactor.anonymize_summary(text)
+                # source_ref is model/agent free text stored verbatim (the
+                # session path GENERATES its source_ref deterministically and
+                # never stores model text there).  A credential in it swaps to
+                # the deterministic default (counted) rather than dropping the
+                # atom — the reference is bookkeeping, the statement is the
+                # cargo.
+                if _drop_if_credential(redactor, str(e.get("source_ref", "")),
+                                       stats):
+                    e.pop("source_ref", None)
+            evidence.append(e)
         if (
             config.drop_low_confidence_without_evidence
             and d.get("confidence") == "low"
@@ -498,11 +569,8 @@ def validate_decisions(
                 continue
             anchors.append({"file": f, "line_start": 0, "line_end": 0,
                             "role": "touched"})
-        d = dict(d)
         d["evidence"] = evidence
         d["anchors"] = anchors[: config.max_anchors_per_decision]
-        if not str(d.get("title", "")).strip():
-            continue
         out.append(d)
     return out
 
@@ -696,6 +764,7 @@ def _sync_write_commit(
     capture_version: str,
     stats: IngestStats,
     force: bool = False,
+    redactor: Any = None,
 ) -> None:
     """Stages [6]-[8] for one commit.  Crash-safe: the marker revision is
     the very last write, so any partial failure leaves the commit unmarked
@@ -708,6 +777,21 @@ def _sync_write_commit(
     for space in (config.decisions_space, config.anchors_space,
                   config.commits_space, config.evidence_space):
         ensure_space(project, space)
+
+    # Privacy boundary (issue #99): the commit subject is stored verbatim on
+    # the marker AND injected into every decision's embedding text, so it
+    # leaves for the cloud graph independently of the mined decisions.  Screen
+    # it once here — PII redacted in place; a credential-bearing subject is
+    # replaced by a literal placeholder (counted).  NOT "" — write_revision
+    # treats an empty embedding_text as "embed ALL metadata" (the server
+    # fallback), which would pollute the marker vector with hashes/author/
+    # bookkeeping keys.
+    subject = commit.subject
+    if redactor is not None:
+        if _drop_if_credential(redactor, subject, stats):
+            subject = "[redacted]"
+        else:
+            subject = redactor.anonymize_summary(subject)
 
     decision_payloads: List[Tuple[Any, Dict[str, str], List[Any], str]] = []
     for d in decisions:
@@ -778,7 +862,7 @@ def _sync_write_commit(
             # force always writes a NEW revision — a re-capture exists to
             # replace stale extraction content, not to converge silently.
             decision_rev = write_revision(
-                item, meta, _compose_embedding_text(meta, commit.subject),
+                item, meta, _compose_embedding_text(meta, subject),
             )
             stats.decisions += 1
 
@@ -813,13 +897,13 @@ def _sync_write_commit(
         marker_rev = write_revision(marker_item, {
             "repo": repo,
             "hash": commit.hash,
-            "subject": commit.subject,
+            "subject": subject,
             "author": commit.author,
             "committed_at": commit.author_date,
             "decisions_count": str(len(decision_payloads)),
             "capture_version": capture_version,
             "schema_version": SCHEMA_VERSION,
-        }, embedding_text=commit.subject)
+        }, embedding_text=subject)
     for decision_rev, _meta, evidence_revs, _sha in decision_payloads:
         _create_edge_once(decision_rev, marker_rev, EDGE_DERIVED_FROM, {}, stats)
         for ev_rev in evidence_revs:
@@ -840,6 +924,7 @@ async def ingest_repo(
     model: str = "",
     force: bool = False,
     max_commits: Optional[int] = None,
+    redactor: Any = None,
 ) -> IngestStats:
     """Mine *rev_range* (or the recent history, incrementally) into the graph.
 
@@ -847,8 +932,15 @@ async def ingest_repo(
     the list of failed commits instead of swallowing errors.  Omitting
     *rev_range* enables incremental mode — already-marked commits are skipped
     (the graph itself is the cursor; no ledger file).
+
+    *redactor* is the privacy boundary (issue #99): every text that leaves for
+    the cloud graph passes the same PII/credential gate the session path uses.
+    ``None`` constructs a default :class:`PIIRedactor` so the screen is always
+    on — the manager passes ``self.pii_redactor``; a detached/direct call
+    still gets screened.
     """
     config = config or CodeMemoryConfig()
+    redactor = redactor or PIIRedactor()
     stats = IngestStats()
     if adapter is None or not model:
         stats.errors.append("no LLM adapter/model configured")
@@ -967,7 +1059,10 @@ async def ingest_repo(
                 stats.failed_commits.append(c.hash[:12])
                 stats.errors.append(f"LLM batch entry missing for {c.hash[:12]}")
                 continue
-            decisions = validate_decisions(c, list(entry.get("decisions", [])), config)
+            decisions = validate_decisions(
+                c, list(entry.get("decisions", [])), config,
+                redactor=redactor, stats=stats,
+            )
             out.append((c, decisions))
         return out
 
@@ -979,7 +1074,7 @@ async def ingest_repo(
             ok = await run_bounded_in_thread(
                 lambda c=c, d=decisions: _sync_write_commit(
                     project_name, config, repo, c, d, capture_version, stats,
-                    force=force,
+                    force=force, redactor=redactor,
                 ) or True,
                 timeout=config.write_timeout, label="code commit write",
                 on_timeout=None, on_error=None,
@@ -1008,6 +1103,7 @@ async def capture_decisions(
     commit_ref: str = "HEAD",
     project_name: str,
     config: Optional[CodeMemoryConfig] = None,
+    redactor: Any = None,
 ) -> IngestStats:
     """Write AGENT-STRUCTURED decisions into the graph — **no LLM, no key**.
 
@@ -1018,8 +1114,15 @@ async def capture_decisions(
     the tool just stores it).  The same deterministic validation still runs:
     anchors are UNIONED with the commit's real changed files, so a missing or
     loose anchor still lands on the right file, and hallucinated files drop.
+
+    The trust model for agent-supplied CONTENT is unchanged, but the privacy
+    boundary still applies (issue #99): evidence and prose pass the same
+    PII/credential gate as every other write path, so a credential cannot be
+    stored even by accident.  ``redactor=None`` constructs a default
+    :class:`PIIRedactor` (screen always on).
     """
     config = config or CodeMemoryConfig()
+    redactor = redactor or PIIRedactor()
     stats = IngestStats()
     if not decisions:
         stats.errors.append("no decisions provided")
@@ -1036,17 +1139,20 @@ async def capture_decisions(
         return stats
 
     stats.commits_seen = 1
-    validated = validate_decisions(commit, list(decisions), config)
+    validated = validate_decisions(
+        commit, list(decisions), config, redactor=redactor, stats=stats,
+    )
     if not validated:
         stats.errors.append(
-            "all decisions dropped by validation (missing title, or "
-            "low-confidence with no evidence)"
+            "all decisions dropped by validation (missing title, "
+            "low-confidence with no evidence, or credential in prose)"
         )
         return stats
 
     ok = await run_bounded_in_thread(
         lambda: _sync_write_commit(
             project_name, config, repo, commit, validated, SCHEMA_VERSION, stats,
+            redactor=redactor,
         ) or True,
         timeout=config.write_timeout, label="code capture write",
         on_timeout=None, on_error=None,

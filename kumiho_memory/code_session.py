@@ -647,6 +647,15 @@ def validate_session_decisions(
                              ("title", "decision", "rationale", "why_question"))
         if _drop_if_credential(redactor, core_text, stats):
             continue
+        # symbols are code identifiers, not prose: the credential gate applies
+        # per entry (a pasted key stored as a "symbol" would reach metadata AND
+        # the embedding text), but PII redaction does not — rewriting
+        # identifiers would corrupt the correlation coordinates for no privacy
+        # gain (an identifier is not PII).
+        d["symbols"] = [
+            s for s in (d.get("symbols") or [])
+            if not _drop_if_credential(redactor, str(s), stats)
+        ]
 
         evidence = []
         for ev in (d.get("evidence") or [])[: config.session_max_evidence_per_decision]:

@@ -2160,6 +2160,7 @@ class UniversalMemoryManager:
             project_name=project_name,
             config=cfg, adapter=adapter, model=model,
             force=force, max_commits=max_commits,
+            redactor=self.pii_redactor,
         )
         return stats.as_dict()
 
@@ -2191,6 +2192,7 @@ class UniversalMemoryManager:
         stats = await capture_decisions(
             repo_path, decisions or [], commit_ref=commit_ref,
             project_name=resolve_project_name(self.project, cfg), config=cfg,
+            redactor=self.pii_redactor,
         )
         return stats.as_dict()
 

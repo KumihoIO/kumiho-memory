@@ -822,3 +822,331 @@ def test_capture_decisions_empty_and_bad_ref(tmp_path, monkeypatch):
         commit_ref="does-not-exist-ref", project_name="p-code", config=cfg,
     ))
     assert s2.errors  # unresolvable ref -> loud error, no write
+
+
+# ---------------- privacy boundary (issue #99: P0-1) ----------------
+#
+# The commit-mining path must cross into the cloud graph through the SAME
+# per-atom PII/credential door as the session path (code_session): a
+# credential-bearing atom is DROPPED (counted), PII is redacted in place, and
+# clean content is stored byte-identical.  Screening defaults ON — the entry
+# points construct a PIIRedactor when none is passed, so these tests exercise
+# the default (keyless) posture with no explicit redactor.
+
+_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"          # matches PIIRedactor aws_access_key
+_SK_KEY = "sk-abcdefghij0123456789ABCDEF"  # matches api_key_generic
+
+
+def _make_repo_secret_subject(tmp_path):
+    """A one-commit repo whose commit SUBJECT carries a leaked key — the
+    'password in the commit message' case from the issue.  The subject is
+    stored verbatim on the marker and injected into the decision embedding, so
+    it leaves for the graph independently of the mined decision text."""
+    repo = tmp_path / "repo_sec"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "T")
+    (repo / "a.py").write_text("X = 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m",
+         f"fix: rotate leaked key {_AWS_KEY}\n\nrationale body, no secrets here")
+    return repo
+
+
+def _payload_one(commit_hash, *, evidence, **overrides):
+    """A single-commit / single-decision canned LLM payload with caller-chosen
+    evidence atoms (the ingest-path secret injection point)."""
+    import json as _json
+
+    dec = {
+        "title": "Load the signing key from the environment",
+        "decision": "read the key from env instead of a literal",
+        "rationale": "hardcoded secrets leak into history",
+        "why_question": "why env not a literal?",
+        "symbols": ["load_key"],
+        "evidence": evidence,
+        "anchors": [{"file": "a.py", "line_start": 1, "line_end": 2,
+                     "role": "primary"}],
+        "supersedes_hint": "",
+        "confidence": "high",
+    }
+    dec.update(overrides)
+    return _json.dumps({"commits": [{"hash": commit_hash, "decisions": [dec]}]})
+
+
+def test_ingest_screens_credential_in_commit_message(tmp_path, monkeypatch):
+    """(a) A secret in the commit MESSAGE must not reach the graph: the marker
+    subject is blanked and the decision embedding carries no key."""
+    repo = _make_repo_secret_subject(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    commits = enumerate_commits(str(repo), None, 10)
+    adapter = _StubAdapter(_payload_for(commits))  # clean decision prose
+    cfg = CodeMemoryConfig(repo="testrepo")
+
+    stats = asyncio.run(ingest_repo(
+        str(repo), None, project_name="p-code",
+        config=cfg, adapter=adapter, model="stub",
+    ))
+    assert stats.credentials_dropped >= 1
+    assert stats.decisions >= 1  # the clean decision still stored (surgical)
+    # the key appears nowhere that leaves for the graph
+    assert all(_AWS_KEY not in t for t in _FAKE.embedding_texts)
+    project = _FAKE.projects["p-code"]
+    markers = [i for (s, k), i in project.items.items() if k == "code_commit"]
+    assert markers
+    for m in markers:
+        # F4: the dropped subject is the literal placeholder, never "" — an
+        # empty embedding_text makes write_revision fall back to embedding
+        # ALL metadata (hash/author/bookkeeping vector pollution).
+        assert m.get_latest_revision().metadata.get("subject") == "[redacted]"
+    # the marker embedding went through the client-level (explicit-text) path:
+    # the fake only records embedding_texts on that path, so the placeholder's
+    # presence proves the embed-all fallback was NOT taken.
+    assert "[redacted]" in _FAKE.embedding_texts
+
+
+def test_ingest_drops_credential_evidence_keeps_clean(tmp_path, monkeypatch):
+    """(b) A secret quoted from a diff excerpt into evidence DROPS (counted);
+    the clean sibling evidence in the same decision survives byte-identical."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    commits = enumerate_commits(str(repo), "HEAD~1..HEAD", 1)
+    clean_text = "the loop collapsed to ~1 effective worker"
+    adapter = _StubAdapter(_payload_one(commits[0].hash, evidence=[
+        {"kind": "constraint",
+         "text": f"the token was hardcoded as {_SK_KEY} in the diff",
+         "source_ref": "commit:x"},
+        {"kind": "measurement", "text": clean_text, "source_ref": "commit:x"},
+    ]))
+    cfg = CodeMemoryConfig(repo="testrepo")
+
+    stats = asyncio.run(ingest_repo(
+        str(repo), "HEAD~1..HEAD", project_name="p-code",
+        config=cfg, adapter=adapter, model="stub",
+    ))
+    assert stats.credentials_dropped == 1
+    assert stats.evidence == 1     # only the clean atom was written
+    assert stats.decisions == 1    # the decision itself survived
+    project = _FAKE.projects["p-code"]
+    ev_items = [i for (s, k), i in project.items.items() if k == "code_evidence"]
+    statements = [i.get_latest_revision().metadata.get("statement", "")
+                  for i in ev_items]
+    assert statements == [clean_text]                 # clean stored verbatim
+    assert all(_SK_KEY not in t for t in _FAKE.embedding_texts)
+
+
+def test_capture_screens_agent_supplied_credential(tmp_path, monkeypatch):
+    """(c) Keyless agent path: a credential in an agent-supplied evidence entry
+    is dropped even though the CONTENT trust model is otherwise unchanged."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    clean_text = "the default executor is shared across the process"
+    decisions = [{
+        "title": "Load the key from env",
+        "decision": "read the API key from the environment",
+        "rationale": "never commit secrets",
+        "why_question": "why env not literal?",
+        "symbols": ["load_key"],
+        "files": ["a.py"],
+        "evidence": [
+            {"kind": "constraint",
+             "text": 'was hardcoded: api_key = "supersecretvalue123"'},
+            {"kind": "rejected_alternative", "text": clean_text},
+        ],
+        "confidence": "high",
+    }]
+    stats = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert stats.credentials_dropped == 1
+    assert stats.evidence == 1 and stats.decisions == 1
+    import kumiho
+    project = kumiho.get_project("p-code")
+    ev_items = [i for (s, k), i in project.items.items() if k == "code_evidence"]
+    statements = [i.get_latest_revision().metadata.get("statement", "")
+                  for i in ev_items]
+    assert statements == [clean_text]
+    assert all("supersecretvalue123" not in s for s in statements)
+
+
+def test_capture_redacts_pii_in_place_not_dropped(tmp_path, monkeypatch):
+    """PII (emails) is REDACTED in place, never dropped: the decision and its
+    evidence still store, with the address replaced by the [email] descriptor."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    decisions = [{
+        "title": "Notify the owner",
+        "decision": "email the module owner alice@example.com on failure",
+        "rationale": "the owner triages incidents",
+        "why_question": "who is paged?",
+        "symbols": ["notify"],
+        "files": ["a.py"],
+        "evidence": [{"kind": "constraint",
+                      "text": "escalate to bob@example.com within the hour"}],
+        "confidence": "high",
+    }]
+    stats = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert stats.credentials_dropped == 0            # PII is not a credential
+    assert stats.decisions == 1 and stats.evidence == 1  # nothing dropped
+    import kumiho
+    project = kumiho.get_project("p-code")
+    d_item = next(i for (s, k), i in project.items.items() if k == "code_decision")
+    dmeta = d_item.get_latest_revision().metadata
+    assert "alice@example.com" not in dmeta["decision"]
+    assert "[email]" in dmeta["decision"]
+    ev_item = next(i for (s, k), i in project.items.items() if k == "code_evidence")
+    stmt = ev_item.get_latest_revision().metadata["statement"]
+    assert "bob@example.com" not in stmt and "[email]" in stmt
+
+
+def test_capture_clean_content_stored_byte_identical(tmp_path, monkeypatch):
+    """Clean content is stored byte-identical — the screen is a no-op on text
+    with no PII/credential, and drops nothing."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    decision_text = "run the CE rerank on one dedicated worker"
+    rationale_text = "a shared pool oversubscribes the cross-encoder"
+    evidence_text = "the default executor is shared across the process"
+    decisions = [{
+        "title": "Use a single-worker executor",
+        "decision": decision_text,
+        "rationale": rationale_text,
+        "why_question": "why not the default executor?",
+        "symbols": ["rerank_async"],
+        "files": ["a.py"],
+        "evidence": [{"kind": "rejected_alternative", "text": evidence_text}],
+        "confidence": "high",
+    }]
+    stats = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert stats.credentials_dropped == 0
+    assert stats.decisions == 1 and stats.evidence == 1
+    import kumiho
+    project = kumiho.get_project("p-code")
+    d_item = next(i for (s, k), i in project.items.items() if k == "code_decision")
+    dmeta = d_item.get_latest_revision().metadata
+    assert dmeta["decision"] == decision_text
+    assert dmeta["rationale"] == rationale_text
+    ev_item = next(i for (s, k), i in project.items.items() if k == "code_evidence")
+    assert ev_item.get_latest_revision().metadata["statement"] == evidence_text
+
+
+def test_all_evidence_dropped_decision_survives(tmp_path, monkeypatch):
+    """All-atoms-dropped policy (parity with the session path): a
+    high-confidence decision whose ONLY evidence is a credential still stores —
+    its anchors carry it — only the evidence atom is dropped, not the decision."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    decisions = [{
+        "title": "Rotate the signing key",
+        "decision": "move signing to KMS",
+        "rationale": "manual keys leak",
+        "why_question": "why KMS?",
+        "symbols": ["sign"],
+        "files": ["a.py"],
+        "evidence": [{"kind": "constraint",
+                      "text": 'was hardcoded: secret = "abcdefgh12345678"'}],
+        "confidence": "high",
+    }]
+    stats = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert stats.credentials_dropped == 1
+    assert stats.evidence == 0     # the only atom dropped
+    assert stats.decisions == 1    # decision SURVIVES (anchor-carried)
+    assert not stats.errors
+
+
+def test_validate_decisions_credential_in_prose_drops_decision(monkeypatch):
+    """A credential in the decision's OWN prose drops the WHOLE decision
+    (matches code_session.validate_session_decisions), counted once."""
+    from kumiho_memory.privacy import PIIRedactor
+
+    c = CommitInfo("h", "a", "2026-07-10T00:00:00+09:00", "s", "b",
+                   files=["a.py"])
+    stats = IngestStats()
+    out = validate_decisions(
+        c,
+        [_decision(decision=f'api_key = "{_SK_KEY}"'),
+         _decision(title="Clean decision")],
+        CodeMemoryConfig(), redactor=PIIRedactor(), stats=stats,
+    )
+    assert len(out) == 1                       # only the clean decision remains
+    assert out[0]["title"] == "Clean decision"
+    assert stats.credentials_dropped == 1
+
+
+def test_validate_decisions_credential_symbol_dropped():
+    """F1: symbols reach metadata AND the embedding text — a credential-
+    bearing symbol entry drops (counted); identifiers are NOT PII-redacted
+    (rewriting them would corrupt the correlation coordinates)."""
+    from kumiho_memory.privacy import PIIRedactor
+
+    c = CommitInfo("h", "a", "2026-07-10T00:00:00+09:00", "s", "b",
+                   files=["a.py"])
+    stats = IngestStats()
+    out = validate_decisions(
+        c, [_decision(symbols=["rerank_async", _AWS_KEY])],
+        CodeMemoryConfig(), redactor=PIIRedactor(), stats=stats,
+    )
+    assert out[0]["symbols"] == ["rerank_async"]  # key dropped, clean kept
+    assert stats.credentials_dropped == 1
+
+
+def test_capture_credential_source_ref_replaced_not_dropped(tmp_path, monkeypatch):
+    """F2: a credential in evidence source_ref (model/agent free text) swaps
+    to the deterministic commit default — the atom itself survives."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    clean_text = "the default executor is shared across the process"
+    decisions = [{
+        "title": "Use a single-worker executor",
+        "decision": "run the CE rerank on one dedicated worker",
+        "rationale": "a shared pool oversubscribes the cross-encoder",
+        "why_question": "why not the default executor?",
+        "symbols": ["rerank_async"],
+        "files": ["a.py"],
+        "evidence": [{"kind": "constraint", "text": clean_text,
+                      "source_ref": f"see {_SK_KEY}"}],
+        "confidence": "high",
+    }]
+    stats = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert stats.credentials_dropped == 1   # the source_ref content, counted
+    assert stats.evidence == 1              # the atom itself survived
+    import kumiho
+    project = kumiho.get_project("p-code")
+    ev_item = next(i for (s, k), i in project.items.items() if k == "code_evidence")
+    emeta = ev_item.get_latest_revision().metadata
+    assert emeta["statement"] == clean_text
+    assert _SK_KEY not in emeta["source_ref"]
+    assert emeta["source_ref"].startswith("commit:")  # deterministic default
+
+
+def test_validate_decisions_stats_none_does_not_crash():
+    """F3: a direct call without stats must not AttributeError on the
+    credential counter — the gate constructs a throwaway IngestStats."""
+    from kumiho_memory.privacy import PIIRedactor
+
+    c = CommitInfo("h", "a", "2026-07-10T00:00:00+09:00", "s", "b",
+                   files=["a.py"])
+    out = validate_decisions(
+        c, [_decision(decision=f'api_key = "{_SK_KEY}"')],
+        CodeMemoryConfig(), redactor=PIIRedactor(),  # stats omitted
+    )
+    assert out == []  # credential decision still dropped, no crash

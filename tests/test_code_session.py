@@ -449,6 +449,20 @@ def test_validate_credential_atom_drops_but_session_survives():
     assert stats.credentials_dropped == 1
 
 
+def test_validate_credential_symbol_dropped_session_parity():
+    """Issue #99 F1 parity: symbols reach metadata AND the embedding text on
+    the session path too — a credential-bearing symbol entry drops (counted),
+    clean identifiers pass untouched (no PII redaction for identifiers)."""
+    from kumiho_memory.privacy import PIIRedactor
+
+    packet = "[m1 user] we use rerank_async for the offload"
+    cand = _candidate(symbols=["rerank_async", "AKIAIOSFODNN7EXAMPLE"])
+    out, stats = _validate([cand], [packet], redactor=PIIRedactor())
+    assert len(out) == 1                       # the decision survives
+    assert out[0]["symbols"] == ["rerank_async"]
+    assert stats.credentials_dropped == 1
+
+
 # ---------------- correlate (the matrix) ----------------
 
 
