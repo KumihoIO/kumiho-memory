@@ -199,6 +199,7 @@ class UniversalMemoryManager:
         auto_assess_fn: Optional[AutoAssessFn] = None,
         auto_assess_min_messages: int = 3,
         auto_assess_window: int = 6,
+        auto_assess_timeout: float = 120.0,
         evidence_rank: Optional[Any] = None,
         rerank: Optional[Any] = None,
         reranker: Optional[Any] = None,
@@ -365,6 +366,9 @@ class UniversalMemoryManager:
         self.auto_assess_fn: Optional[AutoAssessFn] = auto_assess_fn
         self.auto_assess_min_messages = auto_assess_min_messages
         self.auto_assess_window = auto_assess_window
+        # Outer safety cap on a single background assess (LLM + store + bounded
+        # edge writes); a hung assessor can't leak a daemon worker forever.
+        self.auto_assess_timeout = auto_assess_timeout
         # In-process cursor: message count at last auto-store per session.
         # Resets on process restart (safe — worst case one extra LLM call).
         self._auto_store_cursors: Dict[str, int] = {}
@@ -466,8 +470,26 @@ class UniversalMemoryManager:
             },
         )
         # Fire background memory assessment — non-blocking, only if configured.
+        # NOT asyncio.create_task: the MCP runtime dispatches this via
+        # asyncio.run (mcp_tools.tool_memory_add_response / _reflect), a
+        # one-shot loop that cancels pending tasks on teardown — a detached task
+        # is killed before it stores, so evidence grading AND the CONTRADICTS
+        # bridge (issue #94) would silently never run for MCP users, the primary
+        # deployment (issue #104). A daemon thread with its own loop survives the
+        # handler's teardown (same daemon-survival mechanism as
+        # run_bounded_in_thread, which decompose/consolidation already rely on)
+        # and runs to completion without blocking the tool response; bounded so a
+        # hung assessor can't leak a worker. On a genuine long-lived loop the
+        # thread still completes independently — reliability, not a behaviour
+        # change.
         if self.auto_assess_fn is not None:
-            asyncio.create_task(self._background_assess(session_id))
+            from kumiho_memory._bounded import run_coro_in_daemon_thread
+
+            run_coro_in_daemon_thread(
+                lambda: self._background_assess(session_id),
+                timeout=self.auto_assess_timeout,
+                label=f"auto-assess ({session_id})",
+            )
         return {
             "success": True,
             "message_count": result["message_count"],
