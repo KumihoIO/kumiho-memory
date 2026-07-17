@@ -76,6 +76,12 @@ class MemoryAssessResult:
     ``conflicts_with`` so the disagreement stays visible (the contradicted
     belief itself is never revised at write time)."""
 
+    create_contradicts_edges: bool = True
+    """Gate for the ``CONTRADICTS`` edge bridge (threaded from
+    ``EvidencePolicy.create_contradicts_edges``; default ON — it is the
+    feature).  ``False`` skips the edge bridge only; the ``conflicts_with``
+    metadata above is written regardless."""
+
 
 # Callable protocol: async (messages, recalled_memories) → MemoryAssessResult.
 # ``messages`` = recent working-memory dicts (role/content/timestamp).
@@ -590,8 +596,14 @@ class UniversalMemoryManager:
             # CONTRADICTS edges bridge the assessor's conflict verdicts into
             # the graph (the ``conflicts_with`` metadata above is untouched —
             # this is purely additive), so recall can surface "this fact is
-            # contested" instead of returning one side unmarked.
-            if new_kref and assess_result.conflicting_krefs:
+            # contested" instead of returning one side unmarked. Gated by the
+            # policy kill-switch (create_contradicts_edges, default ON),
+            # mirroring the SUPPORTS gate.
+            if (
+                new_kref
+                and assess_result.conflicting_krefs
+                and getattr(assess_result, "create_contradicts_edges", True)
+            ):
                 await self._create_contradicts_edges(
                     new_kref, assess_result.conflicting_krefs,
                 )

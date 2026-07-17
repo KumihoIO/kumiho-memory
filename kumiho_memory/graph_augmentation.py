@@ -36,6 +36,15 @@ from kumiho_memory.summarization import (
 
 logger = logging.getLogger(__name__)
 
+#: CONTRADICTS edge ``basis`` values that mean a fact-level DISPUTE (agent-
+#: declared in decompose, or bridged from the evidence assessor's conflict
+#: verdicts). Entity->entity CONTRADICTS relation edges from the predicate
+#: registry are domain claims ("A contradicts B") — they carry ``predicate``
+#: metadata and no basis, and must neither stamp ``contested_by`` nor be
+#: surfaced by the dispute path. The SDK Edge object carries ``metadata``
+#: (proto map), so this check reuses data already on the fetched edges.
+_DISPUTE_BASES = frozenset({"agent", "evidence-assessor"})
+
 # Type alias for the recall callable injected by the memory manager.
 # It must accept (query, *, limit, space_paths, memory_types) and return a
 # list of memory dicts.
@@ -58,8 +67,11 @@ class GraphAugmentationConfig:
         # CONTRADICTS is a belief-change edge like SUPERSEDES: the walk surfaces
         # the opposing revision the same way, and additionally derives the
         # additive ``contested_by`` recall marker from these edges (reusing the
-        # seed edges the walk already fetches — no extra round-trip). See
-        # ``_traverse_edges``.
+        # seed edges the walk already fetches — no extra round-trip). SCOPED to
+        # dispute edges only (metadata ``basis`` in _DISPUTE_BASES): the
+        # predicate registry also mints entity->entity CONTRADICTS relation
+        # edges (domain claims, ``predicate`` metadata, no basis) which are
+        # neither disputes nor followed here. See ``_traverse_edges``.
         "CONTRADICTS",
     ])
     # NOTE: "ABOUT" (memory -> entity anchor, from entity_promotion.py) is
@@ -935,8 +947,18 @@ class GraphAugmentedRecall:
                             continue
                         # Record contestation BEFORE the seen-check so both a
                         # freshly-surfaced opposing revision and one already in
-                        # the base results get marked.
+                        # the base results get marked. Scoped to DISPUTE edges
+                        # (basis: agent / evidence-assessor): an entity->entity
+                        # CONTRADICTS relation edge (predicate metadata, no
+                        # basis) is a domain claim — skip it entirely (no
+                        # marker, not surfaced).
                         if edge.edge_type == "CONTRADICTS":
+                            basis = str(
+                                (getattr(edge, "metadata", None) or {})
+                                .get("basis", "")
+                            )
+                            if basis not in _DISPUTE_BASES:
+                                continue
                             _mark_contested(kref_str, connected_uri)
                         if connected_uri in seen_krefs:
                             continue

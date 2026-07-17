@@ -136,6 +136,12 @@ def compose_context(
                     "summary": sib.get("summary", ""),
                     "content": sib.get("content", ""),
                     "_score": _score_of(sib.get("_score", 0.0)),
+                    # Dispute / staleness markers are ITEM-level (the recall
+                    # marker matches the memory's own kref OR any sibling kref)
+                    # so they ride onto every rendered sibling block — a
+                    # stacked contested memory must not lose its note.
+                    "contested_by": mem.get("contested_by") or [],
+                    "grounding_stale": bool(mem.get("grounding_stale")),
                 })
         else:
             # No siblings (non-stacked item or single revision) — use the

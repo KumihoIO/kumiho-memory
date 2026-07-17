@@ -130,9 +130,9 @@ def _node_kinds(sch: OntologySchema) -> Dict[str, Any]:
 def _edge_types(sch: OntologySchema) -> Dict[str, Any]:
     """Structural + relational edges with semantics and direction.
 
-    SUPERSEDES carries its current basis explicitly (lexical token-overlap,
-    newest-wins) so agents can tell a heuristic belief-update edge from a
-    semantic one.
+    Belief-change edges (SUPERSEDES / CONTRADICTS) carry a ``basis`` edge-
+    metadata convention labeling their provenance, so agents can tell an
+    agent-declared edge from a heuristic or assessor-bridged one.
     """
     return {
         sch.provenance_edge: {
@@ -152,14 +152,40 @@ def _edge_types(sch: OntologySchema) -> Dict[str, Any]:
         "DEPENDS_ON": {
             "semantics": "a decision is grounded in the fact it was based on.",
             "direction": "decision --DEPENDS_ON--> fact",
+            "grounding_staleness": (
+                "when a SUPERSEDES lands on the fact, each dependent is "
+                "stamped metadata grounding_stale=\"true\" + "
+                "grounding_stale_superseded_by=<kref> with mirrored tag "
+                "grounding:stale (metadata canonical, tag best-effort); "
+                "recall surfaces the marker additively; maintenance clears "
+                "the flag when the superseding fact is gone or the dependent "
+                "re-grounds onto it."
+            ),
         },
         "SUPERSEDES": {
             "semantics": "a newer node replaces an older same-subject node "
                          "(belief update).",
             "direction": "newer --SUPERSEDES--> older (newest-wins)",
-            "basis": "lexical token-Jaccard overlap >= 0.6 between the two "
-                     "nodes' text; corpus-independent, no semantic conflict "
-                     "check.",
+            "basis": "edge metadata `basis` labels provenance: `agent` = "
+                     "declared by the in-loop agent (preferred; suppresses "
+                     "the heuristic for that fact); `lexical-overlap` = "
+                     "fallback heuristic (token-Jaccard overlap >= 0.6 "
+                     "between the two nodes' text; corpus-independent, no "
+                     "semantic conflict check).",
+        },
+        "CONTRADICTS": {
+            "semantics": "the source disputes the target (fact-level dispute; "
+                         "symmetric in meaning, stored as ONE directed edge). "
+                         "Read by recall (whitelisted) and surfaced as an "
+                         "additive contested marker.",
+            "direction": "disputing --CONTRADICTS--> disputed",
+            "basis": "edge metadata `basis` labels provenance: `agent` = "
+                     "declared in decompose; `evidence-assessor` = bridged "
+                     "from assessor conflict verdicts. Entity->entity "
+                     "CONTRADICTS relation edges (predicate registry) carry "
+                     "`predicate` metadata and NO basis — domain claims, not "
+                     "disputes; the reader ignores them for contested "
+                     "marking.",
         },
     }
 

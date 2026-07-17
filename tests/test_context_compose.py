@@ -271,6 +271,26 @@ def test_contested_note_in_full_mode():
     assert "[contested: disputed by 1 other stored memory]" in out
 
 
+def test_contested_note_survives_sibling_branch():
+    # A STACKED contested memory (sibling_revisions present) must not lose its
+    # note: the item-level marker rides onto the rendered sibling blocks.
+    contested = _mem("c", "X is true", score=0.5,
+                     siblings=[_sib("c-r2", "X is true (rev 2)", score=0.9)])
+    contested["contested_by"] = ["kref://other"]
+    out = compose_context([contested])
+    assert "c-r2: X is true (rev 2)" in out
+    assert "[contested: disputed by 1 other stored memory]" in out
+
+
+def test_grounding_note_survives_sibling_branch():
+    stale = _mem("d", "keep Upstash", score=0.5,
+                 siblings=[_sib("d-r2", "keep Upstash (rev 2)", score=0.9)])
+    stale["grounding_stale"] = True
+    out = compose_context([stale])
+    assert "d-r2: keep Upstash (rev 2)" in out
+    assert "[grounding stale: a fact this was based on was superseded]" in out
+
+
 # ---------------------------------------------------------------------------
 # Grounding-staleness note (#95) — additive, mirrors the contested note
 # ---------------------------------------------------------------------------

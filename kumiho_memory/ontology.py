@@ -86,7 +86,11 @@ class OntologySchema:
     changing this object changes what gets written, not the code below.
     """
 
-    version: str = "kumiho.agent_memory.ontology.v1"
+    # v2 (Phase 2): SUPERSEDES became dual-basis (agent-declared preferred,
+    # lexical fallback), CONTRADICTS is a first-class read edge with the basis
+    # convention, and DEPENDS_ON gained the grounding-staleness ripple. The bump
+    # makes seed_ontology_spec mint a new tagged spec revision on next seeding.
+    version: str = "kumiho.agent_memory.ontology.v2"
 
     #: extraction field -> (item kind, space under the project root)
     entities_space: str = "entities"
@@ -628,7 +632,13 @@ def _sync_decompose_agent(
                 # heuristic for this fact (below), even if the target drops.
                 agent_superseded_slugs.add(src_slug)
             target_rev = _resolve_belief_target(str(entry.get(target_key, "")))
-            if target_rev is None or target_rev is src_anchor:
+            # Self-guard on BOTH identity and kref uri: the kref-path resolver
+            # (c) can return a fresh object for the fact's own revision, which
+            # `is` alone would let through as a self-edge.
+            src_uri = getattr(getattr(src_anchor, "kref", None), "uri", "") or ""
+            tgt_uri = getattr(getattr(target_rev, "kref", None), "uri", "") or ""
+            if (target_rev is None or target_rev is src_anchor
+                    or (src_uri and src_uri == tgt_uri)):
                 logger.debug("ontology(agent): %s target unresolved/self: %r",
                              edge_type, entry.get(target_key))
                 continue

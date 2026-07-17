@@ -321,6 +321,25 @@ def test_belief_target_unresolvable_is_dropped(monkeypatch):
     assert _edges_of(_fact_rev(proj, "New fact A"), "SUPERSEDES") == []
 
 
+def test_belief_target_own_kref_is_dropped(monkeypatch):
+    # Hardening: a kref-path (c) resolution of the fact's OWN revision returns a
+    # FRESH object (`is` identity fails), so the self-guard must also compare
+    # kref uris — a self-SUPERSEDES edge must never land.
+    conv = _FakeRev(_CONV_URI)
+    self_slug = slugify("New belief X", hash_on_truncate=True)
+    self_kref = f"kref://proj/facts/{self_slug}.fact?r=1"
+    alias_rev = _FakeRev(self_kref)   # distinct object, same uri as the anchor
+    proj = _install_module(monkeypatch, conv, revs={self_kref: alias_rev})
+    decomp = {
+        "facts": [{"statement": "New belief X"}],
+        "supersedes": [{"statement": "New belief X", "replaces": self_kref}],
+    }
+    stats = _sync_decompose_agent(_CONV_URI, decomp, "proj", OntologySchema())
+    assert stats["supersedes"] == 0
+    assert _edges_of(_fact_rev(proj, "New belief X"), "SUPERSEDES") == []
+    assert alias_rev.edge_meta == []
+
+
 def test_belief_target_kref_path(monkeypatch):
     conv = _FakeRev(_CONV_URI)
     prior_kref = "kref:/proj/facts/prior-belief.fact?r=7"

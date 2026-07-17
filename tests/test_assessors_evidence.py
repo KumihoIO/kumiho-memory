@@ -371,6 +371,46 @@ def test_background_assess_bridges_conflicts_to_edges(monkeypatch):
     assert ("kref://m/1", "CONTRADICTS") in new_rev.edges
 
 
+def test_contradicts_bridge_policy_gate_off_skips_edges(monkeypatch):
+    """create_contradicts_edges=False -> NO bridge call; conflicts_with metadata
+    is still written (the gate kills only the edge, mirroring the SUPPORTS
+    gate's edge-only scope)."""
+    from kumiho_memory.memory_manager import MemoryAssessResult
+
+    stored, revisions = _run_background_assess(
+        MemoryAssessResult(
+            should_store=True, content="Conflicting claim", memory_type="fact",
+            evidence_level="unverified", conflicting_krefs=["kref://m/1"],
+            create_contradicts_edges=False,
+        ),
+        {"item_kref": "kref://m/new", "revision_kref": "kref://m/new/rev/1"},
+        monkeypatch,
+    )
+    assert stored["metadata"]["conflicts_with"] == "kref://m/1"
+    # No CONTRADICTS edge: the bridge was never entered (no revision fetched).
+    assert revisions == {}
+
+
+def test_evidence_policy_gate_threads_onto_result():
+    """The assessor copies EvidencePolicy.create_contradicts_edges onto the
+    result, so the manager's call-site check sees the policy value —
+    conflicting_krefs stays populated either way (metadata is never gated)."""
+    verdict = {"should_store": True, "content": "Contradicting claim",
+               "memory_type": "fact", "reason": "conflict",
+               "agrees_with": [], "contradicts": [2], "source": ""}
+
+    on_result, _ = _assess(verdict, _memories())               # default ON
+    assert on_result.create_contradicts_edges is True
+    assert on_result.conflicting_krefs == ["kref://m/2"]
+
+    off_result, _ = _assess(
+        verdict, _memories(),
+        policy=EvidencePolicy(create_contradicts_edges=False),
+    )
+    assert off_result.create_contradicts_edges is False
+    assert off_result.conflicting_krefs == ["kref://m/2"]      # metadata intact
+
+
 class _ContradictKref:
     def __init__(self, uri):
         self.uri = uri

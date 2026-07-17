@@ -28,10 +28,11 @@ class _FakeKref:
 
 
 class _FakeEdge:
-    def __init__(self, source, target, edge_type):
+    def __init__(self, source, target, edge_type, metadata=None):
         self.source_kref = _FakeKref(source)
         self.target_kref = _FakeKref(target)
         self.edge_type = edge_type
+        self.metadata = dict(metadata or {})  # mirrors kumiho.edge.Edge.metadata
 
 
 class _FakeRev:
@@ -570,11 +571,12 @@ def test_default_edge_types_include_contradicts():
 
 
 def test_contradicts_edge_surfaces_opposing_and_marks_both(monkeypatch):
-    # Outgoing CONTRADICTS (seed -> target): the opposing revision is surfaced
-    # by the walk (like SUPERSEDES) AND both endpoints gain `contested_by`.
+    # Outgoing CONTRADICTS (seed -> target, basis: agent): the opposing revision
+    # is surfaced by the walk (like SUPERSEDES) AND both endpoints gain
+    # `contested_by`.
     graph = {
         CS: _FakeRev(CS, {"title": "S", "summary": "X is true"},
-                     [_FakeEdge(CS, CT, "CONTRADICTS")]),
+                     [_FakeEdge(CS, CT, "CONTRADICTS", {"basis": "agent"})]),
         CT: _FakeRev(CT, {"title": "T", "summary": "X is false"}, []),
     }
     base = [{"kref": CS, "title": "S", "summary": "X is true", "score": 0.5}]
@@ -589,10 +591,12 @@ def test_contradicts_edge_surfaces_opposing_and_marks_both(monkeypatch):
 
 
 def test_contradicts_edge_incoming_direction_also_marks(monkeypatch):
-    # Incoming CONTRADICTS (target -> seed): both directions must mark.
+    # Incoming CONTRADICTS (target -> seed, basis: evidence-assessor): both
+    # directions and both dispute bases must mark.
     graph = {
         CS: _FakeRev(CS, {"title": "S", "summary": "X is true"},
-                     [_FakeEdge(CT, CS, "CONTRADICTS")]),
+                     [_FakeEdge(CT, CS, "CONTRADICTS",
+                                {"basis": "evidence-assessor"})]),
         CT: _FakeRev(CT, {"title": "T", "summary": "X is false"}, []),
     }
     base = [{"kref": CS, "title": "S", "summary": "X is true", "score": 0.5}]
@@ -603,12 +607,48 @@ def test_contradicts_edge_incoming_direction_also_marks(monkeypatch):
     assert surfaced and surfaced[0]["contested_by"] == [CS]
 
 
+def test_entity_relation_contradicts_is_not_a_dispute(monkeypatch):
+    # An entity->entity CONTRADICTS relation edge (predicate registry: carries
+    # `predicate` metadata, NO basis) is a domain claim — it must neither stamp
+    # contested_by nor surface the other entity via the dispute path.
+    ea = "kref://p/entities/theory-a.entity?r=1"
+    eb = "kref://p/entities/theory-b.entity?r=1"
+    graph = {
+        ea: _FakeRev(ea, {"display_name": "Theory A"},
+                     [_FakeEdge(ea, eb, "CONTRADICTS",
+                                {"predicate": "conflicts_with"})]),
+        eb: _FakeRev(eb, {"display_name": "Theory B"}, []),
+    }
+    base = [{"kref": ea, "title": "Theory A", "summary": "", "score": 0.5}]
+    _found, augmented = _traverse(monkeypatch, graph, [ea], base)
+
+    assert "contested_by" not in base[0]
+    assert not [m for m in augmented if m["kref"] == eb]   # not surfaced
+    assert _found == 0
+
+
+def test_basisless_contradicts_is_not_a_dispute(monkeypatch):
+    # Defensive: a CONTRADICTS edge with NO metadata at all (unknown writer) is
+    # not treated as a dispute either — only the two known bases mark.
+    graph = {
+        CS: _FakeRev(CS, {"title": "S", "summary": "X"},
+                     [_FakeEdge(CS, CT, "CONTRADICTS")]),
+        CT: _FakeRev(CT, {"title": "T", "summary": "not X"}, []),
+    }
+    base = [{"kref": CS, "title": "S", "summary": "X", "score": 0.5}]
+    _found, augmented = _traverse(monkeypatch, graph, [CS], base)
+
+    assert "contested_by" not in base[0]
+    assert not [m for m in augmented if m["kref"] == CT]
+
+
 def test_contested_by_is_bounded(monkeypatch):
     # A heavily-contested seed surfaces at most the first 3 disputing krefs.
     targets = [f"kref://p/facts/t{i}.fact?r=1" for i in range(5)]
     graph = {
         CS: _FakeRev(CS, {"title": "S", "summary": "X"},
-                     [_FakeEdge(CS, t, "CONTRADICTS") for t in targets]),
+                     [_FakeEdge(CS, t, "CONTRADICTS", {"basis": "agent"})
+                      for t in targets]),
     }
     for t in targets:
         graph[t] = _FakeRev(t, {"title": t, "summary": "not X"}, [])
@@ -639,7 +679,7 @@ def test_contested_marker_matches_sibling_revision_kref(monkeypatch):
     sib = "kref://p/notes/cs.conversation?r=2"
     graph = {
         sib: _FakeRev(sib, {"title": "S", "summary": "X"},
-                      [_FakeEdge(sib, CT, "CONTRADICTS")]),
+                      [_FakeEdge(sib, CT, "CONTRADICTS", {"basis": "agent"})]),
         CT: _FakeRev(CT, {"title": "T", "summary": "not X"}, []),
     }
     base = [{
