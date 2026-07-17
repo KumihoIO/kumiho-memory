@@ -88,7 +88,8 @@ class GraphAugmentationConfig:
     #: are read by NO recall path today; when this is on, the entity-mediated
     #: reader is EXTENDED by one hop across them to reach a NEIGHBOUR entity's
     #: memories:  seed --ABOUT--> anchor --<relation>--> neighbour anchor
-    #: <--ABOUT-- that neighbour's memories. Reader and writer thus share one
+    #: <--ABOUT/INVOLVES-- that neighbour's memories (INVOLVES reaches event
+    #: nodes, mirroring the direct walk). Reader and writer thus share one
     #: vocabulary (the registry's canonical set) instead of only syntax
     #: (Gruber's G1). DEFAULT OFF pending pair-measured benchmarks: the extra
     #: hop adds one get_edges round-trip per distinct neighbour anchor, bounded
@@ -1396,6 +1397,7 @@ class GraphAugmentedRecall:
                         anchor_rev = kumiho.get_revision(anchor_uri)
                         siblings = 0
                         rel_here: List[Tuple[str, str]] = []
+                        sibs_capped = False
                         for edge in anchor_rev.get_edges(direction=kumiho.BOTH):
                             etype = edge.edge_type
                             # Relation traversal: note the entity->entity relation
@@ -1412,6 +1414,8 @@ class GraphAugmentedRecall:
                                 if neighbour and neighbour != anchor_uri:
                                     rel_here.append((etype, neighbour))
                                 continue
+                            if sibs_capped:
+                                continue  # scanning only for relation edges now
                             # Reach siblings via ABOUT (memories, facts, decisions,
                             # actions) AND INVOLVES (event nodes, which carry the
                             # distilled event_date) — both point *into* the anchor.
@@ -1450,7 +1454,14 @@ class GraphAugmentedRecall:
                             except Exception as exc:
                                 logger.debug("entity recall: sibling %s failed: %s", sib_uri, exc)
                             if siblings >= max_siblings:
-                                break
+                                # The sibling cap must not short-circuit relation
+                                # collection — relation edges can arrive AFTER the
+                                # cap-filling sibling (server edge order is
+                                # arbitrary). Flag off keeps the historical early
+                                # exit byte-identical.
+                                if not relation_on:
+                                    break
+                                sibs_capped = True
                         # Queue this anchor's relation neighbours. RELATES_TO is
                         # the fallback bucket for unregistered predicates —
                         # lowest priority, so the specific relations win the
@@ -1474,6 +1485,11 @@ class GraphAugmentedRecall:
             # krefs. Each neighbour anchor is one extra get_edges round-trip;
             # the caps bound the fan-out.
             if relation_on and relation_candidates:
+                # Global specific-over-fallback ordering: the per-anchor slice
+                # alone lets an EARLIER anchor's RELATES_TO consume the global
+                # caps ahead of a later anchor's specific relation. Stable
+                # partition — arrival order is preserved within each class.
+                relation_candidates.sort(key=lambda c: c[0] == relates_to)
                 rel_found = 0
                 neighbours_expanded = 0
                 for (relation_type, neighbour_uri,

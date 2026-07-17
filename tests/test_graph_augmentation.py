@@ -159,6 +159,45 @@ def test_relation_traversal_reaches_neighbour_via_incoming_edge(monkeypatch):
     assert augmented[0]["via_relation"] == "DEPENDS_ON"
 
 
+def test_sibling_cap_does_not_short_circuit_relation_collection(monkeypatch):
+    # Regression (confirmed bug): the cap-filling sibling used to break out of
+    # the whole edge scan, so a relation edge arriving AFTER it was never
+    # collected — reachability depended on server edge order. Both permutations
+    # must reach the same nodes.
+    S1 = "kref://p/notes/s1.conversation?r=1"
+
+    def _graph(anchor_edges):
+        return {
+            M1: _FakeRev(M1, {"title": "M1"}, [_FakeEdge(M1, A, "ABOUT")]),
+            A: _FakeRev(A, {"display_name": "Acme"}, anchor_edges),
+            N: _FakeRev(N, {"display_name": "Redis"},
+                        [_FakeEdge(NMEM, N, "ABOUT")]),
+            NMEM: _FakeRev(NMEM, {"title": "Redis note", "summary": "s"}, []),
+            S1: _FakeRev(S1, {"title": "S1", "summary": "s"}, []),
+        }
+
+    siblings_first = [
+        _FakeEdge(M1, A, "ABOUT"),
+        _FakeEdge(S1, A, "ABOUT"),      # fills max_siblings=1
+        _FakeEdge(A, N, "USES"),        # used to be unreachable (post-break)
+    ]
+    relation_first = [
+        _FakeEdge(M1, A, "ABOUT"),
+        _FakeEdge(A, N, "USES"),
+        _FakeEdge(S1, A, "ABOUT"),
+    ]
+    reached = []
+    for edges in (siblings_first, relation_first):
+        found, augmented = _run(
+            monkeypatch, _graph(edges), relation_traversal=True,
+            entity_recall_max_siblings=1,
+        )
+        reached.append({m["kref"] for m in augmented})
+    assert reached[0] == reached[1]     # order-independent reachability
+    assert NMEM in reached[0]           # relation neighbour's memory reached
+    assert S1 in reached[0]             # direct sibling (cap slot) kept too
+
+
 def test_relation_traversal_follows_involves_into_neighbour(monkeypatch):
     # A neighbour's memories are reached via ABOUT *and* INVOLVES (event nodes).
     E = "kref://p/events/launch.event?r=1"
@@ -219,6 +258,40 @@ def test_relates_to_still_followed_when_budget_allows(monkeypatch):
     krefs = {m["kref"] for m in augmented}
     assert krefs == {NMEM, RMEM}
     assert next(m for m in augmented if m["kref"] == RMEM)["via_relation"] == "RELATES_TO"
+
+
+def test_global_caps_prefer_specific_over_earlier_relates_to(monkeypatch):
+    # Per-anchor priority alone is not enough: an EARLIER anchor's RELATES_TO
+    # must not consume the global neighbour budget ahead of a LATER anchor's
+    # specific relation — candidates are partitioned specific-first globally
+    # (stable, arrival order kept within each class) before the caps apply.
+    A2 = "kref://p/entities/second.entity?r=1"
+    R = "kref://p/entities/misc.entity?r=1"
+    RMEM = "kref://p/notes/misc-note.conversation?r=1"
+    graph = {
+        M1: _FakeRev(M1, {"title": "M1"}, [
+            _FakeEdge(M1, A, "ABOUT"),      # A expanded first
+            _FakeEdge(M1, A2, "ABOUT"),     # A2 second
+        ]),
+        A: _FakeRev(A, {"display_name": "Acme"}, [
+            _FakeEdge(M1, A, "ABOUT"),
+            _FakeEdge(A, R, "RELATES_TO"),  # earlier anchor, fallback bucket
+        ]),
+        A2: _FakeRev(A2, {"display_name": "Second"}, [
+            _FakeEdge(M1, A2, "ABOUT"),
+            _FakeEdge(A2, N, "USES"),       # later anchor, specific relation
+        ]),
+        R: _FakeRev(R, {"display_name": "Misc"}, [_FakeEdge(RMEM, R, "ABOUT")]),
+        RMEM: _FakeRev(RMEM, {"title": "Misc", "summary": "s"}, []),
+        N: _FakeRev(N, {"display_name": "Redis"}, [_FakeEdge(NMEM, N, "ABOUT")]),
+        NMEM: _FakeRev(NMEM, {"title": "Redis note", "summary": "s"}, []),
+    }
+    found, augmented = _run(
+        monkeypatch, graph, relation_traversal=True,
+        relation_traversal_max_neighbors=1,
+    )
+    assert [m["kref"] for m in augmented] == [NMEM]   # specific wins globally
+    assert augmented[0]["via_relation"] == "USES"
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +433,15 @@ def test_dedup_direct_provenance_wins(monkeypatch):
     assert by_kref[SHARED][0]["hop"] == 2         # direct provenance wins
     assert "via_relation" not in by_kref[SHARED][0]
     assert NONLY in by_kref and by_kref[NONLY][0]["hop"] == 3
+
+
+def test_stray_non_canonical_edge_type_not_followed(monkeypatch):
+    # An entity->entity edge whose type is OUTSIDE the registry's canonical set
+    # (e.g. OWNS, written by pre-registry code) is not traversed — the reader's
+    # vocabulary is exactly predicate_registry.canonical_types().
+    graph = _seed_to_neighbour_graph(relation_type="OWNS", direction="out")
+    found, augmented = _run(monkeypatch, graph, relation_traversal=True)
+    assert found == 0 and augmented == []
 
 
 def test_non_entity_neighbour_not_followed(monkeypatch):
