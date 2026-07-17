@@ -48,7 +48,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 # --- Guard: refuse to run against the cloud (mirrors kumiho-benchmarks run.py) ---
-if os.environ.get("KUMIHO_AUTH_TOKEN") and "--allow-token" not in sys.argv:
+if os.environ.get("KUMIHO_AUTH_TOKEN") and "--allow-token" not in sys.argv and "--compare" not in sys.argv:
     sys.exit(
         "KUMIHO_AUTH_TOKEN is set — this would run against the cloud, not local CE.\n"
         "Unset it (recommended: `env -u KUMIHO_AUTH_TOKEN ...`) or pass "
@@ -71,16 +71,27 @@ def _is_volatile_key(key: str) -> bool:
     return any(sub in k for sub in _VOLATILE_SUBSTRINGS)
 
 
-def _strip_volatile(obj):
-    """Recursively drop volatile (timing) keys from dicts/lists."""
+#: Recall scores carry a recency prior computed from wall-clock time, so two
+#: runs minutes apart drift at ~1e-6 (measured pre-vs-pre on identical code).
+#: Round score-like floats to 4 decimals: drift vanishes, while any real
+#: ranking-affecting change (>=1e-4 score movement, or a reorder — list order
+#: is compared exactly) still fails the diff.
+_SCORE_KEY_SUBSTRINGS = ("score",)
+_SCORE_DECIMALS = 4
+
+
+def _strip_volatile(obj, _key: str = ""):
+    """Recursively drop volatile (timing) keys and round score floats."""
     if isinstance(obj, dict):
         return {
-            k: _strip_volatile(v)
+            k: _strip_volatile(v, k)
             for k, v in obj.items()
             if not _is_volatile_key(k)
         }
     if isinstance(obj, list):
-        return [_strip_volatile(v) for v in obj]
+        return [_strip_volatile(v, _key) for v in obj]
+    if isinstance(obj, float) and any(s in _key.lower() for s in _SCORE_KEY_SUBSTRINGS):
+        return round(obj, _SCORE_DECIMALS)
     return obj
 
 
@@ -163,10 +174,61 @@ async def _run_all(manager, queries, *, limit: int, graph: bool) -> list:
     return results
 
 
+def compare_dumps(path_a: str, path_b: str, tolerance: float = 1e-3) -> list:
+    """Structural comparison: everything must match exactly EXCEPT score-like
+    floats, which must agree within *tolerance*.
+
+    Recall scores carry a wall-clock recency prior, so exact float equality is
+    unattainable across runs even on identical code (measured drift ~1e-6);
+    rounding merely moves the boundary. Order, keys, krefs, and content are
+    compared exactly — those are the result under test.
+    Returns a list of difference descriptions (empty = equivalent).
+    """
+    diffs: list = []
+
+    def walk(a, b, path):
+        if type(a) is not type(b):
+            diffs.append(f"{path}: type {type(a).__name__} != {type(b).__name__}")
+            return
+        if isinstance(a, dict):
+            if set(a) != set(b):
+                diffs.append(f"{path}: keys {sorted(set(a) ^ set(b))}")
+                return
+            for k in a:
+                walk(a[k], b[k], f"{path}.{k}")
+        elif isinstance(a, list):
+            if len(a) != len(b):
+                diffs.append(f"{path}: length {len(a)} != {len(b)}")
+                return
+            for i, (x, y) in enumerate(zip(a, b)):
+                walk(x, y, f"{path}[{i}]")
+        elif isinstance(a, float):
+            key = path.rsplit(".", 1)[-1]
+            if any(s in key.lower() for s in _SCORE_KEY_SUBSTRINGS):
+                if abs(a - b) > tolerance:
+                    diffs.append(f"{path}: score {a} vs {b} (>{tolerance})")
+            elif a != b:
+                diffs.append(f"{path}: {a} != {b}")
+        elif a != b:
+            diffs.append(f"{path}: {a!r} != {b!r}")
+
+    with open(path_a, encoding="utf-8") as fh:
+        da = json.load(fh)
+    with open(path_b, encoding="utf-8") as fh:
+        db = json.load(fh)
+    walk(da, db, "$")
+    return diffs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--project", required=True, help="Kumiho project name to recall against")
-    ap.add_argument("--out", required=True, help="path to write the canonical JSON dump")
+    ap.add_argument("--compare", nargs=2, metavar=("PRE", "POST"),
+                    help="compare two dumps (exact structure/order/content, "
+                         "score floats within tolerance) and exit")
+    ap.add_argument("--tolerance", type=float, default=1e-3,
+                    help="score tolerance for --compare (default 1e-3)")
+    ap.add_argument("--project", help="Kumiho project name to recall against")
+    ap.add_argument("--out", help="path to write the canonical JSON dump")
     ap.add_argument("--queries", help="JSON file: list of query strings (default: 20 built-in probes)")
     ap.add_argument("--limit", type=int, default=5, help="recall limit per query (default 5)")
     ap.add_argument("--no-graph", action="store_true", help="disable graph-augmented recall")
@@ -177,6 +239,19 @@ def main() -> int:
                     help="do not fail when no stacked/sibling-bearing results surfaced "
                          "(a green diff over such a corpus never exercises the #102 path)")
     args = ap.parse_args()
+
+    if args.compare:
+        problems = compare_dumps(args.compare[0], args.compare[1], args.tolerance)
+        for p in problems[:40]:
+            print(f"[bytediff] DIFF {p}", file=sys.stderr)
+        if problems:
+            print(f"[bytediff] GATE FAILED: {len(problems)} difference(s)", file=sys.stderr)
+            return 1
+        print("[bytediff] GATE PASSED: structurally identical "
+              f"(scores within {args.tolerance})", file=sys.stderr)
+        return 0
+    if not args.project or not args.out:
+        ap.error("--project and --out are required unless --compare is used")
 
     graph = not args.no_graph
     queries = _load_queries(args.queries) if args.queries else default_queries()
