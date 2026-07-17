@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from kumiho_memory.evidence import EVIDENCE_LEVELS, evidence_tag
+from kumiho_memory.grounding import apply_grounding_marker
 from kumiho_memory.privacy import PIIRedactor
 from kumiho_memory.redis_memory import RedisMemoryBuffer
 from kumiho_memory.retry import RetryQueue, retry_with_backoff
@@ -74,6 +75,12 @@ class MemoryAssessResult:
     """Revision krefs of contradicted memories — recorded in metadata as
     ``conflicts_with`` so the disagreement stays visible (the contradicted
     belief itself is never revised at write time)."""
+
+    create_contradicts_edges: bool = True
+    """Gate for the ``CONTRADICTS`` edge bridge (threaded from
+    ``EvidencePolicy.create_contradicts_edges``; default ON — it is the
+    feature).  ``False`` skips the edge bridge only; the ``conflicts_with``
+    metadata above is written regardless."""
 
 
 # Callable protocol: async (messages, recalled_memories) → MemoryAssessResult.
@@ -192,6 +199,7 @@ class UniversalMemoryManager:
         auto_assess_fn: Optional[AutoAssessFn] = None,
         auto_assess_min_messages: int = 3,
         auto_assess_window: int = 6,
+        auto_assess_timeout: float = 120.0,
         evidence_rank: Optional[Any] = None,
         rerank: Optional[Any] = None,
         reranker: Optional[Any] = None,
@@ -358,6 +366,9 @@ class UniversalMemoryManager:
         self.auto_assess_fn: Optional[AutoAssessFn] = auto_assess_fn
         self.auto_assess_min_messages = auto_assess_min_messages
         self.auto_assess_window = auto_assess_window
+        # Outer safety cap on a single background assess (LLM + store + bounded
+        # edge writes); a hung assessor can't leak a daemon worker forever.
+        self.auto_assess_timeout = auto_assess_timeout
         # In-process cursor: message count at last auto-store per session.
         # Resets on process restart (safe — worst case one extra LLM call).
         self._auto_store_cursors: Dict[str, int] = {}
@@ -459,8 +470,26 @@ class UniversalMemoryManager:
             },
         )
         # Fire background memory assessment — non-blocking, only if configured.
+        # NOT asyncio.create_task: the MCP runtime dispatches this via
+        # asyncio.run (mcp_tools.tool_memory_add_response / _reflect), a
+        # one-shot loop that cancels pending tasks on teardown — a detached task
+        # is killed before it stores, so evidence grading AND the CONTRADICTS
+        # bridge (issue #94) would silently never run for MCP users, the primary
+        # deployment (issue #104). A daemon thread with its own loop survives the
+        # handler's teardown (same daemon-survival mechanism as
+        # run_bounded_in_thread, which decompose/consolidation already rely on)
+        # and runs to completion without blocking the tool response; bounded so a
+        # hung assessor can't leak a worker. On a genuine long-lived loop the
+        # thread still completes independently — reliability, not a behaviour
+        # change.
         if self.auto_assess_fn is not None:
-            asyncio.create_task(self._background_assess(session_id))
+            from kumiho_memory._bounded import run_coro_in_daemon_thread
+
+            run_coro_in_daemon_thread(
+                lambda: self._background_assess(session_id),
+                timeout=self.auto_assess_timeout,
+                label=f"auto-assess ({session_id})",
+            )
         return {
             "success": True,
             "message_count": result["message_count"],
@@ -585,6 +614,21 @@ class UniversalMemoryManager:
                 await self._create_support_edges(
                     new_kref, assess_result.supporting_krefs,
                 )
+
+            # CONTRADICTS edges bridge the assessor's conflict verdicts into
+            # the graph (the ``conflicts_with`` metadata above is untouched —
+            # this is purely additive), so recall can surface "this fact is
+            # contested" instead of returning one side unmarked. Gated by the
+            # policy kill-switch (create_contradicts_edges, default ON),
+            # mirroring the SUPPORTS gate.
+            if (
+                new_kref
+                and assess_result.conflicting_krefs
+                and getattr(assess_result, "create_contradicts_edges", True)
+            ):
+                await self._create_contradicts_edges(
+                    new_kref, assess_result.conflicting_krefs,
+                )
         except Exception as exc:  # pragma: no cover
             logger.debug("_background_assess error for session %s: %s", session_id, exc)
 
@@ -637,6 +681,81 @@ class UniversalMemoryManager:
         if created:
             logger.debug(
                 "Created %d SUPPORTS edge(s) from %s", created, revision_kref,
+            )
+        return created
+
+    async def _create_contradicts_edges(
+        self,
+        revision_kref: str,
+        conflicting_krefs: List[str],
+        timeout: float = 60.0,
+    ) -> int:
+        """Bridge assessor conflicts into ``CONTRADICTS`` graph edges.
+
+        The conflict-side twin of :meth:`_create_support_edges`: one directed
+        ``CONTRADICTS`` edge (new revision -> each conflicting revision) with
+        ``basis: evidence-assessor``, turning the assessor's ``conflicts_with``
+        metadata into graph structure the recall reader can traverse and
+        surface as a contested marker.
+
+        Best-effort (each failure logged at debug level and skipped — conflict
+        edges are enrichment, never a store blocker) and idempotent: a target
+        already linked by ``CONTRADICTS`` is skipped, mirroring
+        ``ontology._Materializer.edge``'s precheck so a re-assess of the same
+        window can't duplicate.  Runs the synchronous gRPC calls in a bounded
+        daemon thread.  Returns the number of edges created.
+        """
+        from kumiho_memory._bounded import run_bounded_in_thread
+
+        def _sync_create() -> int:
+            import kumiho
+
+            source_rev = kumiho.get_revision(revision_kref)
+            created = 0
+            for target_kref in conflicting_krefs:
+                try:
+                    # Idempotency precheck (server-side dedupe is NOT assumed):
+                    # skip a target already linked by CONTRADICTS. Best-effort —
+                    # if the edge read is unsupported/transient, fall through
+                    # and create rather than silently dropping the edge.
+                    already = False
+                    try:
+                        for existing in source_rev.get_edges(
+                            edge_type_filter="CONTRADICTS", direction=0,
+                        ):
+                            if getattr(
+                                getattr(existing, "target_kref", None), "uri", "",
+                            ) == target_kref:
+                                already = True
+                                break
+                    except Exception:  # noqa: BLE001 — no dedup available; create
+                        pass
+                    if already:
+                        continue
+                    target_rev = kumiho.get_revision(target_kref)
+                    source_rev.create_edge(
+                        target_rev,
+                        "CONTRADICTS",
+                        metadata={"basis": "evidence-assessor"},
+                    )
+                    created += 1
+                except Exception as exc:
+                    logger.debug(
+                        "CONTRADICTS edge %s -> %s failed: %s",
+                        revision_kref, target_kref, exc,
+                    )
+            return created
+
+        created = await run_bounded_in_thread(
+            _sync_create,
+            timeout=timeout,
+            label=f"CONTRADICTS edges ({revision_kref})",
+            on_timeout=0,
+            on_error=0,
+        ) or 0
+        if created:
+            logger.debug(
+                "Created %d CONTRADICTS edge(s) from %s", created, revision_kref,
             )
         return created
 
@@ -2082,6 +2201,8 @@ class UniversalMemoryManager:
         entities: Optional[List[Dict[str, Any]]] = None,
         facts: Optional[List[Dict[str, Any]]] = None,
         relations: Optional[List[Dict[str, Any]]] = None,
+        supersedes: Optional[List[Dict[str, Any]]] = None,
+        contradicts: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Keyless agent-driven ontology decomposition of a stored memory.
 
@@ -2101,7 +2222,8 @@ class UniversalMemoryManager:
 
         stats = await decompose_and_link_agent(
             kref,
-            {"entities": entities or [], "facts": facts or [], "relations": relations or []},
+            {"entities": entities or [], "facts": facts or [], "relations": relations or [],
+             "supersedes": supersedes or [], "contradicts": contradicts or []},
             project_name=self.project,
         )
         return {"decomposed": stats, "kref": kref}
@@ -2188,6 +2310,10 @@ class UniversalMemoryManager:
                 entry["evidence_level"] = meta["evidence_level"]
             if meta.get("source"):
                 entry["source"] = meta["source"]
+            # Grounding-staleness marker (#95): a directly-recalled dependent
+            # whose grounding fact was superseded carries the flag in the
+            # metadata already fetched here — additive, zero extra round-trip.
+            apply_grounding_marker(entry, meta)
             # Semantic event date (valid-time). Surfaced BEFORE the
             # load_artifacts branch so it reaches summarized recall too —
             # the one mode that is otherwise date-blind (no content loaded).

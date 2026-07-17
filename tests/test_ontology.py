@@ -179,6 +179,8 @@ def test_supersedes_uses_token_overlap_not_score(monkeypatch):
     # High token overlap ("use ... the event bus streams") -> SUPERSEDES.
     assert n == 1
     assert new_anchor.edges and new_anchor.edges[0][1] == "SUPERSEDES"
+    # Heuristic provenance is labeled (vs agent-declared basis: agent).
+    assert new_anchor.edges[0][2] == {"reason": "belief update", "basis": "lexical-overlap"}
 
 
 def test_supersedes_skips_low_overlap(monkeypatch):

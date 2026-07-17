@@ -86,7 +86,11 @@ class OntologySchema:
     changing this object changes what gets written, not the code below.
     """
 
-    version: str = "kumiho.agent_memory.ontology.v1"
+    # v2 (Phase 2): SUPERSEDES became dual-basis (agent-declared preferred,
+    # lexical fallback), CONTRADICTS is a first-class read edge with the basis
+    # convention, and DEPENDS_ON gained the grounding-staleness ripple. The bump
+    # makes seed_ontology_spec mint a new tagged spec revision on next seeding.
+    version: str = "kumiho.agent_memory.ontology.v2"
 
     #: extraction field -> (item kind, space under the project root)
     entities_space: str = "entities"
@@ -480,7 +484,8 @@ def _sync_decompose_agent(
         return {}
 
     m = _Materializer(project, project_name, schema)
-    stats: Dict[str, int] = {"entities": 0, "facts": 0, "relations": 0, "edges": 0}
+    stats: Dict[str, int] = {"entities": 0, "facts": 0, "relations": 0,
+                             "supersedes": 0, "contradicts": 0, "edges": 0}
 
     entity_anchors: Dict[str, Any] = {}   # slug -> anchor rev
     alias_to_slug: Dict[str, str] = {}    # slug(name or alias) -> primary slug
@@ -521,6 +526,9 @@ def _sync_decompose_agent(
         else:
             _ensure_entity(str(ent))
 
+    # This call's facts, indexed for belief-change resolution + lexical fallback.
+    fact_anchors_by_slug: Dict[str, Any] = {}            # slug -> anchor rev
+    fact_call_entries: List[Tuple[Any, str, str]] = []   # (anchor, slug, statement)
     for fact in (decomposition.get("facts") or [])[: schema.max_per_kind]:
         is_dict = isinstance(fact, dict)
         statement = str(fact.get("statement", "")).strip() if is_dict else str(fact).strip()
@@ -534,6 +542,8 @@ def _sync_decompose_agent(
         if anchor is None:
             continue
         stats["facts"] += 1
+        fact_anchors_by_slug[slug] = anchor
+        fact_call_entries.append((anchor, slug, statement))
         if m.edge(anchor, conv_rev, schema.provenance_edge):
             stats["edges"] += 1
         for about_name in ((fact.get("about") or []) if is_dict else []):
@@ -572,6 +582,104 @@ def _sync_decompose_agent(
         if m.edge(entity_anchors[subj], entity_anchors[obj], etype, md):
             stats["relations"] += 1
             stats["edges"] += 1
+
+    # --- Belief-change edges (agent-declared SUPERSEDES / CONTRADICTS) ---
+    # In-loop trust model: the agent read the source and named the prior belief
+    # being replaced/contradicted. Referential integrity like relations — the
+    # SOURCE must be a fact materialized in THIS call; the TARGET resolves in
+    # order: (a) a fact in this call, (b) an existing fact item in the facts
+    # space (get, never create), (c) a validated kref uri. Unresolvable source
+    # or target drops the entry (logged), never guessed.
+    facts_space_path = f"/{project_name}/{schema.facts_space}"
+
+    def _resolve_belief_target(target: str) -> Optional[Any]:
+        target = (target or "").strip()
+        if not target:
+            return None
+        slug = slugify(target, hash_on_truncate=True)
+        if slug and slug in fact_anchors_by_slug:            # (a) fact in this call
+            return fact_anchors_by_slug[slug]
+        if slug:                                             # (b) existing fact item
+            try:
+                item = project.get_item(slug, "fact", parent_path=facts_space_path)
+                rev = item.get_latest_revision()
+                if rev is not None:
+                    return rev
+            except Exception:  # noqa: BLE001 — not an existing fact; fall through
+                pass
+        try:                                                 # (c) a kref uri
+            rev = kumiho.get_revision(target)
+            if rev is not None:
+                return rev
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    agent_superseded_slugs: set = set()  # facts the agent explicitly re-based
+
+    def _write_belief_edges(entries, target_key, edge_type, stat_key, track) -> None:
+        for entry in (entries or [])[: schema.max_per_kind]:
+            if not isinstance(entry, dict):
+                continue
+            src_slug = slugify(str(entry.get("statement", "")).strip(), hash_on_truncate=True)
+            src_anchor = fact_anchors_by_slug.get(src_slug) if src_slug else None
+            if src_anchor is None:
+                logger.debug("ontology(agent): %s source not a fact in this call: %r",
+                             edge_type, entry.get("statement"))
+                continue
+            if track:
+                # The agent's explicit declaration wins over the lexical
+                # heuristic for this fact (below), even if the target drops.
+                agent_superseded_slugs.add(src_slug)
+            target_rev = _resolve_belief_target(str(entry.get(target_key, "")))
+            # Self-guard on BOTH identity and kref uri: the kref-path resolver
+            # (c) can return a fresh object for the fact's own revision, which
+            # `is` alone would let through as a self-edge.
+            src_uri = getattr(getattr(src_anchor, "kref", None), "uri", "") or ""
+            tgt_uri = getattr(getattr(target_rev, "kref", None), "uri", "") or ""
+            if (target_rev is None or target_rev is src_anchor
+                    or (src_uri and src_uri == tgt_uri)):
+                logger.debug("ontology(agent): %s target unresolved/self: %r",
+                             edge_type, entry.get(target_key))
+                continue
+            md = {"basis": "agent"}
+            reason = str(entry.get("reason", "")).strip()
+            if reason:
+                md["reason"] = reason
+            # CONTRADICTS is symmetric in meaning but stored as ONE directed
+            # edge (source -> target), like SUPERSEDES — never both directions.
+            if m.edge(src_anchor, target_rev, edge_type, md):
+                stats[stat_key] += 1
+                stats["edges"] += 1
+                # Grounding-staleness ripple (#95): an agent-declared SUPERSEDES
+                # landed on the prior fact (target_rev) — flag the decisions
+                # grounded in it. Only for SUPERSEDES, never CONTRADICTS (a
+                # contested fact isn't a superseded grounding). Best-effort +
+                # bounded; mirrors the heuristic path in relations.link_supersedes.
+                if edge_type == "SUPERSEDES":
+                    from .grounding import ripple_grounding_stale
+                    ripple_grounding_stale(
+                        target_rev,
+                        getattr(getattr(src_anchor, "kref", None), "uri", ""),
+                    )
+
+    _write_belief_edges(decomposition.get("supersedes"), "replaces",
+                        "SUPERSEDES", "supersedes", track=True)
+    _write_belief_edges(decomposition.get("contradicts"), "conflicts_with",
+                        "CONTRADICTS", "contradicts", track=False)
+
+    # --- Lexical SUPERSEDES fallback (basis: lexical-overlap) ---
+    # Runs only for facts the agent did NOT explicitly re-base; the agent's own
+    # declaration wins for the rest, avoiding duplicate/conflicting belief edges.
+    # Mirrors the summarizer path's fallback.
+    from .relations import link_supersedes
+
+    for anchor, slug, statement in fact_call_entries:
+        if slug in agent_superseded_slugs:
+            continue
+        stats["edges"] += link_supersedes(
+            m, "fact", schema.facts_space, slug, anchor, statement, project_name,
+        )
 
     return stats
 

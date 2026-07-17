@@ -1536,6 +1536,8 @@ def tool_memory_decompose(args: Dict[str, Any]) -> Dict[str, Any]:
             entities=args.get("entities") or [],
             facts=args.get("facts") or [],
             relations=args.get("relations") or [],
+            supersedes=args.get("supersedes") or [],
+            contradicts=args.get("contradicts") or [],
         )
     )
 
@@ -1749,7 +1751,11 @@ _ONTOLOGY_TOOLS: List[Dict[str, Any]] = [
             "kumiho_memory_consolidate / kumiho_memory_reflect. Pass the entities "
             "(reusable named hubs), facts (claims, each ABOUT some entities), and "
             "entity->entity relations you distilled from the memory's SUMMARY — "
-            "not the raw transcript. Keep it lean (a handful of each)."
+            "not the raw transcript. Keep it lean (a handful of each). Optionally "
+            "declare belief changes you observed: `supersedes` (a new fact "
+            "replaces a prior one) and `contradicts` (a fact conflicts with "
+            "another) — each names a fact from THIS call and its target (a prior "
+            "fact's statement or its kref); unresolvable targets are dropped."
         ),
         "inputSchema": {
             "type": "object",
@@ -1795,6 +1801,32 @@ _ONTOLOGY_TOOLS: List[Dict[str, Any]] = [
                             "object": {"type": "string", "description": "Target entity name."},
                         },
                         "required": ["subject", "predicate", "object"],
+                    },
+                },
+                "supersedes": {
+                    "type": "array",
+                    "description": "Belief updates: a new fact in this call replaces a prior fact.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "statement": {"type": "string", "description": "A fact statement from THIS call (the new belief)."},
+                            "replaces": {"type": "string", "description": "The prior fact's statement text OR its kref uri."},
+                            "reason": {"type": "string", "description": "Optional why."},
+                        },
+                        "required": ["statement", "replaces"],
+                    },
+                },
+                "contradicts": {
+                    "type": "array",
+                    "description": "Conflicts: a fact in this call contradicts another fact.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "statement": {"type": "string", "description": "A fact statement from THIS call."},
+                            "conflicts_with": {"type": "string", "description": "The conflicting fact's statement text OR its kref uri."},
+                            "reason": {"type": "string", "description": "Optional why."},
+                        },
+                        "required": ["statement", "conflicts_with"],
                     },
                 },
             },

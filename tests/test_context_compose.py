@@ -235,3 +235,83 @@ def test_fact_budget_kwarg_mirrors_config():
     blocks = out.split("\n\n")
     assert len(blocks) == 8                           # 5 base + all 3 facts
     assert blocks[5:] == [f"fact{i}: claim{i}" for i in range(3)]
+
+
+# ---------------------------------------------------------------------------
+# Contested marker (CONTRADICTS edges, threaded from graph_augmentation)
+# ---------------------------------------------------------------------------
+
+def test_contested_memory_gets_disputed_note():
+    contested = _mem("c", "X is true", score=0.5)
+    contested["contested_by"] = ["kref://other"]
+    out = compose_context([contested])
+    assert out == "c: X is true\n[contested: disputed by 1 other stored memory]"
+
+
+def test_contested_note_pluralizes_and_is_bounded_by_marker():
+    contested = _mem("c", "X is true", score=0.5)
+    contested["contested_by"] = ["kref://a", "kref://b"]
+    out = compose_context([contested])
+    assert "[contested: disputed by 2 other stored memories]" in out
+
+
+def test_no_contested_note_without_marker():
+    # Regression: an ordinary memory renders exactly as before — the note is
+    # strictly additive.
+    out = compose_context([_mem("c", "X is true", score=0.5)])
+    assert out == "c: X is true"
+    assert "contested" not in out
+
+
+def test_contested_note_in_full_mode():
+    contested = _mem("c", "sum", score=0.5, content="the raw content")
+    contested["contested_by"] = ["kref://other"]
+    out = compose_context([contested], mode="full")
+    assert out.startswith("the raw content")
+    assert "[contested: disputed by 1 other stored memory]" in out
+
+
+def test_contested_note_survives_sibling_branch():
+    # A STACKED contested memory (sibling_revisions present) must not lose its
+    # note: the item-level marker rides onto the rendered sibling blocks.
+    contested = _mem("c", "X is true", score=0.5,
+                     siblings=[_sib("c-r2", "X is true (rev 2)", score=0.9)])
+    contested["contested_by"] = ["kref://other"]
+    out = compose_context([contested])
+    assert "c-r2: X is true (rev 2)" in out
+    assert "[contested: disputed by 1 other stored memory]" in out
+
+
+def test_grounding_note_survives_sibling_branch():
+    stale = _mem("d", "keep Upstash", score=0.5,
+                 siblings=[_sib("d-r2", "keep Upstash (rev 2)", score=0.9)])
+    stale["grounding_stale"] = True
+    out = compose_context([stale])
+    assert "d-r2: keep Upstash (rev 2)" in out
+    assert "[grounding stale: a fact this was based on was superseded]" in out
+
+
+# ---------------------------------------------------------------------------
+# Grounding-staleness note (#95) — additive, mirrors the contested note
+# ---------------------------------------------------------------------------
+
+def test_grounding_stale_memory_gets_note():
+    stale = _mem("d", "keep Upstash", score=0.5)
+    stale["grounding_stale"] = True
+    out = compose_context([stale])
+    assert out == "d: keep Upstash\n[grounding stale: a fact this was based on was superseded]"
+
+
+def test_no_grounding_note_without_flag():
+    # Strictly additive: an ordinary memory renders exactly as before.
+    out = compose_context([_mem("d", "keep Upstash", score=0.5)])
+    assert out == "d: keep Upstash"
+    assert "grounding stale" not in out
+
+
+def test_grounding_note_in_full_mode():
+    stale = _mem("d", "sum", score=0.5, content="the raw decision")
+    stale["grounding_stale"] = True
+    out = compose_context([stale], mode="full")
+    assert out.startswith("the raw decision")
+    assert "[grounding stale: a fact this was based on was superseded]" in out

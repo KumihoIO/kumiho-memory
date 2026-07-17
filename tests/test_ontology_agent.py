@@ -6,7 +6,11 @@ typed nodes, ABOUT/DERIVED_FROM/relation edges, idempotency, and structural
 validation. The live end-to-end proof is scripts/dogfood_ontology_agent.py.
 """
 import asyncio
+import sys
 import time
+import types
+
+from kumiho._text import slugify
 
 from kumiho_memory import ontology
 from kumiho_memory.ontology import (
@@ -74,6 +78,10 @@ def _patch(monkeypatch, conv_rev):
     proj = _FakeProject("proj")
     monkeypatch.setattr(kumiho, "get_project", lambda name: proj, raising=False)
     monkeypatch.setattr(kumiho, "get_revision", lambda kref: conv_rev, raising=False)
+    # The lexical SUPERSEDES fallback calls kumiho.search; stub it to [] so these
+    # (no-supersedes) fixtures don't reach a real backend. Belief-path tests below
+    # install a full fake kumiho module with their own search/get_revision.
+    monkeypatch.setattr(kumiho, "search", lambda *a, **k: [], raising=False)
     return proj
 
 
@@ -231,4 +239,189 @@ def test_relates_to_relations_are_idempotent(monkeypatch):
     second = _sync_decompose_agent(kref, _DECOMP_PREDICATES, "proj", OntologySchema())
     # folded + fallback edges dedupe on re-decompose exactly like canonical ones.
     assert second["relations"] == 0
+    assert second["edges"] == 0
+
+
+# --- Agent-declared belief change: SUPERSEDES / CONTRADICTS -----------------
+#
+# Uses the sys.modules fake-SDK seam (setitem, never pop) so the belief-target
+# resolver's kumiho.get_revision / kumiho.search and the fact-space get_item are
+# all under test control.
+
+_CONV_URI = "kref:/proj/conversations/c.conversation?r=1"
+
+
+def _install_module(monkeypatch, conv_rev, proj=None, search_results=None, revs=None):
+    proj = proj or _FakeProject("proj")
+    known = {conv_rev.kref.uri: conv_rev}
+    known.update(revs or {})
+    fake = types.ModuleType("kumiho")
+    fake.get_project = lambda name: proj
+    fake.get_revision = lambda kref: known[kref]  # KeyError when unknown -> dropped
+    fake.search = lambda *a, **k: (search_results or [])
+    monkeypatch.setitem(sys.modules, "kumiho", fake)
+    return proj
+
+
+def _fact_rev(proj, statement):
+    return proj._items[("/proj/facts", slugify(statement, hash_on_truncate=True))]._rev
+
+
+def _edges_of(rev, edge_type):
+    return [(et, turi, md) for (et, turi, md) in rev.edge_meta if et == edge_type]
+
+
+def test_agent_supersedes_and_contradicts_land_with_basis_agent(monkeypatch):
+    conv = _FakeRev(_CONV_URI)
+    proj = _install_module(monkeypatch, conv)
+    decomp = {
+        "facts": [
+            {"statement": "Use Upstash for the event bus"},   # prior belief (in-call)
+            {"statement": "Use Redis for the event bus"},      # new belief
+            {"statement": "Cache TTL is 30 seconds"},
+        ],
+        "supersedes": [
+            {"statement": "Use Redis for the event bus",
+             "replaces": "Use Upstash for the event bus", "reason": "cost"},
+        ],
+        "contradicts": [
+            {"statement": "Cache TTL is 30 seconds",
+             "conflicts_with": "Use Upstash for the event bus"},
+        ],
+    }
+    stats = _sync_decompose_agent(_CONV_URI, decomp, "proj", OntologySchema())
+
+    assert stats["supersedes"] == 1
+    assert stats["contradicts"] == 1
+
+    prior_uri = _fact_rev(proj, "Use Upstash for the event bus").kref.uri
+
+    sup = _edges_of(_fact_rev(proj, "Use Redis for the event bus"), "SUPERSEDES")
+    assert len(sup) == 1
+    assert sup[0][1] == prior_uri
+    assert sup[0][2] == {"basis": "agent", "reason": "cost"}
+
+    con = _edges_of(_fact_rev(proj, "Cache TTL is 30 seconds"), "CONTRADICTS")
+    assert len(con) == 1
+    assert con[0][1] == prior_uri
+    assert con[0][2] == {"basis": "agent"}          # no reason carried -> not stored
+
+
+def test_belief_target_unresolvable_is_dropped(monkeypatch):
+    conv = _FakeRev(_CONV_URI)
+    proj = _install_module(monkeypatch, conv)
+    decomp = {
+        "facts": [{"statement": "New fact A"}],
+        "supersedes": [{"statement": "New fact A", "replaces": "some unknown prior"}],
+    }
+    stats = _sync_decompose_agent(_CONV_URI, decomp, "proj", OntologySchema())
+    assert stats["supersedes"] == 0
+    # Dropped, never mislinked: the source fact carries no SUPERSEDES edge at all
+    # (agent declared it, so the lexical heuristic is skipped for it too).
+    assert _edges_of(_fact_rev(proj, "New fact A"), "SUPERSEDES") == []
+
+
+def test_belief_target_own_kref_is_dropped(monkeypatch):
+    # Hardening: a kref-path (c) resolution of the fact's OWN revision returns a
+    # FRESH object (`is` identity fails), so the self-guard must also compare
+    # kref uris — a self-SUPERSEDES edge must never land.
+    conv = _FakeRev(_CONV_URI)
+    self_slug = slugify("New belief X", hash_on_truncate=True)
+    self_kref = f"kref://proj/facts/{self_slug}.fact?r=1"
+    alias_rev = _FakeRev(self_kref)   # distinct object, same uri as the anchor
+    proj = _install_module(monkeypatch, conv, revs={self_kref: alias_rev})
+    decomp = {
+        "facts": [{"statement": "New belief X"}],
+        "supersedes": [{"statement": "New belief X", "replaces": self_kref}],
+    }
+    stats = _sync_decompose_agent(_CONV_URI, decomp, "proj", OntologySchema())
+    assert stats["supersedes"] == 0
+    assert _edges_of(_fact_rev(proj, "New belief X"), "SUPERSEDES") == []
+    assert alias_rev.edge_meta == []
+
+
+def test_belief_target_kref_path(monkeypatch):
+    conv = _FakeRev(_CONV_URI)
+    prior_kref = "kref:/proj/facts/prior-belief.fact?r=7"
+    prior_rev = _FakeRev(prior_kref)
+    proj = _install_module(monkeypatch, conv, revs={prior_kref: prior_rev})
+    decomp = {
+        "facts": [{"statement": "New belief X"}],
+        "supersedes": [{"statement": "New belief X", "replaces": prior_kref}],
+    }
+    stats = _sync_decompose_agent(_CONV_URI, decomp, "proj", OntologySchema())
+    assert stats["supersedes"] == 1
+    sup = _edges_of(_fact_rev(proj, "New belief X"), "SUPERSEDES")
+    assert len(sup) == 1
+    assert sup[0][1] == prior_kref
+    assert sup[0][2] == {"basis": "agent"}
+
+
+def test_belief_target_existing_item_path(monkeypatch):
+    conv = _FakeRev(_CONV_URI)
+    proj = _FakeProject("proj")
+    # An existing fact item from a PRIOR call (get, don't create).
+    prior_slug = slugify("Prior belief P", hash_on_truncate=True)
+    prior_item = proj.create_item(prior_slug, "fact", parent_path="/proj/facts")
+    prior_item.create_revision({"claim": "Prior belief P"})   # marks it materialized
+    _install_module(monkeypatch, conv, proj=proj)
+    decomp = {
+        "facts": [{"statement": "New belief Q"}],
+        "supersedes": [{"statement": "New belief Q", "replaces": "Prior belief P"}],
+    }
+    stats = _sync_decompose_agent(_CONV_URI, decomp, "proj", OntologySchema())
+    assert stats["supersedes"] == 1
+    sup = _edges_of(_fact_rev(proj, "New belief Q"), "SUPERSEDES")
+    assert len(sup) == 1
+    assert sup[0][1] == prior_item._rev.kref.uri
+    assert sup[0][2] == {"basis": "agent"}
+
+
+def test_heuristic_supersedes_skipped_when_agent_declared(monkeypatch):
+    import kumiho_memory.relations as relations
+    called_slugs = []
+
+    def _spy(m, kind, space, self_slug, anchor, text, project_name, edge_type="SUPERSEDES"):
+        called_slugs.append(self_slug)
+        return 0
+
+    monkeypatch.setattr(relations, "link_supersedes", _spy)
+    conv = _FakeRev(_CONV_URI)
+    _install_module(monkeypatch, conv)
+    decomp = {
+        "facts": [
+            {"statement": "Use Redis for the bus"},
+            {"statement": "Cache TTL is 60s"},
+        ],
+        # Target unresolvable, but the fact is still *declared* by the agent, so
+        # the lexical fallback must be skipped for it (agent's declaration wins).
+        "supersedes": [{"statement": "Use Redis for the bus", "replaces": "unknown prior"}],
+    }
+    _sync_decompose_agent(_CONV_URI, decomp, "proj", OntologySchema())
+
+    assert slugify("Use Redis for the bus", hash_on_truncate=True) not in called_slugs
+    assert slugify("Cache TTL is 60s", hash_on_truncate=True) in called_slugs
+
+
+def test_agent_belief_edges_idempotent_rerun(monkeypatch):
+    conv = _FakeRev(_CONV_URI)
+    _install_module(monkeypatch, conv)
+    decomp = {
+        "facts": [
+            {"statement": "Use Upstash for the event bus"},
+            {"statement": "Use Redis for the event bus"},
+        ],
+        "supersedes": [
+            {"statement": "Use Redis for the event bus",
+             "replaces": "Use Upstash for the event bus"},
+        ],
+        "contradicts": [
+            {"statement": "Use Upstash for the event bus",
+             "conflicts_with": "Use Redis for the event bus"},
+        ],
+    }
+    _sync_decompose_agent(_CONV_URI, decomp, "proj", OntologySchema())
+    second = _sync_decompose_agent(_CONV_URI, decomp, "proj", OntologySchema())
+    assert second["supersedes"] == 0
+    assert second["contradicts"] == 0
     assert second["edges"] == 0

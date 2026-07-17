@@ -294,6 +294,11 @@ class EvidencePolicy:
         When ``True``, corroborating revision krefs are returned on the
         assess result so the manager creates ``SUPPORTS`` edges after the
         store completes.
+    create_contradicts_edges:
+        Kill-switch for the ``CONTRADICTS`` edge bridge (default ``True`` —
+        it is the feature). When ``False`` the manager skips the edge
+        bridge; the ``conflicts_with`` metadata is untouched either way
+        (it predates the bridge and stays the canonical conflict record).
     storage_policy:
         WHAT-to-store instruction block (same contract as
         :func:`create_llm_assessor`).
@@ -304,6 +309,7 @@ class EvidencePolicy:
     min_corroboration: int = 2
     official_tags: FrozenSet[str] = frozenset({"evidence:official"})
     create_supports_edges: bool = False
+    create_contradicts_edges: bool = True
     storage_policy: str = DEFAULT_STORAGE_POLICY
     duplicate_score_threshold: float = _DUPLICATE_SCORE_THRESHOLD
 
@@ -549,7 +555,11 @@ def create_evidence_assessor(
                 supporting_krefs=(
                     grade["supporting_krefs"] if policy.create_supports_edges else []
                 ),
+                # conflicting_krefs is NOT gated here — it also feeds the
+                # conflicts_with metadata, which the edge kill-switch must not
+                # touch. The bridge gate rides separately on the result.
                 conflicting_krefs=grade["conflicting_krefs"],
+                create_contradicts_edges=policy.create_contradicts_edges,
             )
             logger.debug(
                 "evidence_assess: should_store=%s level=%s pinned=%s reason=%s",

@@ -162,11 +162,23 @@ def test_build_spec_covers_node_kinds_and_edges():
     assert spec["node_kinds"]["fact"]["space"] == OntologySchema().facts_space
 
     edges = spec["edge_types"]
-    for name in ("DERIVED_FROM", "ABOUT", "INVOLVES", "DEPENDS_ON", "SUPERSEDES"):
+    for name in ("DERIVED_FROM", "ABOUT", "INVOLVES", "DEPENDS_ON",
+                 "SUPERSEDES", "CONTRADICTS"):
         assert name in edges
-    # SUPERSEDES carries its current heuristic basis + newest-wins direction.
+    # SUPERSEDES documents the dual basis convention (agent-declared preferred,
+    # lexical fallback with its threshold) + newest-wins direction.
+    assert "agent" in edges["SUPERSEDES"]["basis"]
+    assert "lexical-overlap" in edges["SUPERSEDES"]["basis"]
     assert "0.6" in edges["SUPERSEDES"]["basis"]
     assert "newest-wins" in edges["SUPERSEDES"]["direction"]
+    # CONTRADICTS documents both dispute bases and the predicate-registry
+    # exclusion (entity relation edges are not disputes).
+    assert "agent" in edges["CONTRADICTS"]["basis"]
+    assert "evidence-assessor" in edges["CONTRADICTS"]["basis"]
+    assert "predicate" in edges["CONTRADICTS"]["basis"]
+    # DEPENDS_ON documents the grounding-staleness ripple convention.
+    assert "grounding_stale" in edges["DEPENDS_ON"]["grounding_staleness"]
+    assert "grounding:stale" in edges["DEPENDS_ON"]["grounding_staleness"]
 
 
 def test_build_spec_embeds_trust_mapping():
@@ -174,9 +186,15 @@ def test_build_spec_embeds_trust_mapping():
     assert spec["trust_vocabulary"] == mapping_as_dict()
 
 
+def test_default_schema_version_is_v2():
+    # Phase 2 (SUPERSEDES dual-basis, CONTRADICTS, grounding staleness) bumped
+    # the contract: re-seeding must mint a new tagged revision.
+    assert OntologySchema().version == "kumiho.agent_memory.ontology.v2"
+
+
 def test_build_spec_honors_schema_version():
-    spec = build_spec(OntologySchema(version="kumiho.agent_memory.ontology.v2"))
-    assert spec["spec_version"] == "kumiho.agent_memory.ontology.v2"
+    spec = build_spec(OntologySchema(version="kumiho.agent_memory.ontology.v3"))
+    assert spec["spec_version"] == "kumiho.agent_memory.ontology.v3"
 
 
 # ---------------------------------------------------------------------------
@@ -221,13 +239,13 @@ def test_reseed_same_version_is_noop(monkeypatch):
 
 
 def test_version_bump_creates_new_revision_and_retags(monkeypatch):
+    # A v1-seeded deployment re-seeded at the CURRENT default (v2) exercises
+    # the designed bump path: new revision on the same item, tag moves.
     project = FakeProject()
     _install_fake_kumiho(monkeypatch, project)
 
     seed_ontology_spec(schema=OntologySchema(version="kumiho.agent_memory.ontology.v1"))
-    bumped = seed_ontology_spec(
-        schema=OntologySchema(version="kumiho.agent_memory.ontology.v2"),
-    )
+    bumped = seed_ontology_spec()
 
     assert bumped is not None
     assert bumped.created_item is False
@@ -237,7 +255,7 @@ def test_version_bump_creates_new_revision_and_retags(monkeypatch):
     assert len(item.revisions) == 2
     tagged = item.get_revision_by_tag(SPEC_TAG)
     assert tagged is item.revisions[1]  # tag moved to the new revision
-    assert tagged.metadata["spec_version"] == "kumiho.agent_memory.ontology.v2"
+    assert tagged.metadata["spec_version"] == OntologySchema().version
     assert SPEC_TAG not in item.revisions[0].tags  # moved off the old one
 
 
