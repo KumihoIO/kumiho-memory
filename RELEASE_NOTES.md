@@ -1,5 +1,37 @@
 # Release Notes — kumiho-memory
 
+## v0.18.0
+
+**Release Date:** 2026-07-17
+
+**Ontology Phase 1 — the typed graph gains an explicit semantic contract**
+(epic #86, PR #91). Grounded in Gruber's ontology design principles; full
+analysis in `docs/ONTOLOGY_PRINCIPLES_GAP.md`.
+
+- **Canonical relation predicate registry** — agent-supplied relation
+  predicates fold onto 10 canonical edge types (`DEPENDS_ON`, `USES`,
+  `IMPLEMENTS`, `PART_OF`, `SUPERSEDES`, `SUPPORTS`, `CAUSES`,
+  `CONTRADICTS`, `CONTAINS`, `RELATES_TO`); synonyms converge
+  (`utilizes → USES`) and unregistered or unnormalizable predicates
+  (incl. CJK) become `RELATES_TO` with the verbatim predicate preserved
+  in edge metadata. Relations are never silently dropped.
+- **Fetchable ontology spec** — node-kind definitions, edge semantics,
+  the predicate registry, and the trust mapping persist as a versioned
+  policy Item (`ontology/spec.policy`, tag `ontology.spec`), seeded at
+  skill ingestion. Any agent can fetch it via `kumiho_get_revision_by_tag`
+  and commit to the same semantics.
+- **Trust-vocabulary mapping** — one documented correspondence across
+  `certainty` / `confidence` (self-reported strength) and
+  `evidence_level` (provenance grade) in `trust_vocab.py`; bands are
+  tie-breakers and never lift provenance.
+- **Relation traversal at recall (opt-in)** — with
+  `KUMIHO_MEMORY_RELATION_TRAVERSAL=1`, the entity-mediated reader
+  follows registered relation edges to neighbor entities' memories with
+  full hop provenance and hard fan-out caps. Measured on the dedicated
+  A/B bench (kumiho-benchmarks `relation_ab/`): relation-linked golds
+  0/8 → 8/8 at latency parity. Ships **off** by default pending the
+  paired LoCoMo F1 + LoCoMo-Plus gate.
+
 ## v0.17.4
 
 **Release Date:** 2026-07-16
