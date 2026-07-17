@@ -82,6 +82,36 @@ class GraphAugmentationConfig:
     #: Cap slots reserved for the (score-less) 2-hop siblings when the merged
     #: result set overflows, so the walk's payload isn't always trimmed first.
     entity_recall_reserve: int = 3
+    #: Registered entity->entity relation-edge traversal (ontology G1 read
+    #: side). The typed relation edges decompose writes between entity anchors
+    #: (USES, DEPENDS_ON, PART_OF, ..., canonicalized by predicate_registry)
+    #: are read by NO recall path today; when this is on, the entity-mediated
+    #: reader is EXTENDED by one hop across them to reach a NEIGHBOUR entity's
+    #: memories:  seed --ABOUT--> anchor --<relation>--> neighbour anchor
+    #: <--ABOUT-- that neighbour's memories. Reader and writer thus share one
+    #: vocabulary (the registry's canonical set) instead of only syntax
+    #: (Gruber's G1). DEFAULT OFF pending pair-measured benchmarks: the extra
+    #: hop adds one get_edges round-trip per distinct neighbour anchor, bounded
+    #: by the relation_traversal_* caps below. Only fires with ``entity_recall``
+    #: (it extends that pass); the manager sets the default from
+    #: KUMIHO_MEMORY_RELATION_TRAVERSAL=1. Deliberately NOT added to the generic
+    #: single-hop ``edge_types`` whitelist — that would hop the content-free
+    #: anchor itself (the documented ABOUT dead-end).
+    relation_traversal: bool = False
+    #: Max relation edges crossed from each origin anchor. RELATES_TO (the
+    #: unregistered-predicate fallback bucket, lowest semantic signal) is
+    #: followed only after the specific relations, so under this cap the
+    #: discriminative edges win the per-anchor budget.
+    relation_traversal_max_edges_per_anchor: int = 3
+    #: Global cap on distinct neighbour anchors expanded per recall — each is an
+    #: extra get_edges round-trip, so this bounds the added latency.
+    relation_traversal_max_neighbors: int = 4
+    #: Global cap on neighbour memories pulled in via this path per recall. They
+    #: ride the score-less sibling reserve (``entity_recall_reserve``), never
+    #: evicting or outranking a direct hit, so this bounds the walk's work, not
+    #: the final surfaced count. The ubiquitous-neighbour guard reuses
+    #: ``entity_bridge_hub_degree_max``.
+    relation_traversal_max_results: int = 4
     #: Entity-bridge join (multi-hop): when two or more reformulated angles
     #: have hits ABOUT the same entity, that entity is a *bridge* and its
     #: fact/event nodes are surfaced with a REAL inherited score
@@ -1278,6 +1308,16 @@ class GraphAugmentedRecall:
         context is enriched with sibling *memories*, never empty stubs. That
         is the crucial difference from putting ``ABOUT`` in the generic
         single-hop set, which would surface the anchor itself.
+
+        When ``relation_traversal`` is on this pass is EXTENDED by one more
+        hop across the typed entity→entity relation edges decompose writes
+        (USES, DEPENDS_ON, ..., canonicalized by ``predicate_registry``):
+        ``seed → anchor → <relation> → neighbour anchor → that neighbour's
+        memories``. The relation edges are read from the SAME canonical set the
+        writer folds onto, closing the G1 writer/reader vocabulary split.
+        Performance: this adds one ``get_edges`` round-trip per distinct
+        neighbour anchor — the ``relation_traversal_*`` caps bound the fan-out,
+        which is why the flag defaults OFF pending pair-measured benchmarks.
         """
         try:
             import kumiho
@@ -1290,10 +1330,40 @@ class GraphAugmentedRecall:
         max_anchor_fetches = self.config.entity_recall_max_anchor_fetches
         results: List[Dict[str, Any]] = []
 
+        # Relation-edge traversal (ontology G1 read side), default OFF. Import
+        # the registry lazily and only when the flag is on — mirrors this
+        # module's import-at-use idiom and keeps the predicate_registry→ontology
+        # chain off the default hot path.
+        relation_on = getattr(self.config, "relation_traversal", False)
+        canonical_set: frozenset = frozenset()
+        relates_to = ""
+        if relation_on:
+            from kumiho_memory.predicate_registry import (
+                RELATES_TO as relates_to,
+                canonical_types,
+            )
+            canonical_set = frozenset(canonical_types())
+        rel_max_edges = self.config.relation_traversal_max_edges_per_anchor
+        rel_max_neighbors = self.config.relation_traversal_max_neighbors
+        rel_max_results = self.config.relation_traversal_max_results
+        hub_max = self.config.entity_bridge_hub_degree_max
+
+        def _kind(kref: str) -> str:
+            head = kref.split("?", 1)[0]
+            return head.rsplit(".", 1)[-1] if "." in head else ""
+
+        # Terse atomic claims first (mirrors the bridge join); whole
+        # conversations are the fallback when pulling a neighbour's memories.
+        kind_priority = {"fact": 0, "event": 1, "decision": 2}
+
         def _sync_entity_walk() -> int:
             found = 0
             visited_anchors: set = set()  # a shared hub is expanded once, not per seed
             anchor_fetches = 0            # global fan-out budget across all seeds
+            # (relation_type, neighbour_uri, origin_anchor, seed_kref) noted
+            # during the direct scan; expanded in a second phase so every direct
+            # sibling is already claimed (direct provenance wins on overlap).
+            relation_candidates: List[Tuple[str, str, str, str]] = []
             for kref_str in seed_krefs:
                 if not kref_str:
                     continue
@@ -1325,11 +1395,27 @@ class GraphAugmentedRecall:
                     try:
                         anchor_rev = kumiho.get_revision(anchor_uri)
                         siblings = 0
+                        rel_here: List[Tuple[str, str]] = []
                         for edge in anchor_rev.get_edges(direction=kumiho.BOTH):
+                            etype = edge.edge_type
+                            # Relation traversal: note the entity->entity relation
+                            # edges from this anchor (either direction) for the
+                            # neighbour-expansion phase. Flag off ⇒ this block is
+                            # never entered and the walk is byte-identical.
+                            if relation_on and etype in canonical_set:
+                                if edge.source_kref.uri == anchor_uri:
+                                    neighbour = edge.target_kref.uri
+                                elif edge.target_kref.uri == anchor_uri:
+                                    neighbour = edge.source_kref.uri
+                                else:
+                                    neighbour = ""
+                                if neighbour and neighbour != anchor_uri:
+                                    rel_here.append((etype, neighbour))
+                                continue
                             # Reach siblings via ABOUT (memories, facts, decisions,
                             # actions) AND INVOLVES (event nodes, which carry the
                             # distilled event_date) — both point *into* the anchor.
-                            if edge.edge_type not in ("ABOUT", "INVOLVES"):
+                            if etype not in ("ABOUT", "INVOLVES"):
                                 continue
                             if edge.target_kref.uri != anchor_uri:
                                 continue  # only incoming node -> anchor
@@ -1365,8 +1451,119 @@ class GraphAugmentedRecall:
                                 logger.debug("entity recall: sibling %s failed: %s", sib_uri, exc)
                             if siblings >= max_siblings:
                                 break
+                        # Queue this anchor's relation neighbours. RELATES_TO is
+                        # the fallback bucket for unregistered predicates —
+                        # lowest priority, so the specific relations win the
+                        # per-anchor budget under the cap.
+                        if relation_on and rel_here:
+                            specific = [c for c in rel_here if c[0] != relates_to]
+                            fallback = [c for c in rel_here if c[0] == relates_to]
+                            for etype_c, neighbour_c in (
+                                specific + fallback
+                            )[:rel_max_edges]:
+                                relation_candidates.append(
+                                    (etype_c, neighbour_c, anchor_uri, kref_str),
+                                )
                     except Exception as exc:
                         logger.debug("entity recall: anchor %s failed: %s", anchor_uri, exc)
+
+            # --- Relation-neighbour expansion (relation_traversal only) ---
+            # Second phase, after all direct siblings are claimed: a memory
+            # reachable BOTH directly and via a relation edge keeps its direct
+            # (hop-2) provenance because the dedup below skips already-seen
+            # krefs. Each neighbour anchor is one extra get_edges round-trip;
+            # the caps bound the fan-out.
+            if relation_on and relation_candidates:
+                rel_found = 0
+                neighbours_expanded = 0
+                for (relation_type, neighbour_uri,
+                     origin_anchor, seed_kref) in relation_candidates:
+                    if rel_found >= rel_max_results:
+                        break
+                    if neighbours_expanded >= rel_max_neighbors:
+                        break
+                    if not neighbour_uri or neighbour_uri in visited_anchors:
+                        continue  # already a direct anchor / already expanded
+                    # Relation edges join entity anchors; a canonical-typed edge
+                    # to a non-entity would be a stray edge whose single hop
+                    # dead-ends — require an entity neighbour.
+                    if _kind(neighbour_uri) != "entity":
+                        continue
+                    visited_anchors.add(neighbour_uri)
+                    neighbours_expanded += 1
+                    try:
+                        neighbour_rev = kumiho.get_revision(neighbour_uri)
+                    except Exception as exc:
+                        logger.debug(
+                            "relation recall: neighbour %s failed: %s",
+                            neighbour_uri, exc,
+                        )
+                        continue
+                    # One pass over the neighbour's edges: collect its incoming
+                    # ABOUT/INVOLVES memories AND count them for the
+                    # ubiquitous-entity guard (a hub neighbour's memories are
+                    # generic noise — same rationale as the bridge join's hub
+                    # cutoff, reusing entity_bridge_hub_degree_max).
+                    incoming = 0
+                    cands: List[Tuple[int, str, str]] = []
+                    try:
+                        for edge in neighbour_rev.get_edges(direction=kumiho.BOTH):
+                            if edge.edge_type not in ("ABOUT", "INVOLVES"):
+                                continue
+                            if edge.target_kref.uri != neighbour_uri:
+                                continue  # only incoming node -> neighbour anchor
+                            incoming += 1
+                            sib_uri = edge.source_kref.uri
+                            if not sib_uri or sib_uri in seen_krefs:
+                                continue
+                            cands.append(
+                                (kind_priority.get(_kind(sib_uri), 3),
+                                 sib_uri, edge.edge_type),
+                            )
+                    except Exception as exc:
+                        logger.debug(
+                            "relation recall: neighbour edges %s failed: %s",
+                            neighbour_uri, exc,
+                        )
+                        continue
+                    if incoming > hub_max:
+                        continue  # ubiquitous neighbour — its memories are generic
+                    cands.sort(key=lambda c: c[0])  # fact/event/decision first
+                    sib_here = 0
+                    for _prio, sib_uri, sib_edge_type in cands:
+                        if rel_found >= rel_max_results or sib_here >= max_siblings:
+                            break
+                        if sib_uri in seen_krefs:
+                            continue
+                        seen_krefs.add(sib_uri)
+                        try:
+                            sib_rev = kumiho.get_revision(sib_uri)
+                        except Exception as exc:
+                            logger.debug(
+                                "relation recall: sibling %s failed: %s",
+                                sib_uri, exc,
+                            )
+                            continue
+                        # Score-less like the direct siblings (never evicts a
+                        # scored hit), plus relation provenance so downstream
+                        # context building can show HOW it was reached: the
+                        # relation crossed and the intermediate entity.
+                        results.append({
+                            "kref": sib_uri,
+                            "title": sib_rev.metadata.get("title", ""),
+                            "summary": sib_rev.metadata.get("summary", ""),
+                            "content": sib_rev.metadata.get("content", ""),
+                            "graph_augmented": True,
+                            "edge_type": sib_edge_type,
+                            "via_entity": neighbour_uri,
+                            "via_relation": relation_type,
+                            "relation_from_entity": origin_anchor,
+                            "from_kref": seed_kref,
+                            "hop": 3,
+                        })
+                        found += 1
+                        rel_found += 1
+                        sib_here += 1
             return found
 
         found = await run_bounded_in_thread(

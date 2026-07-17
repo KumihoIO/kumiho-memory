@@ -268,6 +268,18 @@ class UniversalMemoryManager:
             if os.getenv("KUMIHO_MEMORY_FACT_RECALL", "").strip() != "0":
                 self.graph_augmentation_config.fact_recall = True
 
+        # Registered entity->entity relation-edge traversal (ontology G1 read
+        # side). DEFAULT OFF — opt IN with KUMIHO_MEMORY_RELATION_TRAVERSAL=1;
+        # it adds get_edges round-trips per anchor (bounded by the
+        # relation_traversal_* caps) and awaits pair-measured benchmarks. It
+        # extends the entity-mediated reader, so it only fires when
+        # entity_recall is also on (ontology default).
+        if (
+            self.graph_augmentation_config is not None
+            and os.getenv("KUMIHO_MEMORY_RELATION_TRAVERSAL", "").strip() == "1"
+        ):
+            self.graph_augmentation_config.relation_traversal = True
+
         # Multi-draw reformulation override (angle-union harvesting for
         # oblique triggers). Applies whenever graph augmentation is active.
         draws_env = os.getenv("KUMIHO_MEMORY_REFORMULATE_DRAWS", "").strip()
