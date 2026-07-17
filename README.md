@@ -501,6 +501,16 @@ The scope of this package will remain limited to **client-side concerns**
 
 ---
 
+### Acknowledgments
+
+* **Hugh Kim** (author of *memory-bank*) — for the independent full-module
+  deep-dive review of v0.18.0 (2026-07-17): it cross-validated this package's
+  measurement discipline from the outside, sharpened the read-path roadmap,
+  and drove the security & reliability workstream (#99–#109). The best kind
+  of peer review — adversarial in method, generous in intent.
+
+---
+
 ### License
 
 MIT
