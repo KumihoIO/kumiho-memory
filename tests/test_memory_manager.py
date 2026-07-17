@@ -1290,3 +1290,191 @@ def test_evidence_on_later_message_preserves_session_identity():
             assert meta["source"] == "news:reuters"
 
         asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Backend-error signal (issue #103, P1-1)
+#
+# recall_memories keeps its List return (the established contract — [] on
+# failure), but records a backend-error summary on the manager so callers can
+# distinguish "backend down" from "no memories". The signal is reset per call.
+# ---------------------------------------------------------------------------
+
+
+def _make_manager(memory_retrieve):
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    return UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+        memory_retrieve=memory_retrieve,
+    )
+
+
+def test_recall_records_backend_error_signal_on_failure():
+    """A retrieve backend error is recorded on the manager while recall still
+    returns [] (internal contract unchanged)."""
+    async def error_retrieve(**kwargs):
+        return {"error": "graph backend unavailable: connection refused"}
+
+    manager = _make_manager(error_retrieve)
+
+    async def run():
+        results = await manager.recall_memories("anything")
+        assert results == []
+        assert manager._last_backend_error is not None
+        assert "graph backend unavailable" in manager._last_backend_error
+
+    asyncio.run(run())
+
+
+def test_recall_no_backend_error_signal_on_empty_healthy():
+    """An empty-but-healthy retrieve leaves the signal cleared."""
+    async def empty_retrieve(**kwargs):
+        return {"revision_krefs": []}
+
+    manager = _make_manager(empty_retrieve)
+
+    async def run():
+        results = await manager.recall_memories("nothing here")
+        assert results == []
+        assert manager._last_backend_error is None
+
+    asyncio.run(run())
+
+
+def test_recall_backend_error_signal_cleared_on_next_success():
+    """A failure sets the signal; a subsequent healthy recall clears it (the
+    reset at the top of recall_memories prevents a stale error leaking)."""
+    state = {"fail": True}
+
+    async def flaky_retrieve(**kwargs):
+        if state["fail"]:
+            return {"error": "boom"}
+        return {"revision_krefs": ["kref://memory/ok/1"]}
+
+    manager = _make_manager(flaky_retrieve)
+
+    async def run():
+        await manager.recall_memories("q1")
+        assert manager._last_backend_error is not None
+
+        state["fail"] = False
+        results = await manager.recall_memories("q2")
+        assert len(results) == 1
+        assert manager._last_backend_error is None
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Session-id Redis flake: retry-then-fallback, never silent (issue #103, P1-2)
+# ---------------------------------------------------------------------------
+
+
+class _FlakySessionBuffer:
+    """A redis buffer whose session ops always raise — exercises the
+    retry-then-fallback path (all attempts fail -> WARNING + fallback)."""
+
+    def __init__(self):
+        self.calls = {
+            "get_active_session": 0,
+            "next_session_sequence": 0,
+            "set_active_session": 0,
+        }
+
+    async def get_active_session(self, *, context, user_canonical_id):
+        self.calls["get_active_session"] += 1
+        raise ConnectionError("redis flake: get_active_session")
+
+    async def next_session_sequence(self, *, user_canonical_id, date_str):
+        self.calls["next_session_sequence"] += 1
+        raise ConnectionError("redis flake: next_session_sequence")
+
+    async def set_active_session(self, *, context, user_canonical_id, session_id):
+        self.calls["set_active_session"] += 1
+        raise ConnectionError("redis flake: set_active_session")
+
+    async def close(self):
+        return None
+
+
+class _RecoverOnRetryBuffer:
+    """get_active_session fails once, then succeeds on the retry — exercises
+    the 'retry once before falling back' success path (no warning)."""
+
+    def __init__(self):
+        self.get_calls = 0
+
+    async def get_active_session(self, *, context, user_canonical_id):
+        self.get_calls += 1
+        if self.get_calls == 1:
+            raise ConnectionError("transient flake")
+        return "personal:user-abc:20260101:007"
+
+    async def close(self):
+        return None
+
+
+def test_generate_session_id_retries_then_warns_on_redis_flake(caplog):
+    """A persistent Redis flake must NOT silently fork: each op retries once,
+    then logs at WARNING and falls back to a well-formed session id."""
+    import logging
+
+    buffer = _FlakySessionBuffer()
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="kumiho_memory.memory_manager"):
+        session_id = asyncio.run(
+            manager._generate_session_id("user-canonical-x", "personal")
+        )
+
+    # No-raise guarantee preserved + fallback continuity id is well-formed.
+    assert session_id.startswith("personal:user-")
+    assert session_id.endswith(":001")  # next_session_sequence fell back to 1
+
+    # Each flaky op was attempted twice (initial + one retry) before fallback.
+    assert buffer.calls["get_active_session"] == 2
+    assert buffer.calls["next_session_sequence"] == 2
+    assert buffer.calls["set_active_session"] == 2
+
+    # The fallback is logged loudly, not silent.
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    messages = [r.getMessage() for r in warnings]
+    assert any("_generate_session_id" in m for m in messages)
+    assert any("get_active_session" in m for m in messages)
+
+
+def test_generate_session_id_recovers_on_retry_without_warning(caplog):
+    """When the retry succeeds, the active session is reused and NO warning is
+    logged for that op — the retry-before-fallback path works."""
+    import logging
+
+    buffer = _RecoverOnRetryBuffer()
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="kumiho_memory.memory_manager"):
+        session_id = asyncio.run(
+            manager._generate_session_id("user-x", "personal")
+        )
+
+    # Reused the active session returned by the successful retry.
+    assert session_id == "personal:user-abc:20260101:007"
+    assert buffer.get_calls == 2  # failed once, retried, succeeded
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert not any(
+        "get_active_session" in r.getMessage() for r in warnings
+    )

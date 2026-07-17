@@ -34,14 +34,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _manager: Optional[Any] = None
+_manager_lock = threading.Lock()
 
 
 def _get_manager():
-    """Lazily create and return a shared ``UniversalMemoryManager``."""
+    """Lazily create and return a shared ``UniversalMemoryManager``.
+
+    Double-checked locking makes first-time initialization race-free: the
+    first concurrent callers (parallel ``asyncio.to_thread`` dispatch) can
+    otherwise each observe ``_manager is None`` and double-create the manager
+    / Redis client. Construction stays lazy — the lock is only contended on
+    the very first call and is free thereafter.
+    """
     global _manager
     if _manager is not None:
         return _manager
+    with _manager_lock:
+        if _manager is not None:
+            return _manager
+        _manager = _build_manager()
+        return _manager
 
+
+def _build_manager():
+    """Construct a fresh ``UniversalMemoryManager`` from environment config.
+
+    Called exactly once, under ``_manager_lock`` via ``_get_manager``.
+    """
     from kumiho_memory import (
         RedisMemoryBuffer,
         UniversalMemoryManager,
@@ -208,7 +227,7 @@ def _get_manager():
         logger.warning("Post-recall rerank setup failed: %s", exc)
 
     buffer = RedisMemoryBuffer()
-    _manager = UniversalMemoryManager(
+    manager = UniversalMemoryManager(
         redis_buffer=buffer,
         summarizer=summarizer,
         pii_redactor=PIIRedactor(),
@@ -220,7 +239,7 @@ def _get_manager():
         rerank=rerank_config,
         reranker=reranker,
     )
-    return _manager
+    return manager
 
 
 def _min_score_from_args(args: Dict[str, Any]) -> Optional[float]:
@@ -421,6 +440,11 @@ def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
         )
         results = _filter_by_min_score(results, _min_score_from_args(args))
         result = {"results": results, "count": len(results), "recall_mode": recall_mode}
+        # Additive: surface a backend failure so an empty result isn't read as
+        # "no memories" when the graph/retrieve backend was actually down.
+        backend_error = getattr(manager, "_last_backend_error", None)
+        if backend_error:
+            result["backend_error"] = backend_error
 
         _recall_recent[_recall_signature(args)] = time.monotonic()
         return result
@@ -568,13 +592,19 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
         source_krefs = [m["kref"] for m in results if m.get("kref")]
 
         _recall_recent[_recall_signature(args)] = time.monotonic()
-        return {
+        engage_result = {
             "context": context,
             "results": results,
             "source_krefs": source_krefs,
             "count": len(results),
             "recall_mode": recall_mode,
         }
+        # Additive: surface a backend failure so an empty result isn't read as
+        # "no memories" when the graph/retrieve backend was actually down.
+        backend_error = getattr(manager, "_last_backend_error", None)
+        if backend_error:
+            engage_result["backend_error"] = backend_error
+        return engage_result
 
 
 def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:

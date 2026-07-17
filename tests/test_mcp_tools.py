@@ -1034,3 +1034,132 @@ def test_memory_consolidate_accepts_explicit_evidence():
             assert "evidence:corroborated" in stored["tags"]
         finally:
             _cleanup_manager()
+
+
+# ---------------------------------------------------------------------------
+# Tests — backend-error surfacing (issue #103, P1-1)
+# ---------------------------------------------------------------------------
+
+
+def test_memory_recall_surfaces_backend_error():
+    """A retrieve-backend failure surfaces as an additive backend_error field so
+    an empty result isn't misread as 'no memories'."""
+    try:
+        manager, _ = _install_test_manager()
+
+        async def error_retrieve(**kwargs):
+            return {"error": "graph backend unavailable: connection refused"}
+
+        manager.memory_retrieve = error_retrieve
+        result = tool_memory_recall({"query": "recall while backend is down"})
+        assert result["count"] == 0
+        assert result["results"] == []
+        assert "backend_error" in result
+        assert "graph backend unavailable" in result["backend_error"]
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_recall_no_backend_error_on_success():
+    """A healthy recall carries NO backend_error field (behavior unchanged)."""
+    try:
+        _install_test_manager()  # default retrieve_stub succeeds
+        result = tool_memory_recall({"query": "healthy recall success"})
+        assert result["count"] == 1
+        assert "backend_error" not in result
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_recall_no_backend_error_on_empty_healthy():
+    """An empty-but-healthy recall carries NO backend_error field."""
+    try:
+        manager, _ = _install_test_manager()
+
+        async def empty_retrieve(**kwargs):
+            return {"revision_krefs": []}
+
+        manager.memory_retrieve = empty_retrieve
+        result = tool_memory_recall({"query": "empty but healthy"})
+        assert result["count"] == 0
+        assert result["results"] == []
+        assert "backend_error" not in result
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_engage_surfaces_backend_error():
+    """engage surfaces the same additive backend_error field on failure."""
+    try:
+        manager, _ = _install_test_manager()
+
+        async def error_retrieve(**kwargs):
+            return {"error": "neo4j down"}
+
+        manager.memory_retrieve = error_retrieve
+        result = tool_memory_engage({"query": "engage while backend is down"})
+        assert result["count"] == 0
+        assert "backend_error" in result
+        assert "neo4j down" in result["backend_error"]
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_engage_no_backend_error_on_success():
+    """A healthy engage carries NO backend_error field (behavior unchanged)."""
+    try:
+        _install_test_manager()  # default retrieve_stub succeeds
+        result = tool_memory_engage({"query": "healthy engage success"})
+        assert result["count"] == 1
+        assert "backend_error" not in result
+    finally:
+        _cleanup_manager()
+
+
+# ---------------------------------------------------------------------------
+# Tests — race-free lazy singleton init (issue #103, P1-3)
+# ---------------------------------------------------------------------------
+
+
+def test_get_manager_singleton_thread_safe(monkeypatch):
+    """Concurrent first callers must all receive the SAME manager instance —
+    the double-checked lock must construct exactly once even when many threads
+    race through _get_manager at the same time (a slow constructor widens the
+    race window that the missing lock would have lost)."""
+    import threading
+    import time as _time
+
+    # Reset the singleton and swap in a slow fake builder, both via setitem on
+    # the module __dict__ so pytest restores them automatically at teardown.
+    monkeypatch.setitem(mcp_tools_module.__dict__, "_manager", None)
+
+    build_count = {"n": 0}
+    build_lock = threading.Lock()
+
+    def slow_build():
+        with build_lock:
+            build_count["n"] += 1
+        _time.sleep(0.05)  # widen the race window
+        return object()
+
+    monkeypatch.setitem(mcp_tools_module.__dict__, "_build_manager", slow_build)
+
+    barrier = threading.Barrier(8)
+    results = []
+    results_lock = threading.Lock()
+
+    def worker():
+        barrier.wait()  # release all threads simultaneously
+        mgr = mcp_tools_module._get_manager()
+        with results_lock:
+            results.append(mgr)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert build_count["n"] == 1, "manager was constructed more than once under a race"
+    assert len(results) == 8
+    assert all(r is results[0] for r in results), "threads saw different manager instances"

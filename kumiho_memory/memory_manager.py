@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 StoreCallable = Callable[..., Any]
 RetrieveCallable = Callable[..., Any]
 
+# Short backoff between the two attempts of a session-id Redis call. A single
+# Redis flake must not silently fork a new session, so each call is retried
+# once before falling back to a fresh sequence (see _generate_session_id).
+_SESSION_REDIS_RETRY_BACKOFF = 0.05
+
 
 @dataclass
 class MemoryAssessResult:
@@ -304,6 +309,12 @@ class UniversalMemoryManager:
         # which subsumes plain entity promotion.
         self.ontology_enabled = ontology_on
         self._graph_recall: Optional[Any] = None  # lazy GraphAugmentedRecall
+        # Backend-error signal for recall: set by _lightweight_recall when the
+        # retrieve callable reports a backend failure, reset at the start of
+        # each recall_memories call. The internal recall still returns [] (the
+        # established contract); callers (MCP tools) read this AFTER recall to
+        # distinguish "no memories" from "backend down" without a type change.
+        self._last_backend_error: Optional[str] = None
         self.recall_mode = recall_mode
         self.sibling_strong_score = sibling_strong_score
         self.sibling_char_budget = sibling_char_budget
@@ -1550,6 +1561,9 @@ class UniversalMemoryManager:
             keeps that prior fully dormant, so general recall is unchanged.
             Applies to both the plain and the graph-augmented recall path.
         """
+        # Clear any error signal from a previous recall so a later healthy call
+        # (even an empty one) never inherits a stale backend_error.
+        self._last_backend_error = None
         if graph_augmented and self.graph_augmentation_config is not None:
             gr = self._get_graph_recall()
             if gr is not None:
@@ -1704,6 +1718,9 @@ class UniversalMemoryManager:
 
         if isinstance(result, dict) and "error" in result:
             logger.warning("_lightweight_recall: retrieve returned error: %s", result["error"])
+            # Record the backend failure so callers can distinguish it from an
+            # empty-but-healthy result. Truncated to keep tool payloads small.
+            self._last_backend_error = str(result["error"])[:500]
             return []
 
         if isinstance(result, dict) and "revision_krefs" in result:
@@ -3004,43 +3021,66 @@ class UniversalMemoryManager:
         await self.redis_buffer.close()
 
     async def _generate_session_id(self, user_canonical_id: str, context: str) -> str:
+        # A single Redis flake must not silently fork a new session: each call
+        # is retried once with a short backoff, and if it still fails we log at
+        # WARNING (never silent) before falling back. This never raises — the
+        # no-raise guarantee callers rely on is preserved.
+        async def _redis_retry(op_name, coro_factory, default):
+            for attempt in range(2):
+                try:
+                    return await coro_factory()
+                except Exception as exc:
+                    if attempt == 0:
+                        await asyncio.sleep(_SESSION_REDIS_RETRY_BACKOFF)
+                        continue
+                    logger.warning(
+                        "_generate_session_id: Redis %s failed after retry (%s); "
+                        "falling back — session continuity may be affected.",
+                        op_name, exc,
+                    )
+                    return default
+            return default
+
         # Reuse the active session when one exists (persists across restarts within a day).
         if hasattr(self.redis_buffer, "get_active_session"):
-            try:
-                active = await self.redis_buffer.get_active_session(
+            active = await _redis_retry(
+                "get_active_session",
+                lambda: self.redis_buffer.get_active_session(
                     context=context,
                     user_canonical_id=user_canonical_id,
-                )
-                if active:
-                    return active
-            except Exception:
-                pass
+                ),
+                None,
+            )
+            if active:
+                return active
 
         user_hash = hashlib.sha256(user_canonical_id.encode()).hexdigest()[:10]
         date = datetime.now(timezone.utc).strftime("%Y%m%d")
 
         sequence = 1
         if hasattr(self.redis_buffer, "next_session_sequence"):
-            try:
-                sequence = await self.redis_buffer.next_session_sequence(
+            sequence = await _redis_retry(
+                "next_session_sequence",
+                lambda: self.redis_buffer.next_session_sequence(
                     user_canonical_id=user_canonical_id,
                     date_str=date,
-                )
-            except Exception:
-                sequence = 1
+                ),
+                1,
+            )
 
         new_session_id = f"{context}:user-{user_hash}:{date}:{sequence:03d}"
 
         # Persist as the active session so follow-up restarts reuse it until consolidated.
         if hasattr(self.redis_buffer, "set_active_session"):
-            try:
-                await self.redis_buffer.set_active_session(
+            await _redis_retry(
+                "set_active_session",
+                lambda: self.redis_buffer.set_active_session(
                     context=context,
                     user_canonical_id=user_canonical_id,
                     session_id=new_session_id,
-                )
-            except Exception:
-                pass
+                ),
+                None,
+            )
 
         return new_session_id
 
