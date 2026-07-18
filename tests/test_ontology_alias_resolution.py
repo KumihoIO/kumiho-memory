@@ -16,7 +16,12 @@ import types
 from kumiho._text import slugify
 
 from kumiho_memory import ontology
-from kumiho_memory.ontology import OntologySchema, _AliasResolver, _sync_decompose_agent
+from kumiho_memory.ontology import (
+    OntologySchema,
+    _AliasResolver,
+    _sync_decompose,
+    _sync_decompose_agent,
+)
 
 _CONV = "kref://proj/conversations/c.conversation?r=1"
 _ENTITIES_PATH = "/proj/entities"
@@ -246,6 +251,40 @@ def test_reuse_appends_new_surface_as_alias(monkeypatch):
     appended = hub._rev.metadata["aliases"]
     assert "psql" in appended
     assert appended.count("Postgres") == 0  # display name isn't duplicated in aliases
+
+
+# --------------------------------------------------------------------------- #
+# Summarizer decompose path uses the same resolver                            #
+# --------------------------------------------------------------------------- #
+
+def test_summarizer_path_reuses_existing_hub(monkeypatch):
+    """The LLM-summarizer decompose path (_sync_decompose) resolves aliases via
+    the same resolver: a summary naming "PostgreSQL" reuses the "Postgres" hub."""
+    _enable(monkeypatch)
+    proj = _Project()
+    proj.preexisting_entity("Postgres", aliases=["PostgreSQL"])
+    _install(monkeypatch, proj,
+             search=[_SearchResult(proj.items[(_ENTITIES_PATH,
+                     slugify("Postgres", hash_on_truncate=True))])])
+    summary = {"classification": {"entities": ["PostgreSQL"]},
+               "knowledge": {}, "events": []}
+    stats = _sync_decompose(_CONV, summary, "proj", OntologySchema())
+    assert stats["entities_reused"] == 1
+    assert stats["entities"] == 0
+    assert "postgresql" not in _entity_items(proj)
+
+
+def test_summarizer_path_flag_off_creates_duplicate(monkeypatch):
+    _enable(monkeypatch, on=False)
+    proj = _Project()
+    hub = proj.preexisting_entity("Postgres", aliases=["PostgreSQL"])
+    _install(monkeypatch, proj, search=[_SearchResult(hub)])
+    summary = {"classification": {"entities": ["PostgreSQL"]},
+               "knowledge": {}, "events": []}
+    stats = _sync_decompose(_CONV, summary, "proj", OntologySchema())
+    assert stats["entities_reused"] == 0
+    assert stats["entities"] == 1
+    assert slugify("PostgreSQL", hash_on_truncate=True) in _entity_items(proj)
 
 
 # --------------------------------------------------------------------------- #
