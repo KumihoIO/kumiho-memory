@@ -2019,9 +2019,17 @@ class UniversalMemoryManager:
         recall_mode:
             ``"full"`` (default) includes artifact content (raw conversation
             text, truncated to the shared
-            :data:`kumiho_memory.context_compose.CONTEXT_BUDGET_CHARS` budget).
+            :data:`kumiho_memory.context_compose.CONTEXT_BUDGET_CHARS` budget,
+            with the truncation marker appended when content was cut).
             ``"summarized"`` uses only title + summary — lossy but cheaper.
             Falls back to the instance's ``self.recall_mode`` when ``None``.
+
+        Note: this assembler KEEPS the truncation marker (agents on the MCP
+        ``engage`` path genuinely benefit from knowing content was cut, and
+        this path is bench-irrelevant).  ``compose_context`` — the bench/SDK
+        path — slices silently instead: the marker text measurably made the
+        answer model hedge (−0.055 paired F1 on capped contexts, 0.19.0 RC
+        gate 2026-07-18).  Do not unify the marker without re-measuring.
         """
         from kumiho_memory import context_compose
         from kumiho_memory.evidence_rank import evidence_badge

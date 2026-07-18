@@ -25,12 +25,16 @@ Design principles (mirrors :mod:`kumiho_memory.recall_rerank`):
 Budget unification (#106): this composer and
 ``UniversalMemoryManager.build_recalled_context`` (item-centric, MCP ``engage``)
 both truncate each section's raw content to the shared
-:data:`CONTEXT_BUDGET_CHARS` budget with the shared :data:`TRUNCATION_MARKER`.
-For the LoCoMo bench path (this module, ``mode="full"``): sections at or under
-the budget are byte-identical to pre-unification output; over-budget sections
-are cut to exactly the budget with the marker inside it (previously a bare
-``content[:8000]`` slice) — an intentional unification whose bench impact is
-measured at the 0.19.0 full-10 RC gate, not claimed neutral.
+:data:`CONTEXT_BUDGET_CHARS` budget.  The :data:`TRUNCATION_MARKER` is
+**engage-only**: the 0.19.0 RC gate (2026-07-18) measured the marker text
+making the answer model hedge on the bench path — paired per-question F1 on
+marker-carrying contexts −0.055 vs baseline (n=478) while marker-free
+questions were +0.027 (n=146); single-hop −0.13, adversarial unchanged.  So
+:func:`compose_context` (bench/SDK) uses the silent historical
+``content[:limit]`` slice — byte-identical to 0.18.0 for ALL inputs — while
+``build_recalled_context`` keeps the marker (agents benefit from knowing
+content was cut; that path is bench-irrelevant).  Do not re-unify the marker
+without re-measuring.
 """
 
 from __future__ import annotations
@@ -48,11 +52,11 @@ DEFAULT_CONTEXT_TOP_K = 20
 
 #: Fallback for the per-section content budget when the env override is unset
 #: or malformed.  8000 is the value the LoCoMo benchmark path
-#: (``compose_context``, revision-centric, ``recall_mode="full"``) used before
-#: unification: sections at or under the budget render byte-identically.
-#: Over-budget sections now carry the in-budget truncation marker (previously
-#: a bare ``content[:8000]`` slice) — an intentional unification whose bench
-#: impact is measured at the 0.19.0 full-10 RC gate, not claimed neutral.
+#: (``compose_context``, revision-centric, ``recall_mode="full"``) has always
+#: used, and that path slices silently (``content[:limit]``, no marker) —
+#: byte-identical to 0.18.0 for all inputs.  The truncation marker is
+#: engage-only after the 0.19.0 RC gate measured it regressing the bench path
+#: (see module docstring).
 _DEFAULT_CONTEXT_BUDGET_CHARS = 8000
 
 
@@ -96,8 +100,11 @@ CONTEXT_BUDGET_CHARS = _resolve_context_budget_chars()
 #: Backward-compat alias.  Both name the same per-section content budget.
 DEFAULT_REVISION_CHAR_LIMIT = CONTEXT_BUDGET_CHARS
 
-#: Marker appended when a section's content is truncated to the budget.  Shared
-#: by both assemblers so the truncation policy is identical (marker parity).
+#: Marker appended when a section's content is truncated to the budget.
+#: ENGAGE-ONLY: rendered by ``build_recalled_context`` (MCP ``engage``);
+#: ``compose_context`` (bench/SDK) slices silently — the marker text
+#: measurably made the answer model hedge (−0.055 paired F1 on capped
+#: contexts, 0.19.0 RC gate 2026-07-18).
 TRUNCATION_MARKER = "…[truncated]"
 
 
@@ -111,22 +118,43 @@ def approx_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def truncate_section(text: str, limit: Optional[int] = None) -> str:
+def truncate_section(
+    text: str, limit: Optional[int] = None, *, marker: bool = True,
+) -> str:
     """Truncate one section's raw content to *limit* chars, shared by both
-    assemblers so the per-section truncation policy is identical.
+    assemblers so the per-section budget is identical.
 
     *limit* ``None`` resolves to :data:`CONTEXT_BUDGET_CHARS` at call time (so
     a monkeypatched budget is honored); numeric values — including ``0`` — are
     applied as-is (``0`` empties the section, matching the historical
     ``content[:0]`` slice).  Content at or under the budget is returned
-    **unchanged** (byte-identical).  When truncation fires the result is
-    exactly *limit* chars **total**: the text is cut to
-    ``limit - len(TRUNCATION_MARKER)`` and the marker appended, so the budget
-    is a hard ceiling.  A limit too small to fit the marker degenerates to a
-    bare hard slice (marker omitted) — the ceiling still holds.
+    **unchanged** (byte-identical).  The budget is a hard ceiling in both
+    modes.
+
+    *marker* selects the truncation style — the two assemblers deliberately
+    differ here (measured, 0.19.0 RC gate 2026-07-18):
+
+    * ``marker=False`` — **silent slice**, the exact historical
+      ``text[:limit]``.  Used by :func:`compose_context` (the bench/SDK
+      path): the marker text induces answer-model hedging — paired
+      per-question F1 on marker-carrying contexts was −0.055 vs baseline
+      (n=478) while marker-free questions were +0.027 (n=146), single-hop
+      −0.13 — so the bench path must stay byte-identical to 0.18.0.
+    * ``marker=True`` (default) — when truncation fires the result is exactly
+      *limit* chars **total**: the text is cut to
+      ``limit - len(TRUNCATION_MARKER)`` and the marker appended.  Used by
+      ``build_recalled_context`` (MCP ``engage``, bench-irrelevant), where
+      agents genuinely benefit from knowing content was cut.  A limit too
+      small to fit the marker degenerates to a bare hard slice.
+
+    Do not re-unify the marker behavior without re-measuring the bench impact.
     """
     if limit is None:
         limit = CONTEXT_BUDGET_CHARS
+    if not marker:
+        # Silent slice — byte-identical to the pre-#106 ``content[:limit]``
+        # for ALL inputs (no marker, no 12-char shift).
+        return text[:limit]
     if len(text) <= limit:
         return text
     cut = limit - len(TRUNCATION_MARKER)
@@ -217,7 +245,9 @@ def compose_context(
         ``None`` (default) resolves to the shared
         :data:`CONTEXT_BUDGET_CHARS` at call time; numeric values —
         including ``0`` — apply as-is (``0`` empties the section, the
-        historical ``content[:0]`` slice semantics).
+        historical ``content[:0]`` slice semantics).  The cut is SILENT
+        (no truncation marker) on this path — see :func:`truncate_section`
+        for the measured reason.
     """
     full_mode = mode == "full"
     # Shared per-section content budget (monkeypatch-friendly: read now, not
@@ -317,7 +347,13 @@ def compose_context(
         content = rev.get("content", "")
 
         if full_mode and content:
-            entry_text = truncate_section(content, effective_char_limit)
+            # Silent slice (marker=False): the truncation marker measurably
+            # made the answer model hedge on this path (−0.055 paired F1 on
+            # capped contexts, 0.19.0 RC gate 2026-07-18) — bench/SDK output
+            # stays byte-identical to the historical content[:limit].
+            entry_text = truncate_section(
+                content, effective_char_limit, marker=False,
+            )
         elif summary:
             entry_text = f"{title}: {summary}" if title else summary
         else:

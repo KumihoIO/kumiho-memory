@@ -125,9 +125,9 @@ def test_full_mode_uses_content_with_char_limit_and_summary_fallback():
     without_content = _mem("b", "sb")
     out = compose_context([with_content, without_content],
                           mode="full", char_limit=10)
-    # A limit below the marker width degenerates to a bare hard slice (origin
-    # behavior preserved, budget ceiling honored); the content-less memory
-    # falls back to title+summary.
+    # The bench/SDK path slices SILENTLY (exact content[:limit], no marker —
+    # the marker measurably made the answer model hedge); the content-less
+    # memory falls back to title+summary.
     assert out == "X" * 10 + "\n\nb: sb"
 
 
@@ -367,10 +367,10 @@ def test_env_override_malformed_and_nonpositive_fall_back(monkeypatch):
 
 
 def test_default_budget_matches_bench_path_historical_value():
-    # Unified default = the value the LoCoMo (compose_context, full) path used
-    # before unification — byte-identical for sections at or under the budget;
-    # over-budget sections carry the in-budget marker (measured at the 0.19.0
-    # full-10 RC gate, not claimed neutral).
+    # Unified default = the value the LoCoMo (compose_context, full) path has
+    # always used.  That path slices SILENTLY (content[:limit], no marker) —
+    # byte-identical to 0.18.0 for all inputs — after the 0.19.0 RC gate
+    # measured the marker regressing it (−0.055 paired F1 on capped contexts).
     assert cc._DEFAULT_CONTEXT_BUDGET_CHARS == 8000
     assert DEFAULT_REVISION_CHAR_LIMIT == CONTEXT_BUDGET_CHARS
 
@@ -378,45 +378,54 @@ def test_default_budget_matches_bench_path_historical_value():
 # --- Single source of truth: both assemblers honor the constant -------------
 
 def test_both_assemblers_read_the_shared_budget_constant(monkeypatch):
-    # Monkeypatch the one constant; BOTH assemblers must truncate at it.
+    # Monkeypatch the one constant; BOTH assemblers must truncate at it —
+    # same budget, deliberately different truncation STYLE (see fork test).
     monkeypatch.setattr(cc, "CONTEXT_BUDGET_CHARS", 20)
     content = "Y" * 40
-    # Budget-inclusive: cut to (limit - marker) then append → exactly 20 chars.
-    expected = "Y" * (20 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
-    assert len(expected) == 20
 
-    # Bench path: revision-centric compose_context (char_limit=None → constant).
+    # Bench path: revision-centric compose_context (char_limit=None →
+    # constant), SILENT slice — exact content[:20], no marker.
     bench = compose_context([_mem("a", "sa", score=0.5, content=content)],
                             mode="full")
-    assert bench == expected
+    assert bench == "Y" * 20
 
-    # MCP engage path: item-centric build_recalled_context.
+    # MCP engage path: item-centric build_recalled_context, marker inside
+    # the same 20-char ceiling.
     mgr = _make_full_manager()
     item = mgr.build_recalled_context([_mem("a", "sa", content=content)],
                                       recall_mode="full")
-    assert item == expected
+    assert item == "Y" * (20 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
+    assert len(bench) == len(item) == 20                # shared hard ceiling
 
 
-# --- Shared per-section truncation policy: marker parity ---------------------
+# --- Truncation-style fork: marker is ENGAGE-ONLY (measured) -----------------
 
-def test_truncation_marker_parity_across_assemblers(monkeypatch):
+def test_marker_is_engage_only_bench_path_slices_silently(monkeypatch):
+    # 0.19.0 RC gate (2026-07-18) measured the marker text making the answer
+    # model hedge on the bench path: paired per-question F1 −0.055 on
+    # marker-carrying contexts (n=478) vs +0.027 marker-free (n=146),
+    # single-hop −0.13.  So the fork is deliberate: engage KEEPS the marker
+    # (agents benefit from knowing content was cut, bench-irrelevant path);
+    # compose_context slices silently (byte-identical to 0.18.0).
     monkeypatch.setattr(cc, "CONTEXT_BUDGET_CHARS", 16)
     content = "Z" * 30
+
     bench = compose_context([_mem("a", "sa", score=0.5, content=content)],
                             mode="full")
+    assert bench == "Z" * 16                            # silent slice, no marker
+    assert TRUNCATION_MARKER not in bench
+
     mgr = _make_full_manager()
     item = mgr.build_recalled_context([_mem("a", "sa", content=content)],
                                       recall_mode="full")
-    # Identical marker, identical cut point → identical section output, and
-    # the budget is a hard ceiling (marker included in the 16 chars).
-    assert bench.endswith(TRUNCATION_MARKER)
-    assert item.endswith(TRUNCATION_MARKER)
-    assert bench == item == "Z" * (16 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
-    assert len(bench) == 16
+    assert item.endswith(TRUNCATION_MARKER)             # engage keeps the marker
+    assert item == "Z" * (16 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
+    assert len(item) == 16                              # ceiling still holds
 
 
 def test_truncate_section_policy():
     m = TRUNCATION_MARKER
+    # --- marker=True (default; the engage style) ---
     assert truncate_section("short", 100) == "short"    # under budget: unchanged
     assert truncate_section("abcdef", 6) == "abcdef"    # exact fit: no marker
     # Truncation is budget-inclusive: marker fits INSIDE the limit, so the
@@ -428,6 +437,14 @@ def test_truncate_section_policy():
     assert truncate_section("abcdef", 3) == "abc"
     # 0 passes through like the historical content[:0] slice (NOT unlimited).
     assert truncate_section("abcdef", 0) == ""
+    # --- marker=False (the bench/SDK silent style) ---
+    assert truncate_section("short", 100, marker=False) == "short"
+    assert truncate_section("abcdef", 6, marker=False) == "abcdef"
+    out = truncate_section("a" * 30, 20, marker=False)
+    assert out == "a" * 20                              # exact text[:limit]
+    assert m not in out
+    assert truncate_section("abcdef", 3, marker=False) == "abc"
+    assert truncate_section("abcdef", 0, marker=False) == ""
 
 
 def test_truncate_section_none_limit_uses_constant(monkeypatch):
@@ -435,6 +452,8 @@ def test_truncate_section_none_limit_uses_constant(monkeypatch):
     out = truncate_section("x" * 30)
     assert out == "x" * (14 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
     assert len(out) == 14
+    # Silent mode resolves the same constant.
+    assert truncate_section("x" * 30, marker=False) == "x" * 14
 
 
 def test_char_limit_zero_empties_content_origin_semantics():
@@ -459,11 +478,8 @@ def test_approx_tokens_is_chars_over_four():
 # --- Behavior guard: bench assembler byte-identical under budget -------------
 
 def test_bench_assembler_byte_identical_under_budget():
-    # Under-budget raw content is returned unchanged (no marker) — the LoCoMo
-    # benchmark path (compose_context, recall_mode="full") is byte-identical
-    # to pre-#106 for sections AT OR UNDER the budget.  Over-budget sections
-    # carry the in-budget truncation marker — an intentional unification whose
-    # bench impact is measured at the 0.19.0 full-10 RC gate.
+    # Under-budget raw content is returned unchanged — the LoCoMo benchmark
+    # path (compose_context, recall_mode="full") is byte-identical to 0.18.0.
     content = "hello world"          # 11 chars, far under the 8000 default
     out = compose_context([_mem("a", "sa", score=0.5, content=content)],
                           mode="full")
@@ -473,3 +489,15 @@ def test_bench_assembler_byte_identical_under_budget():
     out2 = compose_context([_mem("a", "sa", score=0.5, content=content)],
                            mode="full", char_limit=CONTEXT_BUDGET_CHARS)
     assert out2 == content
+
+
+def test_bench_assembler_byte_identical_over_budget():
+    # THE case the 0.19.0 RC gate caught (marker-carrying contexts −0.055
+    # paired F1): over-budget content on the bench path must be the exact
+    # historical content[:8000] — no marker, no 12-char shift.
+    content = "B" * (CONTEXT_BUDGET_CHARS + 500)
+    out = compose_context([_mem("a", "sa", score=0.5, content=content)],
+                          mode="full")
+    assert out == content[:CONTEXT_BUDGET_CHARS]        # exact silent slice
+    assert len(out) == CONTEXT_BUDGET_CHARS
+    assert TRUNCATION_MARKER not in out
