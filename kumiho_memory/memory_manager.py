@@ -25,6 +25,7 @@ from kumiho_memory.redis_memory import RedisMemoryBuffer
 from kumiho_memory.failure_ledger import FailureLedger, content_key
 from kumiho_memory.retry import RetryQueue, classify_failure, retry_with_backoff
 from kumiho_memory.summarization import LLMAdapter, MemorySummarizer
+from kumiho_memory.temporal_guard import classify_event_date, parse_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -1119,7 +1120,25 @@ class UniversalMemoryManager:
                 if _ISO_EVENT_DATE_RE.match(d := str(ev.get("event_date", "")).strip())
             ]
             if iso_dates:
-                structured_metadata["event_date"] = min(iso_dates)
+                canonical_event_date = min(iso_dates)
+                structured_metadata["event_date"] = canonical_event_date
+                # Valid-time corroboration (#119). The date passed only a FORMAT
+                # regex above; a well-formed hallucination would still pollute
+                # the event-proximity boost. Cross-check it against the raw
+                # transcript and stamp a confidence marker. An absent key means
+                # "legacy row" downstream, so this is purely additive — existing
+                # stored dates keep the boost unchanged. Unverified dates stay as
+                # metadata but recall_rerank skips their boost.
+                source_text = "\n".join(
+                    str(m.get("content", "")) for m in messages
+                )
+                reference_ts = (
+                    parse_timestamp(messages[-1].get("timestamp"))
+                    if messages else None
+                )
+                structured_metadata["event_date_confidence"] = classify_event_date(
+                    canonical_event_date, source_text, reference_ts,
+                )
 
         if decisions:
             dec_texts = [d.get("decision", "") for d in decisions if d.get("decision")]
@@ -2479,6 +2498,11 @@ class UniversalMemoryManager:
             # the one mode that is otherwise date-blind (no content loaded).
             if meta.get("event_date"):
                 entry["event_date"] = meta["event_date"]
+                # Confidence marker (#119): carry it alongside event_date so the
+                # event-proximity boost can skip uncorroborated dates. Absent key
+                # (legacy rows) is treated as trusted, so the boost is unchanged.
+                if meta.get("event_date_confidence"):
+                    entry["event_date_confidence"] = meta["event_date_confidence"]
 
             # Read the raw conversation from the local artifact file.
             if load_artifacts:

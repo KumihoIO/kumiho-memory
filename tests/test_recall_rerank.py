@@ -319,6 +319,50 @@ def test_temporal_priors_capped_jointly():
     assert out[0]["score"] == pytest.approx(0.5 + 0.12)  # capped at 0.12, not 0.24
 
 
+# --------- event_date confidence guard (#119, hallucinated-date guard) ---------
+
+def test_unverified_confidence_gets_no_boost():
+    # A well-formed but uncorroborated date must not move ranking.
+    cfg = RerankConfig(event_proximity_half_life_days=30.0, event_proximity_max_boost=0.12)
+    mem = {"event_date": "2023-05-08", "event_date_confidence": "unverified"}
+    assert _event_proximity_boost(mem, cfg, QT) == 0.0
+
+
+@pytest.mark.parametrize("confidence", ["verified", "derived", None])
+def test_verified_derived_and_absent_boost_is_byte_identical(confidence):
+    # Regression guard: the boost for verified / derived / absent-key rows must
+    # equal the pre-#119 value (which had no confidence key at all).
+    cfg = RerankConfig(event_proximity_half_life_days=30.0, event_proximity_max_boost=0.12)
+    legacy = {"event_date": "2023-05-08"}  # no confidence key = pre-#119 row
+    baseline = _event_proximity_boost(legacy, cfg, QT)
+    assert baseline > 0.0
+    guarded = {"event_date": "2023-05-08"}
+    if confidence is not None:
+        guarded["event_date_confidence"] = confidence
+    assert _event_proximity_boost(guarded, cfg, QT) == baseline
+
+
+def test_unverified_date_does_not_reorder_but_verified_does():
+    # Two memories, identical except confidence: the verified near-dated one
+    # overtakes on the temporal prior; the unverified one never does.
+    near_verified = _mem(title="near_verified", score=0.80, event_date="2023-05-08",
+                         event_date_confidence="verified")
+    far = _mem(title="far", score=0.85, event_date="2018-05-08")
+    cfg = RerankConfig(recency_enabled=False, mmr_enabled=False,
+                       event_proximity_enabled=True,
+                       event_proximity_half_life_days=30.0,
+                       event_proximity_max_boost=0.12)
+    out = rerank("q", [near_verified, far], config=cfg, now=NOW, query_time=QT)
+    assert [m["title"] for m in out] == ["near_verified", "far"]  # 0.92 > 0.85
+
+    # Same shape, but the near date is unverified → no boost → order preserved.
+    near_unverified = _mem(title="near_unverified", score=0.80, event_date="2023-05-08",
+                           event_date_confidence="unverified")
+    far2 = _mem(title="far2", score=0.85, event_date="2018-05-08")
+    out2 = rerank("q", [near_unverified, far2], config=cfg, now=NOW, query_time=QT)
+    assert [m["title"] for m in out2] == ["far2", "near_unverified"]  # 0.85 > 0.80
+
+
 # ---------------- env-based reranker resolution (shared helper) ----------------
 
 import kumiho_memory.recall_rerank as rr_mod

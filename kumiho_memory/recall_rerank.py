@@ -179,7 +179,17 @@ def _event_proximity_boost(
     Distinct from :func:`_recency_boost`, which measures *storage* age from
     ``created_at``. No-ops (``0.0``) when the memory carries no parseable
     ``event_date`` — so legacy/undated revisions are unaffected.
+
+    Guard (#119): a date the extractor could NOT corroborate against its source
+    transcript is stamped ``event_date_confidence == "unverified"`` at write
+    time; such a (possibly hallucinated) date is metadata-only and must never
+    move ranking, so it gets no boost. An absent key means a legacy/pre-#119 row
+    (or an agent-authored capture) and stays trusted; ``"verified"`` /
+    ``"derived"`` follow the original path — so the boost is byte-identical to
+    pre-#119 behavior for every row that is not explicitly unverified.
     """
+    if mem.get("event_date_confidence") == "unverified":
+        return 0.0
     ts = _parse_ts(_pad_iso_date(mem.get("event_date")))
     if ts is None:
         return 0.0
