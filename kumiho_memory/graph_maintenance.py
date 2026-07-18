@@ -50,6 +50,7 @@ precheck; ``evidence:official`` grades are never rewritten (operator-owned).
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -137,6 +138,50 @@ _SCORE_REVISIONS_MAX = 100
 _OUTGOING = 0
 _INCOMING = 1
 _BOTH = 2
+
+#: Distinguishing-asymmetry guard for fact-merge confirmation (both the
+#: keyless per-entity scan and the embedding-assisted stage share this gate).
+#: Token-Jaccard alone cannot tell "the user is happy" from "the user is NOT
+#: happy" apart when the rest of the sentence is identical, nor "meeting is
+#: Friday" from "meeting is Monday" — both score high lexical overlap while
+#: stating opposite or simply different facts. Measured 2026-07-19: a live
+#: gate-check against the real server merged both cases before this guard
+#: existed. This is a narrow, keyless safety net for exactly those two
+#: confirmed failure modes, not a general semantic-difference detector.
+_NEGATION_RE = re.compile(
+    r"\b(not|n't|never|cannot|no longer|without)\b"
+    r"|(?:지\s*않|치\s*않|안\s|못\s|없다|아니다)",
+    re.IGNORECASE,
+)
+_WEEKDAY_RE = re.compile(
+    r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+    r"|(월요일|화요일|수요일|목요일|금요일|토요일|일요일)",
+    re.IGNORECASE,
+)
+
+
+def _distinguishing_markers(text: str) -> Tuple[bool, frozenset]:
+    """Return (negation-present, weekday-names-found) signals for *text*."""
+    neg = bool(_NEGATION_RE.search(text))
+    weekdays = frozenset(m.group(0).lower() for m in _WEEKDAY_RE.finditer(text))
+    return neg, weekdays
+
+
+def _has_distinguishing_asymmetry(stmt_a: str, stmt_b: str) -> bool:
+    """True when *stmt_a* / *stmt_b* differ on a polarity or named-day marker.
+
+    Asymmetric negation (one statement negated, the other not) or differing
+    weekday names both signal the statements are NOT duplicates regardless of
+    token overlap — refuse the merge rather than let the lexical gate fold
+    them together.
+    """
+    neg_a, days_a = _distinguishing_markers(stmt_a)
+    neg_b, days_b = _distinguishing_markers(stmt_b)
+    if neg_a != neg_b:
+        return True
+    if (days_a or days_b) and days_a != days_b:
+        return True
+    return False
 
 
 @dataclass
@@ -712,6 +757,8 @@ class GraphMaintainer:
             return False
         if _jaccard(a["tokens"], b["tokens"]) < _FACT_DEDUP_JACCARD:
             return False
+        if _has_distinguishing_asymmetry(a.get("statement", ""), b.get("statement", "")):
+            return False
         # Keeper selection needs the edge count; compute it lazily so the
         # embedding stage only pays the round-trip for a confirmed pair.
         for entry in (a, b):
@@ -1051,6 +1098,7 @@ class GraphMaintainer:
                     "rev": src,
                     "slug": _node_slug(uri, kind),
                     "tokens": _tokens(claim),
+                    "statement": claim,
                     "edges": len(_edges(src, None, _BOTH)),
                 }
             )
