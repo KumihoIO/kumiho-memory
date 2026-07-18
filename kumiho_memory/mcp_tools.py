@@ -226,6 +226,8 @@ def _build_manager():
     except Exception as exc:
         logger.warning("Post-recall rerank setup failed: %s", exc)
 
+    from kumiho_memory.failure_ledger import default_failure_ledger
+
     buffer = RedisMemoryBuffer()
     manager = UniversalMemoryManager(
         redis_buffer=buffer,
@@ -238,6 +240,8 @@ def _build_manager():
         evidence_rank=evidence_rank,
         rerank=rerank_config,
         reranker=reranker,
+        # Park content that fails deterministically run after run (#118).
+        failure_ledger=default_failure_ledger(),
     )
     return manager
 
@@ -514,6 +518,8 @@ def tool_memory_dream_state(args: Dict[str, Any]) -> Dict[str, Any]:
             base_url=base_url,
         )
 
+    from kumiho_memory.failure_ledger import default_failure_ledger
+
     ds = DreamState(
         project=args.get("project", "CognitiveMemory"),
         batch_size=args.get("batch_size", 20),
@@ -527,6 +533,8 @@ def tool_memory_dream_state(args: Dict[str, Any]) -> Dict[str, Any]:
         maintenance_llm=args.get("maintenance_llm", False),
         code_project=args.get("code_project"),
         summarizer=summarizer,
+        # Skip items parked for repeated deterministic failures (#118).
+        failure_ledger=default_failure_ledger(),
     )
     return asyncio.run(ds.run())
 

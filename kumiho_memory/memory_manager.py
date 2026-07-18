@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import hashlib
+import json
 import logging
 import math
 import mimetypes
@@ -26,8 +27,10 @@ from kumiho_memory.valid_time import (
     as_of_recall_enabled,
 )
 from kumiho_memory.redis_memory import RedisMemoryBuffer
-from kumiho_memory.retry import RetryQueue, retry_with_backoff
+from kumiho_memory.failure_ledger import FailureLedger, content_key
+from kumiho_memory.retry import RetryQueue, classify_failure, retry_with_backoff
 from kumiho_memory.summarization import LLMAdapter, MemorySummarizer
+from kumiho_memory.temporal_guard import classify_event_date, parse_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,35 @@ RetrieveCallable = Callable[..., Any]
 # Redis flake must not silently fork a new session, so each call is retried
 # once before falling back to a fresh sequence (see _generate_session_id).
 _SESSION_REDIS_RETRY_BACKOFF = 0.05
+
+# Payload fields that identify *what* is being stored, used to key the failure
+# ledger (#118).  Volatile fields (artifact paths, session ids, timestamps) are
+# excluded so the same content maps to the same key across runs.
+_FAILURE_KEY_FIELDS = (
+    "project",
+    "memory_type",
+    "title",
+    "summary",
+    "user_text",
+    "assistant_text",
+)
+
+
+def _payload_failure_key(payload: Dict[str, Any]) -> str:
+    """Derive a stable failure-ledger key for a ``memory_store`` payload.
+
+    Keys on the content-identifying fields so a poison payload maps to the
+    same ledger entry each run.  Falls back to a canonical hash of the whole
+    payload when none of those fields are populated.
+    """
+    parts = [
+        f"{field_name}={payload[field_name]}"
+        for field_name in _FAILURE_KEY_FIELDS
+        if payload.get(field_name)
+    ]
+    if not parts:
+        parts.append(json.dumps(payload, sort_keys=True, default=str))
+    return content_key(*parts)
 
 
 @dataclass
@@ -209,6 +241,7 @@ class UniversalMemoryManager:
         redis_url: Optional[str] = None,
         tenant_hint: Optional[str] = None,
         retry_queue: Optional[RetryQueue] = None,
+        failure_ledger: Optional[FailureLedger] = None,
         store_max_retries: int = 3,
         graph_augmentation: Optional[Any] = None,
         entity_promotion: Optional[Any] = True,
@@ -253,6 +286,11 @@ class UniversalMemoryManager:
             memory_retrieve if memory_retrieve is not None else _load_default_retrieve()
         )
         self.retry_queue = retry_queue
+        # Cross-run failure ledger (issue #118): parks content that fails
+        # deterministically so it is not re-stored run after run.  Opt-in at
+        # the library layer (None = today's behavior); the MCP/CLI entrypoints
+        # wire a default ledger so parking is active in production.
+        self.failure_ledger = failure_ledger
         self.store_max_retries = store_max_retries
         # Graph-augmented recall: pass a GraphAugmentationConfig for full
         # control, or simply ``True`` for the default config — no boilerplate.
@@ -1096,7 +1134,25 @@ class UniversalMemoryManager:
                 if _ISO_EVENT_DATE_RE.match(d := str(ev.get("event_date", "")).strip())
             ]
             if iso_dates:
-                structured_metadata["event_date"] = min(iso_dates)
+                canonical_event_date = min(iso_dates)
+                structured_metadata["event_date"] = canonical_event_date
+                # Valid-time corroboration (#119). The date passed only a FORMAT
+                # regex above; a well-formed hallucination would still pollute
+                # the event-proximity boost. Cross-check it against the raw
+                # transcript and stamp a confidence marker. An absent key means
+                # "legacy row" downstream, so this is purely additive — existing
+                # stored dates keep the boost unchanged. Unverified dates stay as
+                # metadata but recall_rerank skips their boost.
+                source_text = "\n".join(
+                    str(m.get("content", "")) for m in messages
+                )
+                reference_ts = (
+                    parse_timestamp(messages[-1].get("timestamp"))
+                    if messages else None
+                )
+                structured_metadata["event_date_confidence"] = classify_event_date(
+                    canonical_event_date, source_text, reference_ts,
+                )
 
         if decisions:
             dec_texts = [d.get("decision", "") for d in decisions if d.get("decision")]
@@ -1402,21 +1458,51 @@ class UniversalMemoryManager:
     async def _store_with_retry(self, **payload: Any) -> Dict[str, Any]:
         """Call ``memory_store`` with retry + queue fallback.
 
-        1. Try up to ``store_max_retries`` with exponential backoff.
-        2. If all retries fail and a ``retry_queue`` is configured,
-           enqueue the payload for later replay.
-        3. If no queue is configured, raise the exception.
+        1. If a failure ledger is configured and this content is *parked*
+           (repeated deterministic failures, issue #118), skip the store —
+           it would just fail again — and return ``{"parked": True}``.
+        2. Try up to ``store_max_retries`` with exponential backoff.
+        3. On success, clear any ledger history for this content.
+        4. On failure, classify it and record it in the ledger; then, if a
+           ``retry_queue`` is configured, enqueue the payload for later replay,
+           otherwise raise.
         """
         if not self.memory_store:
             return {}
 
+        ledger = self.failure_ledger
+        key: Optional[str] = None
+        if ledger is not None:
+            try:
+                key = _payload_failure_key(payload)
+                if key and ledger.is_parked(key):
+                    logger.info(
+                        "memory_store skipped — content parked after repeated "
+                        "deterministic failures (#118)"
+                    )
+                    return {"parked": True}
+            except Exception as exc:  # noqa: BLE001 — ledger must never break stores
+                logger.debug("failure ledger park check failed (ignored): %s", exc)
+                key = None
+
         try:
-            return await retry_with_backoff(
+            result = await retry_with_backoff(
                 self.memory_store,
                 max_retries=self.store_max_retries,
                 **payload,
             )
+            if ledger is not None and key:
+                try:
+                    ledger.record_success(key)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("failure ledger record_success failed (ignored): %s", exc)
+            return result
         except Exception as exc:
+            if ledger is not None and key:
+                try:
+                    ledger.record_failure(key, classify_failure(exc))
+                except Exception as le:  # noqa: BLE001
+                    logger.debug("failure ledger record_failure failed (ignored): %s", le)
             if self.retry_queue is not None:
                 self.retry_queue.enqueue(payload)
                 logger.warning(
@@ -1430,11 +1516,12 @@ class UniversalMemoryManager:
     async def flush_retry_queue(self) -> Dict[str, int]:
         """Replay queued ``memory_store`` calls that previously failed.
 
-        Returns ``{"succeeded": N, "failed": M}``.  Items that still
-        fail remain in the queue for the next flush attempt.
+        Returns ``{"succeeded": N, "failed": M, "dropped": D}``.  Items that
+        fail transiently remain in the queue for the next flush; items that
+        fail deterministically are dropped (they would never succeed, #118).
         """
         if not self.retry_queue or not self.memory_store:
-            return {"succeeded": 0, "failed": 0}
+            return {"succeeded": 0, "failed": 0, "dropped": 0}
         return await self.retry_queue.flush(self.memory_store)
 
     @staticmethod
@@ -2442,6 +2529,11 @@ class UniversalMemoryManager:
             # the one mode that is otherwise date-blind (no content loaded).
             if meta.get("event_date"):
                 entry["event_date"] = meta["event_date"]
+                # Confidence marker (#119): carry it alongside event_date so the
+                # event-proximity boost can skip uncorroborated dates. Absent key
+                # (legacy rows) is treated as trusted, so the boost is unchanged.
+                if meta.get("event_date_confidence"):
+                    entry["event_date_confidence"] = meta["event_date_confidence"]
             # Valid-time interval (G8): additive valid_from/valid_to alongside
             # event_date, surfaced only when present + ISO-valid. Feeds the
             # opt-in as-of recall filter (KUMIHO_MEMORY_AS_OF_RECALL); absent on

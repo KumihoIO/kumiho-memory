@@ -929,7 +929,7 @@ def test_flush_retry_queue_replays_items():
 
         async def run():
             result = await manager.flush_retry_queue()
-            assert result == {"succeeded": 2, "failed": 0}
+            assert result == {"succeeded": 2, "failed": 0, "dropped": 0}
             assert queue.count == 0
             assert replayed == ["queued-1", "queued-2"]
 
@@ -971,6 +971,252 @@ def test_consolidation_raises_without_queue():
                 assert False, "Should have raised ConnectionError"
             except ConnectionError:
                 pass
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Failure ledger / parking at the store seam (issue #118)
+# ---------------------------------------------------------------------------
+
+
+def _ledger_manager(memory_store, ledger, *, store_max_retries=2, retry_queue=None):
+    buffer = RedisMemoryBuffer(client=FakeRedis(), redis_url="redis://test")
+    return UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=memory_store,
+        failure_ledger=ledger,
+        retry_queue=retry_queue,
+        store_max_retries=store_max_retries,
+    )
+
+
+_POISON_PAYLOAD = {
+    "project": "CognitiveMemory",
+    "memory_type": "fact",
+    "title": "Poison title",
+    "summary": "This content deterministically fails.",
+}
+
+
+def test_store_skips_parked_content():
+    """A parked payload is not sent to memory_store; returns {'parked': True}."""
+    from kumiho_memory.failure_ledger import FailureLedger
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    calls = []
+
+    async def store(**kwargs):
+        calls.append(kwargs)
+        return {"revision_kref": "kref://x"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=2)
+        key = _payload_failure_key(_POISON_PAYLOAD)
+        ledger.record_failure(key, "deterministic")
+        ledger.record_failure(key, "deterministic")  # now parked
+        assert ledger.is_parked(key) is True
+
+        manager = _ledger_manager(store, ledger)
+
+        async def run():
+            result = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert result == {"parked": True}
+            assert calls == []  # store never attempted
+
+        asyncio.run(run())
+
+
+def test_store_records_deterministic_failure_and_parks():
+    """Two deterministic store failures park the content; the 3rd is skipped."""
+    from kumiho_memory.failure_ledger import FailureLedger
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    attempts = []
+
+    async def store(**kwargs):
+        attempts.append(kwargs.get("title"))
+        raise ValueError("schema validation failed")  # deterministic
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=2)
+        queue = RetryQueue(os.path.join(tmp, "queue"))
+        manager = _ledger_manager(store, ledger, retry_queue=queue)
+        key = _payload_failure_key(_POISON_PAYLOAD)
+
+        async def run():
+            # 1st failure: recorded, queued, not yet parked.
+            r1 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r1.get("queued") is True
+            assert ledger.is_parked(key) is False
+            # 2nd failure: reaches threshold → parked.
+            r2 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r2.get("queued") is True
+            assert ledger.is_parked(key) is True
+            # 3rd call: skipped entirely (store not attempted again).
+            before = len(attempts)
+            r3 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r3 == {"parked": True}
+            assert len(attempts) == before  # deterministic ValueError → 1 call each
+
+        asyncio.run(run())
+
+
+def test_store_transient_failures_never_park():
+    """Repeated transient (ConnectionError) failures never park the content."""
+    from kumiho_memory.failure_ledger import FailureLedger
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    async def store(**kwargs):
+        raise ConnectionError("network down")  # transient
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=2)
+        queue = RetryQueue(os.path.join(tmp, "queue"))
+        manager = _ledger_manager(store, ledger, retry_queue=queue, store_max_retries=1)
+        key = _payload_failure_key(_POISON_PAYLOAD)
+
+        async def run():
+            for _ in range(4):
+                await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert ledger.is_parked(key) is False
+            entry = ledger.get(key)
+            assert entry["last_error_class"] == "transient"
+
+        asyncio.run(run())
+
+
+def test_store_success_clears_ledger_history():
+    """A successful store clears any prior failure history for the content."""
+    from kumiho_memory.failure_ledger import FailureLedger
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    outcome = {"fail": True}
+
+    async def store(**kwargs):
+        if outcome["fail"]:
+            raise ValueError("deterministic once")
+        return {"revision_kref": "kref://ok"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=3)
+        queue = RetryQueue(os.path.join(tmp, "queue"))
+        manager = _ledger_manager(store, ledger, retry_queue=queue)
+        key = _payload_failure_key(_POISON_PAYLOAD)
+
+        async def run():
+            await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert ledger.get(key)["attempts"] == 1
+            outcome["fail"] = False
+            result = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert result == {"revision_kref": "kref://ok"}
+            assert ledger.get(key) is None  # history cleared
+
+        asyncio.run(run())
+
+
+def test_store_without_ledger_is_unchanged():
+    """No ledger configured → behavior identical to before (#118 additive)."""
+    calls = []
+
+    async def store(**kwargs):
+        calls.append(kwargs)
+        return {"revision_kref": "kref://x"}
+
+    manager = _ledger_manager(store, None)
+
+    async def run():
+        result = await manager._store_with_retry(**_POISON_PAYLOAD)
+        assert result == {"revision_kref": "kref://x"}
+        assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+def test_payload_failure_key_json_fallback_when_no_content_fields():
+    """A payload with none of the content-identifying fields falls back to a
+    stable hash of the whole payload (issue #118)."""
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    p1 = {"artifact_location": "/tmp/a", "space_hint": "x"}
+    p2 = {"space_hint": "x", "artifact_location": "/tmp/a"}  # same, reordered
+    p3 = {"artifact_location": "/tmp/b", "space_hint": "x"}  # different content
+
+    k1 = _payload_failure_key(p1)
+    assert isinstance(k1, str) and len(k1) == 64  # sha256 hex
+    assert k1 == _payload_failure_key(p2)  # order-independent (sort_keys)
+    assert k1 != _payload_failure_key(p3)
+
+
+class _ParkCheckRaisingLedger:
+    """is_parked raises; writes are no-ops."""
+
+    def is_parked(self, key, *, now=None):
+        raise RuntimeError("is_parked boom")
+
+    def record_failure(self, key, error_class, *, now=None):
+        pass
+
+    def record_success(self, key):
+        pass
+
+
+def test_store_park_check_error_does_not_block_store():
+    """A ledger is_parked() error is swallowed — the store still proceeds
+    (issue #118: ledger errors must never break a store)."""
+    calls = []
+
+    async def store(**kwargs):
+        calls.append(kwargs)
+        return {"revision_kref": "kref://ok"}
+
+    manager = _ledger_manager(store, _ParkCheckRaisingLedger())
+
+    async def run():
+        result = await manager._store_with_retry(**_POISON_PAYLOAD)
+        assert result == {"revision_kref": "kref://ok"}
+        assert len(calls) == 1  # store attempted despite the park-check error
+
+    asyncio.run(run())
+
+
+class _WriteRaisingLedger:
+    """is_parked works, but record_success / record_failure raise."""
+
+    def is_parked(self, key, *, now=None):
+        return False
+
+    def record_failure(self, key, error_class, *, now=None):
+        raise RuntimeError("record_failure boom")
+
+    def record_success(self, key):
+        raise RuntimeError("record_success boom")
+
+
+def test_store_ledger_write_errors_are_swallowed():
+    """record_success / record_failure errors never surface to the caller
+    (issue #118)."""
+    outcome = {"fail": False}
+
+    async def store(**kwargs):
+        if outcome["fail"]:
+            raise ValueError("deterministic")
+        return {"revision_kref": "kref://ok"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        queue = RetryQueue(os.path.join(tmp, "q"))
+        manager = _ledger_manager(store, _WriteRaisingLedger(), retry_queue=queue)
+
+        async def run():
+            # Success path: record_success raises but is swallowed.
+            r1 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r1 == {"revision_kref": "kref://ok"}
+            # Failure path: record_failure raises but is swallowed; payload queued.
+            outcome["fail"] = True
+            r2 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r2.get("queued") is True
 
         asyncio.run(run())
 
@@ -1478,3 +1724,132 @@ def test_generate_session_id_recovers_on_retry_without_warning(caplog):
     assert not any(
         "get_active_session" in r.getMessage() for r in warnings
     )
+
+
+# --------------------------------------------------------------------------
+# event_date confidence stamping at consolidation (#119)
+# --------------------------------------------------------------------------
+
+from datetime import timedelta
+
+
+class EventSummarizer:
+    """Stub summarizer that emits one event with a configurable event_date.
+
+    ``event_date`` may be a literal ISO string, or a callable taking the
+    consolidated ``messages`` (so a test can derive a date from the buffered
+    message timestamps — e.g. "yesterday").
+    """
+
+    def __init__(self, event_date):
+        self._event_date = event_date
+
+    async def summarize_conversation(self, messages, context=None):
+        ed = self._event_date(messages) if callable(self._event_date) else self._event_date
+        return {
+            "type": "summary",
+            "title": "An event happened",
+            "summary": "Something occurred.",
+            "events": [{
+                "event": "the thing happened",
+                "when": "then",
+                "event_date": ed,
+                "consequence": "noted",
+            }],
+            "knowledge": {"facts": [], "decisions": [], "actions": [], "open_questions": []},
+            "classification": {"topics": ["events"], "entities": []},
+        }
+
+    async def generate_implications(self, messages, context=None):
+        return []
+
+
+class PassthroughRedactor:
+    def anonymize_summary(self, summary):
+        return summary
+
+    def reject_credentials(self, text):
+        pass
+
+
+def _consolidate_capturing_metadata(user_message, event_date):
+    """Run a full ingest→consolidate and return the stored metadata dict."""
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    stored = {}
+
+    async def store_stub(**kwargs):
+        stored.update(kwargs)
+        return {"item_kref": "kref://memory/item", "revision_kref": ""}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = UniversalMemoryManager(
+            redis_buffer=buffer,
+            summarizer=EventSummarizer(event_date),
+            pii_redactor=PassthroughRedactor(),
+            memory_store=store_stub,
+            consolidation_threshold=2,
+            artifact_root=tmpdir,
+        )
+
+        async def run():
+            ingest = await manager.ingest_message(
+                user_id="user-ev", message=user_message, context="personal",
+            )
+            sid = ingest["session_id"]
+            await manager.add_assistant_response(session_id=sid, response="Noted.")
+            result = await manager.consolidate_session(session_id=sid)
+            assert result["success"] is True
+
+        asyncio.run(run())
+    return stored.get("metadata", {})
+
+
+def test_consolidation_marks_literal_date_verified():
+    # The date is literally present in the user's message → verified.
+    meta = _consolidate_capturing_metadata(
+        "The incident happened on 2026-07-18 in Seoul.", "2026-07-18",
+    )
+    assert meta["event_date"] == "2026-07-18"
+    assert meta["event_date_confidence"] == "verified"
+
+
+def test_consolidation_marks_hallucinated_date_unverified():
+    # A well-formed date absent from the source → kept, but flagged unverified.
+    meta = _consolidate_capturing_metadata(
+        "We chatted about the trip. No specific dates came up.", "2026-03-15",
+    )
+    assert meta["event_date"] == "2026-03-15"  # still stored as metadata
+    assert meta["event_date_confidence"] == "unverified"
+
+
+def test_consolidation_marks_relative_date_derived_via_message_timestamp():
+    # "yesterday" in the source + an event_date that is exactly one day before
+    # the buffered message timestamp → derived. Proves the reference timestamp
+    # is wired from the message, not fabricated.
+    def yesterday_of(messages):
+        from kumiho_memory.temporal_guard import parse_timestamp
+        ref = parse_timestamp(messages[-1].get("timestamp"))
+        return (ref - timedelta(days=1)).date().isoformat()
+
+    meta = _consolidate_capturing_metadata(
+        "We shipped the release yesterday, big relief.", yesterday_of,
+    )
+    assert meta["event_date_confidence"] == "derived"
+
+
+def test_consolidation_marks_relative_date_derived_via_in_content_anchor():
+    # Historical / backfill case: the message CONTENT carries the date anchor
+    # ('[7 May 2023]') and a relative token ('yesterday'), and the summarizer
+    # emits the resolved historical date 2023-05-06. The buffered message
+    # timestamp is the wall-clock INGEST time (~now, 2026) — NOT the conversation
+    # time — so relative derivation must anchor on the in-content date, not the
+    # ingest clock. Pre-fix this was misclassified 'unverified' and lost the
+    # event-proximity boost, defeating requirement (1)(b) for exactly the
+    # backfill/LoCoMo use case event_date exists for.
+    meta = _consolidate_capturing_metadata(
+        "[7 May 2023] We shipped the release yesterday, big relief.",
+        "2023-05-06",
+    )
+    assert meta["event_date"] == "2023-05-06"
+    assert meta["event_date_confidence"] == "derived"

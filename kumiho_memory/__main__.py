@@ -215,6 +215,7 @@ def cmd_ingest_skill(args: argparse.Namespace) -> int:
 def cmd_dream(args: argparse.Namespace) -> int:
     """Run a Dream State consolidation cycle."""
     from kumiho_memory import DreamState
+    from kumiho_memory.failure_ledger import default_failure_ledger
 
     prefs = _load_preferences()
     _configure_llm_from_prefs(prefs, "dreamState")
@@ -226,6 +227,8 @@ def cmd_dream(args: argparse.Namespace) -> int:
         max_deprecation_ratio=args.max_deprecation_ratio,
         allow_published_deprecation=args.allow_published_deprecation,
         extra_instructions=args.policy,
+        # Skip items parked for repeated deterministic failures (#118).
+        failure_ledger=default_failure_ledger(),
     )
 
     result = asyncio.run(ds.run())
