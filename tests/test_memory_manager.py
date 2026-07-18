@@ -1478,3 +1478,115 @@ def test_generate_session_id_recovers_on_retry_without_warning(caplog):
     assert not any(
         "get_active_session" in r.getMessage() for r in warnings
     )
+
+
+# --------------------------------------------------------------------------
+# event_date confidence stamping at consolidation (#119)
+# --------------------------------------------------------------------------
+
+from datetime import timedelta
+
+
+class EventSummarizer:
+    """Stub summarizer that emits one event with a configurable event_date.
+
+    ``event_date`` may be a literal ISO string, or a callable taking the
+    consolidated ``messages`` (so a test can derive a date from the buffered
+    message timestamps — e.g. "yesterday").
+    """
+
+    def __init__(self, event_date):
+        self._event_date = event_date
+
+    async def summarize_conversation(self, messages, context=None):
+        ed = self._event_date(messages) if callable(self._event_date) else self._event_date
+        return {
+            "type": "summary",
+            "title": "An event happened",
+            "summary": "Something occurred.",
+            "events": [{
+                "event": "the thing happened",
+                "when": "then",
+                "event_date": ed,
+                "consequence": "noted",
+            }],
+            "knowledge": {"facts": [], "decisions": [], "actions": [], "open_questions": []},
+            "classification": {"topics": ["events"], "entities": []},
+        }
+
+    async def generate_implications(self, messages, context=None):
+        return []
+
+
+class PassthroughRedactor:
+    def anonymize_summary(self, summary):
+        return summary
+
+    def reject_credentials(self, text):
+        pass
+
+
+def _consolidate_capturing_metadata(user_message, event_date):
+    """Run a full ingest→consolidate and return the stored metadata dict."""
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    stored = {}
+
+    async def store_stub(**kwargs):
+        stored.update(kwargs)
+        return {"item_kref": "kref://memory/item", "revision_kref": ""}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = UniversalMemoryManager(
+            redis_buffer=buffer,
+            summarizer=EventSummarizer(event_date),
+            pii_redactor=PassthroughRedactor(),
+            memory_store=store_stub,
+            consolidation_threshold=2,
+            artifact_root=tmpdir,
+        )
+
+        async def run():
+            ingest = await manager.ingest_message(
+                user_id="user-ev", message=user_message, context="personal",
+            )
+            sid = ingest["session_id"]
+            await manager.add_assistant_response(session_id=sid, response="Noted.")
+            result = await manager.consolidate_session(session_id=sid)
+            assert result["success"] is True
+
+        asyncio.run(run())
+    return stored.get("metadata", {})
+
+
+def test_consolidation_marks_literal_date_verified():
+    # The date is literally present in the user's message → verified.
+    meta = _consolidate_capturing_metadata(
+        "The incident happened on 2026-07-18 in Seoul.", "2026-07-18",
+    )
+    assert meta["event_date"] == "2026-07-18"
+    assert meta["event_date_confidence"] == "verified"
+
+
+def test_consolidation_marks_hallucinated_date_unverified():
+    # A well-formed date absent from the source → kept, but flagged unverified.
+    meta = _consolidate_capturing_metadata(
+        "We chatted about the trip. No specific dates came up.", "2026-03-15",
+    )
+    assert meta["event_date"] == "2026-03-15"  # still stored as metadata
+    assert meta["event_date_confidence"] == "unverified"
+
+
+def test_consolidation_marks_relative_date_derived_via_message_timestamp():
+    # "yesterday" in the source + an event_date that is exactly one day before
+    # the buffered message timestamp → derived. Proves the reference timestamp
+    # is wired from the message, not fabricated.
+    def yesterday_of(messages):
+        from kumiho_memory.temporal_guard import parse_timestamp
+        ref = parse_timestamp(messages[-1].get("timestamp"))
+        return (ref - timedelta(days=1)).date().isoformat()
+
+    meta = _consolidate_capturing_metadata(
+        "We shipped the release yesterday, big relief.", yesterday_of,
+    )
+    assert meta["event_date_confidence"] == "derived"
