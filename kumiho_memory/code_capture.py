@@ -366,6 +366,34 @@ def build_packet(repo_path: str, commit: CommitInfo, config: CodeMemoryConfig) -
     return "\n".join(parts)
 
 
+def _anonymize_packet(redactor: Any, packet: str, stats: IngestStats) -> str:
+    """Pre-LLM privacy pass over the per-commit packet — the commit-path twin
+    of the session path's ``anonymize_summary`` over its chunks
+    (:mod:`code_session` step [3]: "redact BEFORE the LLM").  ``build_packet``
+    assembles raw subject/body/diff; without this a leaked key in a commit
+    transits the LLM provider before the #99 storage gate ever runs.  That gate
+    (:func:`validate_decisions`) screens what comes BACK from the model and
+    stays as the second layer; this closes the pre-LLM leg so what the model
+    sees is already screened ('what is verified is what is written').
+
+    Mirrors the session policy exactly: PII is redacted IN PLACE
+    (``anonymize_summary``); a credential-bearing LINE is dropped whole to a
+    ``[redacted]`` placeholder (counted) — the same drop-the-unit discipline
+    the session path applies to its ``session_line``.  Screening per line (not
+    over the whole packet) keeps the drop surgical: hunk headers, file paths,
+    and surrounding diff structure survive so the model still has enough to
+    mine decisions (anonymize content, not structure)."""
+    if redactor is None:
+        return packet
+    out: List[str] = []
+    for line in packet.split("\n"):
+        line = redactor.anonymize_summary(line)
+        if _drop_if_credential(redactor, line, stats):
+            line = "[redacted]"
+        out.append(line)
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------------------
 # [4] LLM structuring — batched, strict schema
 # ---------------------------------------------------------------------------
@@ -1011,7 +1039,13 @@ async def ingest_repo(
         if c.files and all(_is_denylisted(f) for f in c.files):
             stats.skipped_prefilter += 1
             continue
-        c.packet = build_packet(repo_path, c, config)
+        # Anonymize BEFORE the packet reaches the LLM adapter (issue #117):
+        # PII redacted in place, credential-bearing lines dropped to the
+        # [redacted] placeholder — parity with the session path's pre-LLM
+        # anonymization.  redactor is never None here (defaulted above).
+        c.packet = _anonymize_packet(
+            redactor, build_packet(repo_path, c, config), stats,
+        )
         pending.append(c)
 
     # batched structuring, concurrency 3

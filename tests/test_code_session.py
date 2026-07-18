@@ -714,6 +714,54 @@ def test_standalone_capture_origin_session(monkeypatch, tmp_path):
     assert der and "session" in der[0].target_kref.uri
 
 
+def test_session_marker_credential_line_uses_redacted_placeholder(
+        monkeypatch, tmp_path):
+    """Issue #117 part 2 / F4 analog (PR #111): when the first user line bears a
+    credential it is dropped, and the resulting session_line — which feeds the
+    session MARKER's embedding_text — must be the '[redacted]' placeholder, NOT
+    '' (an empty embedding_text makes write_revision fall back to embedding ALL
+    metadata: hash/author/bookkeeping vector pollution)."""
+    from kumiho_memory.privacy import PIIRedactor
+
+    repo, _sha = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+
+    quote = "defer the bge-m3 migration because the release cycle comes first"
+    msgs = [
+        _msg("user", "should we migrate embeddings to bge-m3 now? set "
+                     'api_key = "sk-abcdefghij0123456789ABCDEF" first'),
+        _msg("assistant", quote),
+        _msg("user", "yes, agreed"),
+    ]
+    adapter = _StubAdapter(_payload([{
+        "title": "Defer the bge-m3 embedding migration",
+        "decision": "defer the bge-m3 migration until after the release cycle",
+        "rationale": "release cycle first",
+        "why_question": "why was the bge-m3 migration deferred?",
+        "symbols": [], "files": ["rerank.py"], "mentioned_commits": [],
+        "alternatives": [{
+            "option": "migrate now", "verdict": "deferred",
+            "quote": quote, "quote_en": "", "message_index": 1,
+        }],
+        "evidence": [], "settled_by_message": 2,
+        "status_hint": "uncommitted", "confidence": "high",
+    }]))
+    stats = _mine(repo, adapter, messages=msgs, redactor=PIIRedactor())
+    assert stats.credentials_dropped >= 1
+
+    import kumiho
+
+    project = kumiho.get_project("p-code")
+    marker = project.get_item(session_slug("repo", "s1"), KIND_SESSION)
+    assert marker.get_latest_revision() is not None
+    # The marker embedding_text is EXACTLY the placeholder — proving the
+    # dropped session_line took the client-level (explicit-text) write path,
+    # NOT write_revision's embed-all-metadata fallback (which appends nothing
+    # here).  The decision embedding merely CONTAINS the placeholder substring,
+    # so an exact-match count isolates the marker write.
+    assert _FAKE.embedding_texts.count("[redacted]") >= 1
+
+
 def test_evidence_dedup_slug_convergence_and_near_dup(monkeypatch, tmp_path):
     repo, sha = _make_repo(tmp_path)
     _install_fake_kumiho(monkeypatch)

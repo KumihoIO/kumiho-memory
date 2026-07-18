@@ -1520,7 +1520,13 @@ async def mine_session(
             if redactor is not None:
                 line = redactor.anonymize_summary(line)
                 if _drop_if_credential(redactor, line, stats):
-                    line = ""
+                    # NOT "" — session_line feeds write_revision's
+                    # embedding_text on the marker (and standalone-decision
+                    # composition); an empty string takes the embed-ALL-metadata
+                    # fallback (hashes/author/bookkeeping-key vector pollution).
+                    # Mirror the commit path's F4 placeholder (code_capture
+                    # subject, PR #111).
+                    line = "[redacted]"
             session_line = line[:80]
             break
 

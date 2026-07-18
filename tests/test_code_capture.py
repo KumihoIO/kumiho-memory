@@ -835,6 +835,8 @@ def test_capture_decisions_empty_and_bad_ref(tmp_path, monkeypatch):
 
 _AWS_KEY = "AKIAIOSFODNN7EXAMPLE"          # matches PIIRedactor aws_access_key
 _SK_KEY = "sk-abcdefghij0123456789ABCDEF"  # matches api_key_generic
+_EMAIL = "alice@example.com"               # matches PIIRedactor email
+_PHONE = "415-555-0199"                    # matches PIIRedactor phone
 
 
 def _make_repo_secret_subject(tmp_path):
@@ -873,6 +875,82 @@ def _payload_one(commit_hash, *, evidence, **overrides):
     }
     dec.update(overrides)
     return _json.dumps({"commits": [{"hash": commit_hash, "decisions": [dec]}]})
+
+
+class _CapturingAdapter(_StubAdapter):
+    """Records the prompt text sent to the LLM so tests can assert on the
+    PRE-LLM packet — the exact bytes that would transit the provider."""
+
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.prompts = []
+
+    async def chat(self, *, messages, model, system="", max_tokens=1024,
+                   json_mode=False):
+        self.prompts.append(messages[0]["content"])
+        return await super().chat(
+            messages=messages, model=model, system=system,
+            max_tokens=max_tokens, json_mode=json_mode,
+        )
+
+
+def _make_repo_pii_diff(tmp_path):
+    """A two-commit repo whose HEAD carries PII in the subject/body AND a
+    credential + PII inside the diff — the 'raw packet transits the provider'
+    case from issue #117."""
+    repo = tmp_path / "repo_pii"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "T")
+    (repo / "cfg.py").write_text("OWNER = 'x'\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "seed config module\n\nbaseline body")
+    (repo / "cfg.py").write_text(
+        f"OWNER = '{_EMAIL}'\n"
+        f'API_KEY = "{_SK_KEY}"\n'
+        f"PHONE = '{_PHONE}'\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m",
+         f"fix: page {_EMAIL} on failure\n\n"
+         f"escalation contact is {_PHONE}, no other notes")
+    return repo
+
+
+def test_ingest_anonymizes_packet_before_llm(tmp_path, monkeypatch):
+    """Issue #117: the per-commit packet is anonymized BEFORE it reaches the
+    LLM adapter (parity with the session path).  PII is redacted in place, a
+    credential-bearing line is dropped to [redacted], and diff STRUCTURE (hunk
+    headers, file paths, labels) survives so extraction quality is preserved."""
+    repo = _make_repo_pii_diff(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    commits = enumerate_commits(str(repo), "HEAD~1..HEAD", 1)
+    adapter = _CapturingAdapter(_payload_for(commits))
+    cfg = CodeMemoryConfig(repo="testrepo")
+
+    stats = asyncio.run(ingest_repo(
+        str(repo), "HEAD~1..HEAD", project_name="p-code",
+        config=cfg, adapter=adapter, model="stub",
+    ))
+    assert adapter.calls >= 1 and adapter.prompts
+    sent = "\n".join(adapter.prompts)   # everything the provider would see
+
+    # content anonymized: no raw PII or key transits the LLM
+    assert _EMAIL not in sent
+    assert _PHONE not in sent
+    assert _SK_KEY not in sent
+    # PII redacted IN PLACE (descriptors present, in subject/body AND diff)
+    assert "[email]" in sent and "[phone]" in sent
+    # credential-bearing line DROPPED to the placeholder (counted)
+    assert "[redacted]" in sent
+    assert stats.credentials_dropped >= 1
+    # structure preserved: the model still has hunk headers, paths, and labels
+    assert "subject:" in sent
+    assert "changed files:" in sent and "- cfg.py" in sent
+    assert "--- diff: cfg.py ---" in sent
+    assert "@@" in sent
 
 
 def test_ingest_screens_credential_in_commit_message(tmp_path, monkeypatch):
