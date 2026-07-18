@@ -41,14 +41,17 @@ independent v0.18.0 review.
   layer.
 
 Gate note: every change above passed its per-change gate (byte-diff recall
-invariance, paired conv-26 answer-only runs, permutation tests) on a stable
-benchmark environment. The full-10 re-verification could not be completed
-honestly: the local benchmark CE was running in-progress (unreleased)
-server development whose behavior changed mid-cycle — live-confirmed via
-the bytediff harness (1,587 recall differences on identical code and
-corpus) — so the old 0.5435 baseline describes a server state that no
-longer exists on that machine. A fresh baseline will be established once
-the new server ships as a versioned release.
+invariance, paired conv-26 answer-only runs, permutation tests), each run
+inside a write-quiet window on the benchmark CE. The full-10 re-verification
+was invalidated mid-campaign by a subtler mechanism, isolated via a
+three-way controlled comparison: large writes to *other* projects on the
+same server (a second corpus ingest plus a memory backfill) shifted this
+project's recall rankings through corpus-global BM25 statistics
+(kumiho-server#28) — same code, same corpus, 1,142 recall differences
+across time, with same-code stability controls clean at both endpoints.
+Client code was exonerated; the 0.5435 baseline remains internally valid
+for its own write-quiet window. A fresh baseline will be established on an
+isolated (write-quiet or #28-fixed) server state as the new reference.
 
 ## v0.18.0
 
