@@ -142,11 +142,36 @@ def test_park_threshold_one_parks_immediately():
         assert ledger.is_parked("k", now=_now()) is True
 
 
-def test_mixed_then_deterministic_parks_on_total_attempts():
-    """A transient attempt then a deterministic one reaches threshold=2."""
+def test_transient_does_not_count_toward_park_threshold():
+    """Parking counts *deterministic* attempts only (issue #118).
+
+    A transient blip followed by a single deterministic failure must NOT park
+    (that would pull storable content for the whole TTL after being seen
+    deterministically-bad only once).  A second deterministic failure parks it.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         ledger = FailureLedger(tmp, park_threshold=2)
         ledger.record_failure("k", "transient", now=_now())
+        ledger.record_failure("k", "deterministic", now=_now())
+        # Total attempts == 2, but only ONE deterministic → not parked.
+        assert ledger.is_parked("k", now=_now()) is False
+        entry = ledger.get("k")
+        assert entry["attempts"] == 2
+        assert entry["deterministic_attempts"] == 1
+        # A second deterministic failure reaches the deterministic threshold.
+        ledger.record_failure("k", "deterministic", now=_now())
+        assert ledger.is_parked("k", now=_now()) is True
+        assert ledger.get("k")["deterministic_attempts"] == 2
+
+
+def test_interleaved_transient_does_not_reset_deterministic_count():
+    """Deterministic attempts accumulate even with transient failures between."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=2)
+        ledger.record_failure("k", "deterministic", now=_now())
+        ledger.record_failure("k", "transient", now=_now())
+        assert ledger.is_parked("k", now=_now()) is False
+        # The second deterministic failure (with a transient in between) parks.
         ledger.record_failure("k", "deterministic", now=_now())
         assert ledger.is_parked("k", now=_now()) is True
 
@@ -293,6 +318,30 @@ def test_entries_not_dict_starts_fresh():
         assert len(ledger) == 0
 
 
+def test_invalid_utf8_file_starts_fresh():
+    """A ledger whose bytes are not valid UTF-8 loads empty and never raises.
+
+    Regression for issue #118: text-mode ``read()`` would raise
+    UnicodeDecodeError (a ValueError, not an OSError) past both read-loop
+    ``except`` arms, crashing every ledger call and permanently disabling
+    parking until the file was manually deleted.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp)
+        ledger._file.parent.mkdir(parents=True, exist_ok=True)
+        # Invalid UTF-8: disk corruption / partial hardware write / tampering.
+        ledger._file.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \xff nonsense")
+        # Every read path must behave as an empty ledger, never raise.
+        assert len(ledger) == 0
+        assert ledger.is_parked("k") is False
+        assert ledger.get("k") is None
+        # A write loads (corrupt → empty) then rewrites a valid file (self-heal).
+        entry = ledger.record_failure("k", "deterministic", now=_now())
+        assert entry["attempts"] == 1
+        reloaded = json.loads(ledger._file.read_text(encoding="utf-8"))
+        assert "k" in reloaded["entries"]
+
+
 # ---------------------------------------------------------------------------
 # Atomic write / concurrency
 # ---------------------------------------------------------------------------
@@ -381,6 +430,40 @@ def test_pruning_drops_oldest_parked_when_all_parked():
         # Oldest parked dropped, newest retained.
         assert ledger.get("p-0") is None
         assert ledger.get("p-3") is not None
+
+
+def test_prune_protects_just_recorded_entry_under_saturation():
+    """A poison item building toward the threshold is not evicted when the
+    ledger is saturated with parked entries (issue #118 nitpick).
+
+    Pre-fix, the just-recorded non-parked entry (ranked first for dropping)
+    was pruned immediately every run, so it could never accumulate enough
+    deterministic failures to park.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=2, max_entries=3)
+        base = _now()
+        # Saturate with 3 parked entries (2 deterministic failures each).
+        for i in range(3):
+            t = base + timedelta(minutes=i)
+            ledger.record_failure(f"parked-{i}", "deterministic", now=t)
+            ledger.record_failure(f"parked-{i}", "deterministic", now=t)
+        assert len(ledger) == 3
+        later = base + timedelta(minutes=10)
+        assert all(ledger.is_parked(f"parked-{i}", now=later) for i in range(3))
+
+        # A NEW poison item fails deterministically once (building, not parked).
+        t_build = base + timedelta(minutes=20)
+        ledger.record_failure("building", "deterministic", now=t_build)
+        # It survived pruning; the oldest parked entry was evicted instead.
+        assert ledger.get("building") is not None
+        assert ledger.get("building")["deterministic_attempts"] == 1
+        assert len(ledger) == 3
+        assert ledger.get("parked-0") is None  # oldest parked dropped
+
+        # It can now reach the threshold and park on its second failure.
+        ledger.record_failure("building", "deterministic", now=t_build)
+        assert ledger.is_parked("building", now=t_build) is True
 
 
 # ---------------------------------------------------------------------------

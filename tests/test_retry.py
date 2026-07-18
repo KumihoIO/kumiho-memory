@@ -374,7 +374,7 @@ def test_retry_queue_flush_success():
 
         async def run():
             result = await queue.flush(store_stub)
-            assert result == {"succeeded": 2, "failed": 0}
+            assert result == {"succeeded": 2, "failed": 0, "dropped": 0}
             assert queue.count == 0
             assert replayed == ["replay-1", "replay-2"]
 
@@ -406,6 +406,52 @@ def test_retry_queue_flush_partial_failure():
         asyncio.run(run())
 
 
+def test_retry_queue_flush_drops_deterministic_failure():
+    """A payload that fails deterministically on replay is dropped, not
+    re-queued (issue #118) — re-queuing would replay the same poison payload
+    on every future flush forever."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        queue = RetryQueue(tmpdir)
+        queue.enqueue({"project": "test", "title": "poison"})
+        queue.enqueue({"project": "test", "title": "will-succeed"})
+
+        calls = []
+
+        async def store(**kwargs):
+            calls.append(kwargs.get("title"))
+            if kwargs.get("title") == "poison":
+                raise ValueError("schema validation failed")  # deterministic
+            return {"ok": True}
+
+        async def run():
+            result = await queue.flush(store, max_retries=3)
+            assert result == {"succeeded": 1, "failed": 0, "dropped": 1}
+            # The poison payload is gone — not left to replay every flush.
+            assert queue.count == 0
+            # Deterministic fail-fast: the poison item was attempted exactly once.
+            assert calls.count("poison") == 1
+
+        asyncio.run(run())
+
+
+def test_retry_queue_flush_transient_stays_queued():
+    """A transient replay failure is still re-queued (not dropped) — only
+    deterministic failures are dropped."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        queue = RetryQueue(tmpdir)
+        queue.enqueue({"project": "test", "title": "blip"})
+
+        async def store(**kwargs):
+            raise ConnectionError("still down")  # transient
+
+        async def run():
+            result = await queue.flush(store, max_retries=1)
+            assert result == {"succeeded": 0, "failed": 1, "dropped": 0}
+            assert queue.count == 1  # stays for the next flush
+
+        asyncio.run(run())
+
+
 def test_retry_queue_flush_empty():
     """Flushing an empty queue should return zeros."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -416,6 +462,6 @@ def test_retry_queue_flush_empty():
 
         async def run():
             result = await queue.flush(store_stub)
-            assert result == {"succeeded": 0, "failed": 0}
+            assert result == {"succeeded": 0, "failed": 0, "dropped": 0}
 
         asyncio.run(run())

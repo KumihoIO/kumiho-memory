@@ -929,7 +929,7 @@ def test_flush_retry_queue_replays_items():
 
         async def run():
             result = await manager.flush_retry_queue()
-            assert result == {"succeeded": 2, "failed": 0}
+            assert result == {"succeeded": 2, "failed": 0, "dropped": 0}
             assert queue.count == 0
             assert replayed == ["queued-1", "queued-2"]
 
@@ -1133,6 +1133,92 @@ def test_store_without_ledger_is_unchanged():
         assert len(calls) == 1
 
     asyncio.run(run())
+
+
+def test_payload_failure_key_json_fallback_when_no_content_fields():
+    """A payload with none of the content-identifying fields falls back to a
+    stable hash of the whole payload (issue #118)."""
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    p1 = {"artifact_location": "/tmp/a", "space_hint": "x"}
+    p2 = {"space_hint": "x", "artifact_location": "/tmp/a"}  # same, reordered
+    p3 = {"artifact_location": "/tmp/b", "space_hint": "x"}  # different content
+
+    k1 = _payload_failure_key(p1)
+    assert isinstance(k1, str) and len(k1) == 64  # sha256 hex
+    assert k1 == _payload_failure_key(p2)  # order-independent (sort_keys)
+    assert k1 != _payload_failure_key(p3)
+
+
+class _ParkCheckRaisingLedger:
+    """is_parked raises; writes are no-ops."""
+
+    def is_parked(self, key, *, now=None):
+        raise RuntimeError("is_parked boom")
+
+    def record_failure(self, key, error_class, *, now=None):
+        pass
+
+    def record_success(self, key):
+        pass
+
+
+def test_store_park_check_error_does_not_block_store():
+    """A ledger is_parked() error is swallowed — the store still proceeds
+    (issue #118: ledger errors must never break a store)."""
+    calls = []
+
+    async def store(**kwargs):
+        calls.append(kwargs)
+        return {"revision_kref": "kref://ok"}
+
+    manager = _ledger_manager(store, _ParkCheckRaisingLedger())
+
+    async def run():
+        result = await manager._store_with_retry(**_POISON_PAYLOAD)
+        assert result == {"revision_kref": "kref://ok"}
+        assert len(calls) == 1  # store attempted despite the park-check error
+
+    asyncio.run(run())
+
+
+class _WriteRaisingLedger:
+    """is_parked works, but record_success / record_failure raise."""
+
+    def is_parked(self, key, *, now=None):
+        return False
+
+    def record_failure(self, key, error_class, *, now=None):
+        raise RuntimeError("record_failure boom")
+
+    def record_success(self, key):
+        raise RuntimeError("record_success boom")
+
+
+def test_store_ledger_write_errors_are_swallowed():
+    """record_success / record_failure errors never surface to the caller
+    (issue #118)."""
+    outcome = {"fail": False}
+
+    async def store(**kwargs):
+        if outcome["fail"]:
+            raise ValueError("deterministic")
+        return {"revision_kref": "kref://ok"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        queue = RetryQueue(os.path.join(tmp, "q"))
+        manager = _ledger_manager(store, _WriteRaisingLedger(), retry_queue=queue)
+
+        async def run():
+            # Success path: record_success raises but is swallowed.
+            r1 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r1 == {"revision_kref": "kref://ok"}
+            # Failure path: record_failure raises but is swallowed; payload queued.
+            outcome["fail"] = True
+            r2 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r2.get("queued") is True
+
+        asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------

@@ -1605,6 +1605,152 @@ def test_assess_batch_no_ledger_deterministic_returns_empty():
     asyncio.run(run())
 
 
+class _MixedPoisonAdapter:
+    """Fails deterministically for DETPOISON content, transiently for
+    TRANSPOISON content, and assesses anything else cleanly."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, *, messages, model, system, max_tokens, json_mode=False):
+        self.calls += 1
+        content = messages[0]["content"]
+        if "DETPOISON" in content:
+            raise _DetHTTPError("content blocked", 400)  # deterministic (4xx)
+        if "TRANSPOISON" in content:
+            raise ConnectionError("network blip")  # transient
+        return json.dumps(
+            {"assessments": [{"index": 0, "relevance_score": 0.9, "should_deprecate": False}]}
+        )
+
+
+class _AdapterSummarizer:
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.model = "stub-model"
+
+
+def test_assess_isolate_transient_in_isolation_not_recorded():
+    """A batch that fails deterministically as a whole, where one item fails
+    *transiently* when re-assessed alone, records only the deterministic item;
+    the transient blip during isolation counts toward neither the systemic
+    decision nor the ledger (issue #118 — the previously-uncovered else branch)."""
+    det_item = _assess_rev("kref://P/s/det.conversation", "DETPOISON content")
+    trans_item = _assess_rev("kref://P/s/trans.conversation", "TRANSPOISON content")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _ds_with_ledger(tmp, summarizer=_AdapterSummarizer(_MixedPoisonAdapter()))
+
+        async def run():
+            # Batch prompt carries both markers → DETPOISON makes the whole
+            # batch fail deterministically → isolation runs.
+            survivors = await ds._assess_batch([det_item, trans_item], {})
+            # det_item failed deterministically; trans_item failed transiently
+            # in isolation — neither is a survivor.
+            assert survivors == []
+
+        asyncio.run(run())
+
+        ledger = ds.failure_ledger
+        # Only the deterministic item is recorded/parked.
+        assert ledger.is_parked(det_item.item_kref.uri) is True
+        # The transient-in-isolation item is NOT recorded (else branch).
+        assert ledger.get(trans_item.item_kref.uri) is None
+        assert len(ledger) == 1
+
+
+class _MalformedFieldAdapter:
+    """chat() SUCCEEDS but returns a malformed field for the item (a non-numeric
+    relevance_score) — an output-format problem, not a content failure."""
+
+    async def chat(self, *, messages, model, system, max_tokens, json_mode=False):
+        return json.dumps(
+            {"assessments": [{"index": 0, "relevance_score": "high", "should_deprecate": False}]}
+        )
+
+
+def test_assess_batch_malformed_field_does_not_park_item():
+    """A malformed LLM assessment field skips just that entry — it must NOT be
+    classified deterministic and park an innocent memory (issue #118)."""
+    item = _assess_rev("kref://P/s/legit.conversation", "legitimate content")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _ds_with_ledger(tmp, summarizer=_AdapterSummarizer(_MalformedFieldAdapter()))
+
+        async def run():
+            survivors = await ds._assess_batch([item], {})
+            # The malformed entry is skipped; nothing survives, nothing raised.
+            assert survivors == []
+
+        asyncio.run(run())
+
+        # The legit item is NOT parked — the failure was format, not content.
+        assert ds.failure_ledger.is_parked(item.item_kref.uri) is False
+        assert len(ds.failure_ledger) == 0
+
+
+def test_revision_without_item_kref_is_not_recorded():
+    """A revision lacking an item kref yields an empty ledger key, so it is not
+    recorded under the (never-checked) revision kref (issue #118 nitpick)."""
+    rev = FakeRevision(
+        kref=FakeKref("kref://P/s/orphan.conversation?r=1"),
+        item_kref=None,
+        metadata={"title": "POISON orphan", "summary": "POISON orphan"},
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _ds_with_ledger(tmp, summarizer=_PoisonSummarizer())
+
+        async def run():
+            survivors = await ds._assess_batch([rev], {})
+            assert survivors == []
+
+        asyncio.run(run())
+
+        # Nothing recorded: the only available key (the revision kref) is never
+        # consulted at collection time, so recording it is deliberately skipped.
+        assert len(ds.failure_ledger) == 0
+        assert ds.failure_ledger.get("kref://P/s/orphan.conversation?r=1") is None
+
+
+class _RaisingLedger:
+    """A failure ledger whose reads/writes raise — used to prove ledger errors
+    never break Dream State collection or assessment (issue #118)."""
+
+    def is_parked(self, key, *, now=None):
+        raise RuntimeError("ledger boom (is_parked)")
+
+    def record_failure(self, key, error_class, *, now=None):
+        raise RuntimeError("ledger boom (record_failure)")
+
+
+def test_collect_revisions_park_check_error_does_not_break_collection():
+    """If the ledger's is_parked raises, collection logs and includes the item
+    rather than crashing the run (issue #118 — ledger errors never block)."""
+    item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/facts/x.conversation",
+        "kref://CognitiveMemory/facts/x.conversation?r=1",
+        {"title": "x"},
+        created_at="2026-07-01T12:00:00+00:00",
+    )
+    sdk, _, _ = _build_fake_sdk(
+        spaces=[FakeSpace("/CognitiveMemory/facts")],
+        items_by_space={"/CognitiveMemory/facts": [item]},
+    )
+    ds = DreamState(
+        summarizer=StubSummarizer(), failure_ledger=_RaisingLedger(), kind_filter=""
+    )
+    global _saved_kumiho
+    _saved_kumiho = sys.modules.get("kumiho", _MISSING)
+    sys.modules["kumiho"] = sdk
+    try:
+        revisions = ds._collect_revisions(sdk, None)
+        # The park check raised but was swallowed — the item is still collected.
+        assert [r.kref.uri for r in revisions] == [rev.kref.uri]
+    finally:
+        _cleanup_sdk()
+
+
 # ---------------------------------------------------------------------------
 # Destructive-proposal verification layer (issue #108)
 # ---------------------------------------------------------------------------

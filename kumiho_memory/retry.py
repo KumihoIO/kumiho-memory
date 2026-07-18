@@ -279,14 +279,20 @@ class RetryQueue:
     ) -> Dict[str, int]:
         """Attempt to replay all queued payloads through *store_callable*.
 
-        Returns a dict with ``succeeded`` and ``failed`` counts.  Items
-        that succeed are removed; items that fail again stay in the queue.
+        Returns a dict with ``succeeded``, ``failed``, and ``dropped`` counts.
+        Items that succeed are removed; items that fail *transiently* stay in
+        the queue; items that fail *deterministically* are dropped (issue #118)
+        — a deterministic payload will re-fail on every future flush, so
+        re-queuing it would replay the same poison content forever.  The
+        content was already recorded in the failure ledger at the store seam
+        that first enqueued it, so dropping it here loses no tracking.
         """
         entries = self.drain()
         if not entries:
-            return {"succeeded": 0, "failed": 0}
+            return {"succeeded": 0, "failed": 0, "dropped": 0}
 
         succeeded = 0
+        dropped = 0
         still_failed: List[Dict[str, Any]] = []
 
         for entry in entries:
@@ -300,10 +306,18 @@ class RetryQueue:
                 )
                 succeeded += 1
             except Exception as exc:
+                if classify_failure(exc) == FailureClass.DETERMINISTIC:
+                    dropped += 1
+                    logger.warning(
+                        "Dropping deterministically-failing retry queue entry "
+                        "(it will never succeed): %s",
+                        exc,
+                    )
+                    continue
                 logger.warning("Retry queue flush failed for entry: %s", exc)
                 still_failed.append(entry)
 
-        # Rewrite queue with only the items that still failed
+        # Rewrite queue with only the items that still failed transiently.
         if still_failed:
             with open(self._queue_file, "w", encoding="utf-8") as f:
                 for entry in still_failed:
@@ -311,7 +325,7 @@ class RetryQueue:
         else:
             self.clear()
 
-        return {"succeeded": succeeded, "failed": len(still_failed)}
+        return {"succeeded": succeeded, "failed": len(still_failed), "dropped": dropped}
 
     def clear(self) -> None:
         """Remove all pending items."""

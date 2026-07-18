@@ -1483,11 +1483,12 @@ class UniversalMemoryManager:
     async def flush_retry_queue(self) -> Dict[str, int]:
         """Replay queued ``memory_store`` calls that previously failed.
 
-        Returns ``{"succeeded": N, "failed": M}``.  Items that still
-        fail remain in the queue for the next flush attempt.
+        Returns ``{"succeeded": N, "failed": M, "dropped": D}``.  Items that
+        fail transiently remain in the queue for the next flush; items that
+        fail deterministically are dropped (they would never succeed, #118).
         """
         if not self.retry_queue or not self.memory_store:
-            return {"succeeded": 0, "failed": 0}
+            return {"succeeded": 0, "failed": 0, "dropped": 0}
         return await self.retry_queue.flush(self.memory_store)
 
     @staticmethod

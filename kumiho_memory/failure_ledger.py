@@ -112,8 +112,9 @@ class FailureLedger:
         Directory holding ``ledger.json``.  Defaults to
         ``$KUMIHO_FAILURE_LEDGER_DIR`` or ``~/.kumiho/failure_ledger``.
     park_threshold:
-        Number of attempts after which a *deterministic* failure parks the
-        item.  Defaults to ``$KUMIHO_FAILURE_PARK_THRESHOLD`` or ``2``.
+        Number of *deterministic* failures after which the item is parked
+        (transient/unknown failures never count toward it).  Defaults to
+        ``$KUMIHO_FAILURE_PARK_THRESHOLD`` or ``2``.
     park_ttl_days:
         Days a parked item stays parked before it un-parks.  Defaults to
         ``$KUMIHO_FAILURE_PARK_TTL_DAYS`` or ``14``.
@@ -169,10 +170,10 @@ class FailureLedger:
     ) -> Dict[str, Any]:
         """Record one failed attempt for *key* classified as *error_class*.
 
-        Increments the attempt counter, refreshes ``last_seen`` /
-        ``last_error_class``, and parks the item when the latest failure is
-        deterministic and the attempt count has reached ``park_threshold``.
-        Returns a copy of the resulting entry.
+        Increments the attempt counters, refreshes ``last_seen`` /
+        ``last_error_class``, and parks the item once it has failed
+        *deterministically* at least ``park_threshold`` times.  Returns a copy
+        of the resulting entry.
         """
         now = now or _utcnow()
         now_iso = now.isoformat()
@@ -189,16 +190,27 @@ class FailureLedger:
             entry["last_error_class"] = error_class
             entry.setdefault("first_seen", now_iso)
 
+            det_attempts = int(entry.get("deterministic_attempts", 0) or 0)
+            if error_class == FailureClass.DETERMINISTIC:
+                det_attempts += 1
+            entry["deterministic_attempts"] = det_attempts
+
+            # Park only after ``park_threshold`` *deterministic* failures (issue
+            # #118 asks for "classified deterministic >= 2 attempts").  Counting
+            # deterministic attempts specifically — not total attempts of any
+            # class — avoids pulling storable content out of rotation for the
+            # whole TTL after a single deterministic failure that merely
+            # happened to follow an unrelated transient blip.
             if (
                 error_class == FailureClass.DETERMINISTIC
-                and entry["attempts"] >= self.park_threshold
+                and det_attempts >= self.park_threshold
             ):
                 # Refresh the park timestamp so the TTL clock restarts on every
                 # deterministic failure past the threshold.
                 entry["parked_at"] = now_iso
 
             entries[key] = entry
-            self._prune(entries)
+            self._prune(entries, protect=key)
             self._save(data)
             return dict(entry)
 
@@ -247,6 +259,7 @@ class FailureLedger:
                 if parked_at is not None and (now - parked_at) >= self.park_ttl:
                     entry["parked_at"] = None
                     entry["attempts"] = 0
+                    entry["deterministic_attempts"] = 0
                     changed += 1
             if changed:
                 self._save(data)
@@ -269,20 +282,26 @@ class FailureLedger:
     def _load(self) -> Dict[str, Any]:
         """Load the ledger, returning a fresh empty one on genuine corruption.
 
-        A missing, truncated, or garbage file — or one with an unexpected
-        shape/version — yields an empty ledger rather than raising.  A
-        *transient* OS lock (a concurrent writer mid-replace on Windows) is
-        retried rather than mistaken for corruption, so concurrent writers do
-        not wipe each other's entries.
+        A missing, truncated, or garbage file — including one whose bytes are
+        not valid UTF-8 — or one with an unexpected shape/version yields an
+        empty ledger rather than raising.  A *transient* OS lock (a concurrent
+        writer mid-replace on Windows) is retried rather than mistaken for
+        corruption, so concurrent writers do not wipe each other's entries.
         """
         if not self._file.exists():
             return _empty()
 
-        raw: Optional[str] = None
+        raw_bytes: Optional[bytes] = None
         for attempt in range(_REPLACE_RETRIES):
             try:
-                with open(self._file, "r", encoding="utf-8") as f:
-                    raw = f.read()
+                # Read as bytes and decode below so invalid UTF-8 is handled as
+                # corruption (start fresh) rather than raising a
+                # UnicodeDecodeError past this method.  Text-mode ``read()``
+                # would decode eagerly and escape both ``except`` arms here
+                # (UnicodeDecodeError is a ValueError, not an OSError),
+                # permanently disabling parking on a corrupt file.
+                with open(self._file, "rb") as f:
+                    raw_bytes = f.read()
                 break
             except FileNotFoundError:
                 # Replaced away between exists() and open() — treat as empty.
@@ -295,7 +314,11 @@ class FailureLedger:
                 time.sleep(_REPLACE_BACKOFF)
 
         try:
-            data = json.loads(raw or "")
+            # ``UnicodeDecodeError`` (invalid UTF-8) is a ``ValueError`` subclass;
+            # both a decode failure and a JSON parse failure land here and are
+            # treated as corruption.
+            raw = (raw_bytes or b"").decode("utf-8")
+            data = json.loads(raw)
         except (ValueError, UnicodeDecodeError) as exc:
             logger.warning("Failure ledger corrupt (%s) — starting fresh", exc)
             return _empty()
@@ -346,12 +369,19 @@ class FailureLedger:
                     raise
                 time.sleep(_REPLACE_BACKOFF)
 
-    def _prune(self, entries: Dict[str, Any]) -> None:
+    def _prune(self, entries: Dict[str, Any], *, protect: Optional[str] = None) -> None:
         """Drop the least-important entries when over ``max_entries``.
 
         Non-parked, least-recently-seen entries are dropped first so parked
         (poison) items are retained as long as possible — dropping a parked
         entry would let its poison content be re-selected.
+
+        ``protect`` names an entry that must never be dropped — the caller
+        passes the key it just recorded.  Without this, a poison item building
+        toward the park threshold (still non-parked, so ranked first for
+        dropping) would be evicted every run when the ledger is saturated with
+        parked entries, and could never accumulate enough deterministic
+        failures to park.
         """
         if len(entries) <= self.max_entries:
             return
@@ -364,8 +394,14 @@ class FailureLedger:
 
         ordered = sorted(entries.items(), key=sort_key)
         drop = len(entries) - self.max_entries
-        for key, _ in ordered[:drop]:
+        dropped = 0
+        for key, _ in ordered:
+            if dropped >= drop:
+                break
+            if key == protect:
+                continue
             del entries[key]
+            dropped += 1
 
 
 # ---------------------------------------------------------------------------

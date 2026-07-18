@@ -1298,15 +1298,18 @@ class DreamState:
 
     @staticmethod
     def _revision_ledger_key(rev: Any) -> str:
-        """Stable ledger key for a revision: its item kref (falls back to the
-        revision kref).  The item kref is stable across new revisions of the
-        same content, matching the key used at collection time."""
+        """Stable ledger key for a revision: its *item* kref, or ``""``.
+
+        The item kref is stable across new revisions of the same content and is
+        exactly the key Dream State collection checks with ``is_parked`` (which
+        reads ``item.kref.uri``).  Returns ``""`` when the revision carries no
+        item kref: recording under the revision kref instead would key the entry
+        under a value the collection check never consults, so the record would
+        be dead weight and the item would still never be skipped.
+        ``_record_assessment_failure`` skips empty keys.
+        """
         item_kref = getattr(rev, "item_kref", None)
-        uri = getattr(item_kref, "uri", None)
-        if uri:
-            return uri
-        kref = getattr(rev, "kref", None)
-        return getattr(kref, "uri", "") or ""
+        return getattr(item_kref, "uri", "") or ""
 
     async def _assess_once(
         self,
@@ -1375,49 +1378,73 @@ class DreamState:
 
         parsed = _parse_assessments(raw)
 
-        # Convert to MemoryAssessment objects.
+        # Convert to MemoryAssessment objects.  A malformed field in the LLM's
+        # assessment for one memory (a non-numeric relevance_score, a non-list
+        # suggested_tags, a non-dict entry) is an output-*format* problem, not
+        # evidence that the memory's own content is poison.  Guard each item so
+        # such an error only drops that one assessment (retried next run) rather
+        # than propagating to _assess_batch, where classify_failure would tag it
+        # DETERMINISTIC and park an innocent memory (issue #118).
         assessments: List[MemoryAssessment] = []
         for item in parsed:
-            idx = item.get("index", -1)
-            rev_kref = kref_by_index.get(idx, "")
-            if not rev_kref:
-                continue
-
-            related: List[Tuple[str, str]] = []
-            rel_type = item.get("relationship_type", "")
-            for rel_idx in item.get("related_indices", []):
-                target = kref_by_index.get(rel_idx)
-                if target and target != rev_kref:
-                    related.append((target, rel_type or "REFERENCED"))
-
-            raw_metadata_updates = item.get("metadata_updates", {})
-            metadata_updates: Dict[str, str] = {}
-            if isinstance(raw_metadata_updates, dict):
-                metadata_updates = {
-                    str(key): str(value)
-                    for key, value in raw_metadata_updates.items()
-                    if key and value is not None
-                }
-            elif isinstance(raw_metadata_updates, list):
-                metadata_updates = {
-                    str(entry.get("key")): str(entry.get("value"))
-                    for entry in raw_metadata_updates
-                    if isinstance(entry, dict) and entry.get("key") and entry.get("value") is not None
-                }
-
-            assessments.append(
-                MemoryAssessment(
-                    revision_kref=rev_kref,
-                    relevance_score=float(item.get("relevance_score", 0.5)),
-                    should_deprecate=bool(item.get("should_deprecate", False)),
-                    deprecation_reason=item.get("deprecation_reason", ""),
-                    suggested_tags=list(item.get("suggested_tags", [])),
-                    metadata_updates=metadata_updates,
-                    related_memories=related,
+            try:
+                assessment = self._item_to_assessment(item, kref_by_index)
+            except (ValueError, TypeError, AttributeError) as exc:
+                logger.warning(
+                    "Skipping malformed LLM assessment entry (not parked): %s", exc
                 )
-            )
+                continue
+            if assessment is not None:
+                assessments.append(assessment)
 
         return assessments
+
+    @staticmethod
+    def _item_to_assessment(
+        item: Any, kref_by_index: Dict[int, str]
+    ) -> Optional[MemoryAssessment]:
+        """Convert one parsed LLM assessment dict to a ``MemoryAssessment``.
+
+        Returns ``None`` when the entry does not map to a known revision.  May
+        raise ``ValueError`` / ``TypeError`` / ``AttributeError`` on a malformed
+        field — the caller catches those and skips just that one item.
+        """
+        idx = item.get("index", -1)
+        rev_kref = kref_by_index.get(idx, "")
+        if not rev_kref:
+            return None
+
+        related: List[Tuple[str, str]] = []
+        rel_type = item.get("relationship_type", "")
+        for rel_idx in item.get("related_indices", []):
+            target = kref_by_index.get(rel_idx)
+            if target and target != rev_kref:
+                related.append((target, rel_type or "REFERENCED"))
+
+        raw_metadata_updates = item.get("metadata_updates", {})
+        metadata_updates: Dict[str, str] = {}
+        if isinstance(raw_metadata_updates, dict):
+            metadata_updates = {
+                str(key): str(value)
+                for key, value in raw_metadata_updates.items()
+                if key and value is not None
+            }
+        elif isinstance(raw_metadata_updates, list):
+            metadata_updates = {
+                str(entry.get("key")): str(entry.get("value"))
+                for entry in raw_metadata_updates
+                if isinstance(entry, dict) and entry.get("key") and entry.get("value") is not None
+            }
+
+        return MemoryAssessment(
+            revision_kref=rev_kref,
+            relevance_score=float(item.get("relevance_score", 0.5)),
+            should_deprecate=bool(item.get("should_deprecate", False)),
+            deprecation_reason=item.get("deprecation_reason", ""),
+            suggested_tags=list(item.get("suggested_tags", [])),
+            metadata_updates=metadata_updates,
+            related_memories=related,
+        )
 
     # ------------------------------------------------------------------
     # Destructive-proposal verification (issue #108)
