@@ -976,6 +976,166 @@ def test_consolidation_raises_without_queue():
 
 
 # ---------------------------------------------------------------------------
+# Failure ledger / parking at the store seam (issue #118)
+# ---------------------------------------------------------------------------
+
+
+def _ledger_manager(memory_store, ledger, *, store_max_retries=2, retry_queue=None):
+    buffer = RedisMemoryBuffer(client=FakeRedis(), redis_url="redis://test")
+    return UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=memory_store,
+        failure_ledger=ledger,
+        retry_queue=retry_queue,
+        store_max_retries=store_max_retries,
+    )
+
+
+_POISON_PAYLOAD = {
+    "project": "CognitiveMemory",
+    "memory_type": "fact",
+    "title": "Poison title",
+    "summary": "This content deterministically fails.",
+}
+
+
+def test_store_skips_parked_content():
+    """A parked payload is not sent to memory_store; returns {'parked': True}."""
+    from kumiho_memory.failure_ledger import FailureLedger
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    calls = []
+
+    async def store(**kwargs):
+        calls.append(kwargs)
+        return {"revision_kref": "kref://x"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=2)
+        key = _payload_failure_key(_POISON_PAYLOAD)
+        ledger.record_failure(key, "deterministic")
+        ledger.record_failure(key, "deterministic")  # now parked
+        assert ledger.is_parked(key) is True
+
+        manager = _ledger_manager(store, ledger)
+
+        async def run():
+            result = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert result == {"parked": True}
+            assert calls == []  # store never attempted
+
+        asyncio.run(run())
+
+
+def test_store_records_deterministic_failure_and_parks():
+    """Two deterministic store failures park the content; the 3rd is skipped."""
+    from kumiho_memory.failure_ledger import FailureLedger
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    attempts = []
+
+    async def store(**kwargs):
+        attempts.append(kwargs.get("title"))
+        raise ValueError("schema validation failed")  # deterministic
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=2)
+        queue = RetryQueue(os.path.join(tmp, "queue"))
+        manager = _ledger_manager(store, ledger, retry_queue=queue)
+        key = _payload_failure_key(_POISON_PAYLOAD)
+
+        async def run():
+            # 1st failure: recorded, queued, not yet parked.
+            r1 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r1.get("queued") is True
+            assert ledger.is_parked(key) is False
+            # 2nd failure: reaches threshold → parked.
+            r2 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r2.get("queued") is True
+            assert ledger.is_parked(key) is True
+            # 3rd call: skipped entirely (store not attempted again).
+            before = len(attempts)
+            r3 = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert r3 == {"parked": True}
+            assert len(attempts) == before  # deterministic ValueError → 1 call each
+
+        asyncio.run(run())
+
+
+def test_store_transient_failures_never_park():
+    """Repeated transient (ConnectionError) failures never park the content."""
+    from kumiho_memory.failure_ledger import FailureLedger
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    async def store(**kwargs):
+        raise ConnectionError("network down")  # transient
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=2)
+        queue = RetryQueue(os.path.join(tmp, "queue"))
+        manager = _ledger_manager(store, ledger, retry_queue=queue, store_max_retries=1)
+        key = _payload_failure_key(_POISON_PAYLOAD)
+
+        async def run():
+            for _ in range(4):
+                await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert ledger.is_parked(key) is False
+            entry = ledger.get(key)
+            assert entry["last_error_class"] == "transient"
+
+        asyncio.run(run())
+
+
+def test_store_success_clears_ledger_history():
+    """A successful store clears any prior failure history for the content."""
+    from kumiho_memory.failure_ledger import FailureLedger
+    from kumiho_memory.memory_manager import _payload_failure_key
+
+    outcome = {"fail": True}
+
+    async def store(**kwargs):
+        if outcome["fail"]:
+            raise ValueError("deterministic once")
+        return {"revision_kref": "kref://ok"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=3)
+        queue = RetryQueue(os.path.join(tmp, "queue"))
+        manager = _ledger_manager(store, ledger, retry_queue=queue)
+        key = _payload_failure_key(_POISON_PAYLOAD)
+
+        async def run():
+            await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert ledger.get(key)["attempts"] == 1
+            outcome["fail"] = False
+            result = await manager._store_with_retry(**_POISON_PAYLOAD)
+            assert result == {"revision_kref": "kref://ok"}
+            assert ledger.get(key) is None  # history cleared
+
+        asyncio.run(run())
+
+
+def test_store_without_ledger_is_unchanged():
+    """No ledger configured → behavior identical to before (#118 additive)."""
+    calls = []
+
+    async def store(**kwargs):
+        calls.append(kwargs)
+        return {"revision_kref": "kref://x"}
+
+    manager = _ledger_manager(store, None)
+
+    async def run():
+        result = await manager._store_with_retry(**_POISON_PAYLOAD)
+        assert result == {"revision_kref": "kref://x"}
+        assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
 # Evidence-level schema tests (issue #9)
 # ---------------------------------------------------------------------------
 

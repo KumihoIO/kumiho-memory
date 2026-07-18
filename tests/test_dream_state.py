@@ -20,6 +20,7 @@ from kumiho_memory.dream_state import (
     _parse_assessments,
     _parse_refutations,
 )
+from kumiho_memory.failure_ledger import FailureLedger
 
 
 # ---------------------------------------------------------------------------
@@ -1399,6 +1400,209 @@ def test_collect_revisions_skips_space_profile_items():
         assert profile_rev.kref.uri not in krefs
     finally:
         _cleanup_sdk()
+
+
+# ---------------------------------------------------------------------------
+# Failure ledger: parking skip in selection + assessment isolation (issue #118)
+# ---------------------------------------------------------------------------
+
+
+class _DetHTTPError(Exception):
+    """Deterministic (4xx) adapter failure carrying a status code."""
+
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _PoisonAdapter:
+    """Adapter that raises deterministically when the prompt contains POISON."""
+
+    def __init__(self, error=None):
+        self.error = error or _DetHTTPError("content blocked", 400)
+        self.calls = 0
+
+    async def chat(self, *, messages, model, system, max_tokens, json_mode=False):
+        self.calls += 1
+        content = messages[0]["content"]
+        if "POISON" in content:
+            raise self.error
+        # Any non-poison (single-item isolation) prompt assesses cleanly.
+        return json.dumps(
+            {"assessments": [{"index": 0, "relevance_score": 0.9, "should_deprecate": False}]}
+        )
+
+
+class _PoisonSummarizer:
+    def __init__(self, error=None):
+        self.adapter = _PoisonAdapter(error)
+        self.model = "stub-model"
+
+
+def _ds_with_ledger(tmp, summarizer=None, **kwargs):
+    return DreamState(
+        summarizer=summarizer or StubSummarizer(),
+        failure_ledger=FailureLedger(tmp, park_threshold=1),
+        **kwargs,
+    )
+
+
+def test_collect_revisions_skips_parked_item():
+    """Dream State selection skips items parked for deterministic failures."""
+    parked_item, parked_rev = _make_item_with_revision(
+        "kref://CognitiveMemory/facts/poison.conversation",
+        "kref://CognitiveMemory/facts/poison.conversation?r=1",
+        {"title": "poison"},
+        created_at="2026-07-01T12:00:00+00:00",
+    )
+    normal_item, normal_rev = _make_item_with_revision(
+        "kref://CognitiveMemory/facts/normal.conversation",
+        "kref://CognitiveMemory/facts/normal.conversation?r=1",
+        {"title": "normal"},
+        created_at="2026-07-01T12:00:00+00:00",
+    )
+    sdk, _, _ = _build_fake_sdk(
+        spaces=[FakeSpace("/CognitiveMemory/facts")],
+        items_by_space={"/CognitiveMemory/facts": [parked_item, normal_item]},
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = FailureLedger(tmp, park_threshold=1)
+        # Park the poison item by its stable item kref.
+        ledger.record_failure(parked_item.kref.uri, "deterministic")
+        assert ledger.is_parked(parked_item.kref.uri) is True
+
+        ds = DreamState(
+            summarizer=StubSummarizer(), failure_ledger=ledger, kind_filter=""
+        )
+        global _saved_kumiho
+        _saved_kumiho = sys.modules.get("kumiho", _MISSING)
+        sys.modules["kumiho"] = sdk
+        try:
+            revisions = ds._collect_revisions(sdk, None)
+            krefs = [r.kref.uri for r in revisions]
+            assert normal_rev.kref.uri in krefs
+            assert parked_rev.kref.uri not in krefs
+        finally:
+            _cleanup_sdk()
+
+
+def test_collect_revisions_no_ledger_keeps_all():
+    """Without a ledger, collection behaves exactly as before (additive)."""
+    item, rev = _make_item_with_revision(
+        "kref://CognitiveMemory/facts/x.conversation",
+        "kref://CognitiveMemory/facts/x.conversation?r=1",
+        {"title": "x"},
+        created_at="2026-07-01T12:00:00+00:00",
+    )
+    sdk, _, _ = _build_fake_sdk(
+        spaces=[FakeSpace("/CognitiveMemory/facts")],
+        items_by_space={"/CognitiveMemory/facts": [item]},
+    )
+    ds = _make_dream_state(sdk, kind_filter="")  # no failure_ledger
+    try:
+        revisions = ds._collect_revisions(sdk, None)
+        assert [r.kref.uri for r in revisions] == [rev.kref.uri]
+    finally:
+        _cleanup_sdk()
+
+
+def _assess_rev(item_uri, title):
+    return FakeRevision(
+        kref=FakeKref(f"{item_uri}?r=1"),
+        item_kref=FakeKref(item_uri),
+        metadata={"title": title, "summary": title},
+    )
+
+
+def test_assess_batch_isolates_and_parks_single_poison():
+    """A deterministic batch failure is isolated to the poison item, which is
+    recorded; innocent co-batched items are assessed and not recorded."""
+    good = _assess_rev("kref://P/s/good.conversation", "benign fact")
+    poison = _assess_rev("kref://P/s/poison.conversation", "POISON content")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _ds_with_ledger(tmp, summarizer=_PoisonSummarizer())
+
+        async def run():
+            survivors = await ds._assess_batch([good, poison], {})
+            # The good item was assessed; the poison item was dropped.
+            assert len(survivors) == 1
+            assert survivors[0].revision_kref == good.kref.uri
+
+        asyncio.run(run())
+
+        ledger = ds.failure_ledger
+        assert ledger.is_parked(poison.item_kref.uri) is True
+        assert ledger.get(good.item_kref.uri) is None
+
+
+def test_assess_batch_systemic_failure_parks_nothing():
+    """If every item fails deterministically it is treated as a systemic bug,
+    not poison — nothing is parked."""
+    p1 = _assess_rev("kref://P/s/p1.conversation", "POISON one")
+    p2 = _assess_rev("kref://P/s/p2.conversation", "POISON two")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _ds_with_ledger(tmp, summarizer=_PoisonSummarizer())
+
+        async def run():
+            survivors = await ds._assess_batch([p1, p2], {})
+            assert survivors == []
+
+        asyncio.run(run())
+
+        ledger = ds.failure_ledger
+        assert len(ledger) == 0
+
+
+def test_assess_batch_single_item_deterministic_records():
+    """A deterministic failure on a 1-item batch records that item directly."""
+    poison = _assess_rev("kref://P/s/solo.conversation", "POISON solo")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _ds_with_ledger(tmp, summarizer=_PoisonSummarizer())
+
+        async def run():
+            survivors = await ds._assess_batch([poison], {})
+            assert survivors == []
+
+        asyncio.run(run())
+
+        assert ds.failure_ledger.is_parked(poison.item_kref.uri) is True
+
+
+def test_assess_batch_transient_failure_does_not_record():
+    """A transient batch failure keeps prior behavior: skip, no ledger writes."""
+    good = _assess_rev("kref://P/s/a.conversation", "benign")
+    other = _assess_rev("kref://P/s/b.conversation", "benign two")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _ds_with_ledger(
+            tmp, summarizer=_PoisonSummarizer(error=ConnectionError("network")),
+        )
+        # Make the batch call raise a transient error regardless of content.
+        poison_content_rev = _assess_rev("kref://P/s/c.conversation", "POISON here")
+
+        async def run():
+            survivors = await ds._assess_batch([good, other, poison_content_rev], {})
+            assert survivors == []
+
+        asyncio.run(run())
+
+        assert len(ds.failure_ledger) == 0
+
+
+def test_assess_batch_no_ledger_deterministic_returns_empty():
+    """Without a ledger, a deterministic batch failure just returns [] (as before)."""
+    poison = _assess_rev("kref://P/s/poison.conversation", "POISON content")
+    ds = DreamState(summarizer=_PoisonSummarizer())  # no ledger
+
+    async def run():
+        survivors = await ds._assess_batch([poison], {})
+        assert survivors == []
+
+    asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------

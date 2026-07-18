@@ -18,7 +18,12 @@ from kumiho_memory.summarization import (
     OpenAICompatEmbeddingAdapter,
 )
 from kumiho_memory.privacy import PIIRedactor, CredentialDetectedError
-from kumiho_memory.retry import RetryQueue
+from kumiho_memory.retry import RetryQueue, FailureClass, classify_failure
+from kumiho_memory.failure_ledger import (
+    FailureLedger,
+    content_key,
+    default_failure_ledger,
+)
 from kumiho_memory.dream_state import DreamState, MemoryAssessment, DreamStateStats
 from kumiho_memory.graph_maintenance import GraphMaintainer, MaintenanceStats
 from kumiho_memory.graph_augmentation import GraphAugmentedRecall, GraphAugmentationConfig
@@ -84,6 +89,11 @@ __all__ = [
     "PIIRedactor",
     "CredentialDetectedError",
     "RetryQueue",
+    "FailureClass",
+    "classify_failure",
+    "FailureLedger",
+    "content_key",
+    "default_failure_ledger",
     "DreamState",
     "MemoryAssessment",
     "DreamStateStats",

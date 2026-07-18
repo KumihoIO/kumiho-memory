@@ -46,6 +46,8 @@ from kumiho_memory.evidence import (
     EVIDENCE_TAG_PREFIX,
     OFFICIAL,
 )
+from kumiho_memory.failure_ledger import FailureLedger
+from kumiho_memory.retry import FailureClass, classify_failure
 from kumiho_memory.summarization import (
     LLMAdapter,
     MemorySummarizer,
@@ -556,6 +558,7 @@ class DreamState:
         code_project: Optional[str] = None,
         verifier: Optional[LLMAdapter] = None,
         verifier_model: Optional[str] = None,
+        failure_ledger: Optional[FailureLedger] = None,
         # Legacy parameters — accepted but ignored for backward compatibility
         routing_key_filter: str = "revision.*",
         event_timeout: float = 10.0,
@@ -565,6 +568,11 @@ class DreamState:
         self.batch_size = batch_size
         self.kind_filter = kind_filter
         self.dry_run = dry_run
+        # Cross-run failure ledger (issue #118): selection skips parked items;
+        # a deterministic assessment failure isolated to a single item parks it.
+        # Opt-in at the library layer (None = today's behavior); the MCP/CLI
+        # entrypoints wire a default ledger so parking is active in production.
+        self.failure_ledger = failure_ledger
 
         if not (0.1 <= max_deprecation_ratio <= 0.9):
             raise ValueError(
@@ -1126,6 +1134,22 @@ class DreamState:
                 if getattr(rev, "deprecated", False):
                     continue
 
+                # Skip items parked for repeated deterministic failures (#118)
+                # so poison content is not re-assessed run after run.  Keyed on
+                # the stable item kref; ledger errors never block collection.
+                if self.failure_ledger is not None and item_kref:
+                    try:
+                        if self.failure_ledger.is_parked(item_kref):
+                            logger.info(
+                                "Dream State: skipping parked item %s (#118)",
+                                item_kref,
+                            )
+                            continue
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "failure ledger park check failed (ignored): %s", exc
+                        )
+
                 # Filter by created_at timestamp
                 if cutoff is not None and rev.created_at:
                     try:
@@ -1183,7 +1207,117 @@ class DreamState:
         revisions: list,
         bundle_context: Dict[str, list],
     ) -> List[MemoryAssessment]:
-        """Send a batch of revisions to the LLM for assessment."""
+        """Assess a batch of revisions, honoring the failure ledger (#118).
+
+        Transient / unknown assessment failures behave as before (skip the
+        batch this run — it is retried next run).  A *deterministic* failure
+        is isolated to the specific poison item(s) so they can be parked
+        without penalizing innocent co-batched items.
+        """
+        if not revisions:
+            return []
+        try:
+            return await self._assess_once(revisions, bundle_context)
+        except Exception as exc:
+            failure_class = classify_failure(exc)
+            if failure_class != FailureClass.DETERMINISTIC:
+                # Transient/unknown: unchanged behavior, no ledger writes.
+                logger.warning("LLM assessment failed (%s): %s", failure_class, exc)
+                return []
+            # Deterministic failure.
+            if self.failure_ledger is None:
+                logger.warning("LLM assessment failed (deterministic): %s", exc)
+                return []
+            if len(revisions) == 1:
+                # Unambiguous: this single item is the poison.
+                logger.warning(
+                    "Assessment deterministically failed for a single item — "
+                    "recording in failure ledger (#118): %s",
+                    exc,
+                )
+                self._record_assessment_failure(revisions[0])
+                return []
+            # Multi-item batch: isolate the poison item(s) individually.
+            logger.warning(
+                "Assessment deterministically failed for a batch of %d — "
+                "isolating poison item(s) (#118): %s",
+                len(revisions),
+                exc,
+            )
+            return await self._assess_isolate(revisions, bundle_context)
+
+    async def _assess_isolate(
+        self,
+        revisions: list,
+        bundle_context: Dict[str, list],
+    ) -> List[MemoryAssessment]:
+        """Re-assess each revision alone to attribute a deterministic failure.
+
+        Items that succeed are assessed normally; items that fail
+        deterministically on their own are recorded in the ledger.  If *every*
+        item fails deterministically the failure is treated as systemic (a
+        request-shape bug, not poison content) and nothing is recorded — this
+        guards against parking the whole memory set on a self-inflicted bug.
+        """
+        survivors: List[MemoryAssessment] = []
+        failed: list = []
+        for rev in revisions:
+            try:
+                survivors.extend(await self._assess_once([rev], bundle_context))
+            except Exception as exc:
+                if classify_failure(exc) == FailureClass.DETERMINISTIC:
+                    failed.append(rev)
+                else:
+                    logger.warning(
+                        "Isolated assessment transient/unknown failure "
+                        "(not recorded): %s",
+                        exc,
+                    )
+        if failed and len(failed) < len(revisions):
+            for rev in failed:
+                self._record_assessment_failure(rev)
+        elif failed:
+            logger.warning(
+                "Dream State: all %d isolated items failed deterministically — "
+                "treating as systemic, not parking any (#118)",
+                len(revisions),
+            )
+        return survivors
+
+    def _record_assessment_failure(self, rev: Any) -> None:
+        """Record a deterministic assessment failure for *rev* in the ledger."""
+        ledger = self.failure_ledger
+        if ledger is None:
+            return
+        try:
+            key = self._revision_ledger_key(rev)
+            if key:
+                ledger.record_failure(key, FailureClass.DETERMINISTIC)
+        except Exception as exc:  # noqa: BLE001 — ledger must never break a run
+            logger.debug("failure ledger record_failure failed (ignored): %s", exc)
+
+    @staticmethod
+    def _revision_ledger_key(rev: Any) -> str:
+        """Stable ledger key for a revision: its item kref (falls back to the
+        revision kref).  The item kref is stable across new revisions of the
+        same content, matching the key used at collection time."""
+        item_kref = getattr(rev, "item_kref", None)
+        uri = getattr(item_kref, "uri", None)
+        if uri:
+            return uri
+        kref = getattr(rev, "kref", None)
+        return getattr(kref, "uri", "") or ""
+
+    async def _assess_once(
+        self,
+        revisions: list,
+        bundle_context: Dict[str, list],
+    ) -> List[MemoryAssessment]:
+        """Send one batch of revisions to the LLM for assessment.
+
+        Raises on adapter error so the caller (:meth:`_assess_batch`) can
+        classify the failure; returns parsed assessments on success.
+        """
         if not revisions:
             return []
 
@@ -1230,17 +1364,14 @@ class DreamState:
             + bundle_info
         )
 
-        try:
-            raw = await self.summarizer.adapter.chat(
-                messages=[{"role": "user", "content": user_prompt}],
-                model=self.summarizer.model,
-                system=self._system_prompt,
-                max_tokens=2048,
-                json_mode=_ASSESSMENT_SCHEMA_MODE,
-            )
-        except Exception as exc:
-            logger.warning("LLM assessment failed: %s", exc)
-            return []
+        # Raises on adapter error — _assess_batch classifies and handles it.
+        raw = await self.summarizer.adapter.chat(
+            messages=[{"role": "user", "content": user_prompt}],
+            model=self.summarizer.model,
+            system=self._system_prompt,
+            max_tokens=2048,
+            json_mode=_ASSESSMENT_SCHEMA_MODE,
+        )
 
         parsed = _parse_assessments(raw)
 
