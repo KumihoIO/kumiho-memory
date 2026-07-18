@@ -53,9 +53,13 @@ from kumiho_memory.evidence_rank import (
     evidence_badge,
 )
 from kumiho_memory.context_compose import (
+    CONTEXT_BUDGET_CHARS,
     DEFAULT_CONTEXT_TOP_K,
+    TRUNCATION_MARKER,
+    approx_tokens,
     collect_top_revisions,
     compose_context,
+    truncate_section,
 )
 from kumiho_memory.recall_rerank import (
     RerankConfig,
@@ -105,8 +109,12 @@ __all__ = [
     "apply_evidence_weights",
     "evidence_badge",
     "DEFAULT_CONTEXT_TOP_K",
+    "CONTEXT_BUDGET_CHARS",
+    "TRUNCATION_MARKER",
+    "approx_tokens",
     "collect_top_revisions",
     "compose_context",
+    "truncate_section",
     "RerankConfig",
     "rerank",
     "rerank_async",

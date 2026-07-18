@@ -21,11 +21,22 @@ Design principles (mirrors :mod:`kumiho_memory.recall_rerank`):
 * **Every stage no-ops safely.**  No scores → original order is preserved.
   ``top_k=0`` → no cap.  Empty input → empty string.
 * **Dependency-light.**  Pure-python dict traversal; no numpy, no LLM calls.
+
+Budget unification (#106): this composer and
+``UniversalMemoryManager.build_recalled_context`` (item-centric, MCP ``engage``)
+both truncate each section's raw content to the shared
+:data:`CONTEXT_BUDGET_CHARS` budget with the shared :data:`TRUNCATION_MARKER`.
+For the LoCoMo bench path (this module, ``mode="full"``): sections at or under
+the budget are byte-identical to pre-unification output; over-budget sections
+are cut to exactly the budget with the marker inside it (previously a bare
+``content[:8000]`` slice) — an intentional unification whose bench impact is
+measured at the 0.19.0 full-10 RC gate, not claimed neutral.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -35,8 +46,93 @@ logger = logging.getLogger(__name__)
 #: unlimited (the pre-cap behavior).
 DEFAULT_CONTEXT_TOP_K = 20
 
-#: Default per-revision cap on raw artifact content in ``"full"`` mode.
-DEFAULT_REVISION_CHAR_LIMIT = 8000
+#: Fallback for the per-section content budget when the env override is unset
+#: or malformed.  8000 is the value the LoCoMo benchmark path
+#: (``compose_context``, revision-centric, ``recall_mode="full"``) used before
+#: unification: sections at or under the budget render byte-identically.
+#: Over-budget sections now carry the in-budget truncation marker (previously
+#: a bare ``content[:8000]`` slice) — an intentional unification whose bench
+#: impact is measured at the 0.19.0 full-10 RC gate, not claimed neutral.
+_DEFAULT_CONTEXT_BUDGET_CHARS = 8000
+
+
+def _resolve_context_budget_chars() -> int:
+    """Read the shared per-section content budget from the environment.
+
+    Env override: ``KUMIHO_MEMORY_CONTEXT_BUDGET_CHARS`` (positive int).  A
+    missing, blank, non-integer, or non-positive value falls back to
+    :data:`_DEFAULT_CONTEXT_BUDGET_CHARS`.
+    """
+    raw = os.environ.get("KUMIHO_MEMORY_CONTEXT_BUDGET_CHARS")
+    if raw is not None and raw.strip():
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            logger.warning(
+                "KUMIHO_MEMORY_CONTEXT_BUDGET_CHARS=%r is not an integer — "
+                "falling back to %d.",
+                raw, _DEFAULT_CONTEXT_BUDGET_CHARS,
+            )
+        else:
+            if value > 0:
+                return value
+            logger.warning(
+                "KUMIHO_MEMORY_CONTEXT_BUDGET_CHARS=%d is not positive — "
+                "falling back to %d.",
+                value, _DEFAULT_CONTEXT_BUDGET_CHARS,
+            )
+    return _DEFAULT_CONTEXT_BUDGET_CHARS
+
+
+#: Single source of truth for the per-section raw-content budget, in
+#: characters.  BOTH assemblers — :func:`compose_context` (revision-centric,
+#: the LoCoMo benchmark path) and
+#: :meth:`kumiho_memory.memory_manager.UniversalMemoryManager.build_recalled_context`
+#: (item-centric, the MCP ``engage`` path) — truncate each section's raw
+#: content to this cap.  Override with ``KUMIHO_MEMORY_CONTEXT_BUDGET_CHARS``.
+#: Read at call time (not baked into defaults) so tests can monkeypatch it.
+CONTEXT_BUDGET_CHARS = _resolve_context_budget_chars()
+
+#: Backward-compat alias.  Both name the same per-section content budget.
+DEFAULT_REVISION_CHAR_LIMIT = CONTEXT_BUDGET_CHARS
+
+#: Marker appended when a section's content is truncated to the budget.  Shared
+#: by both assemblers so the truncation policy is identical (marker parity).
+TRUNCATION_MARKER = "…[truncated]"
+
+
+def approx_tokens(text: str) -> int:
+    """Rough token estimate for a rendered context: ``len // 4``.
+
+    A deliberately cheap, dependency-free heuristic (the classic ~4 chars/token
+    rule) so both assemblers can report an ``approx_tokens`` figure without
+    pulling in a tokenizer.  Not exact — a budgeting signal, not a billing one.
+    """
+    return len(text) // 4
+
+
+def truncate_section(text: str, limit: Optional[int] = None) -> str:
+    """Truncate one section's raw content to *limit* chars, shared by both
+    assemblers so the per-section truncation policy is identical.
+
+    *limit* ``None`` resolves to :data:`CONTEXT_BUDGET_CHARS` at call time (so
+    a monkeypatched budget is honored); numeric values — including ``0`` — are
+    applied as-is (``0`` empties the section, matching the historical
+    ``content[:0]`` slice).  Content at or under the budget is returned
+    **unchanged** (byte-identical).  When truncation fires the result is
+    exactly *limit* chars **total**: the text is cut to
+    ``limit - len(TRUNCATION_MARKER)`` and the marker appended, so the budget
+    is a hard ceiling.  A limit too small to fit the marker degenerates to a
+    bare hard slice (marker omitted) — the ceiling still holds.
+    """
+    if limit is None:
+        limit = CONTEXT_BUDGET_CHARS
+    if len(text) <= limit:
+        return text
+    cut = limit - len(TRUNCATION_MARKER)
+    if cut <= 0:
+        return text[:limit]
+    return text[:cut] + TRUNCATION_MARKER
 
 
 def _score_of(value: Any) -> float:
@@ -88,7 +184,7 @@ def compose_context(
     *,
     mode: str = "summarized",
     top_k: Optional[int] = None,
-    char_limit: int = DEFAULT_REVISION_CHAR_LIMIT,
+    char_limit: Optional[int] = None,
     fact_budget: int = 2,
 ) -> str:
     """Build answering-LLM context text from recalled memories.
@@ -118,8 +214,17 @@ def compose_context(
         uses :data:`DEFAULT_CONTEXT_TOP_K`; ``0`` means unlimited.
     char_limit:
         Per-revision character cap on raw content in ``"full"`` mode.
+        ``None`` (default) resolves to the shared
+        :data:`CONTEXT_BUDGET_CHARS` at call time; numeric values —
+        including ``0`` — apply as-is (``0`` empties the section, the
+        historical ``content[:0]`` slice semantics).
     """
     full_mode = mode == "full"
+    # Shared per-section content budget (monkeypatch-friendly: read now, not
+    # baked into the signature default).
+    effective_char_limit = (
+        CONTEXT_BUDGET_CHARS if char_limit is None else char_limit
+    )
 
     # --- Collect all revisions across all memories into one flat list ---
     all_revisions: List[Dict[str, Any]] = []
@@ -212,7 +317,7 @@ def compose_context(
         content = rev.get("content", "")
 
         if full_mode and content:
-            entry_text = content[:char_limit]
+            entry_text = truncate_section(content, effective_char_limit)
         elif summary:
             entry_text = f"{title}: {summary}" if title else summary
         else:

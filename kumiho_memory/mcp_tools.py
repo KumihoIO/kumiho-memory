@@ -591,6 +591,8 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
         )
         source_krefs = [m["kref"] for m in results if m.get("kref")]
 
+        from kumiho_memory.context_compose import approx_tokens
+
         _recall_recent[_recall_signature(args)] = time.monotonic()
         engage_result = {
             "context": context,
@@ -598,6 +600,9 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
             "source_krefs": source_krefs,
             "count": len(results),
             "recall_mode": recall_mode,
+            # Additive budgeting signal (chars/4 heuristic) so callers can
+            # size the assembled context without a tokenizer.
+            "approx_tokens": approx_tokens(context),
         }
         # Additive: surface a backend failure so an empty result isn't read as
         # "no memories" when the graph/retrieve backend was actually down.

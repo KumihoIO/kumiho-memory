@@ -413,6 +413,19 @@ def test_memory_engage_returns_context_and_krefs():
         _cleanup_manager()
 
 
+def test_memory_engage_exposes_approx_tokens():
+    """engage should surface an additive approx_tokens (chars/4) budget field."""
+    from kumiho_memory.context_compose import approx_tokens
+
+    try:
+        _install_test_manager()
+        result = tool_memory_engage({"query": "user preferences", "limit": 3})
+        assert "approx_tokens" in result
+        assert result["approx_tokens"] == approx_tokens(result["context"])
+    finally:
+        _cleanup_manager()
+
+
 def test_memory_engage_filters_by_min_score():
     """kumiho_memory_engage should drop low-scoring memories before context."""
     try:

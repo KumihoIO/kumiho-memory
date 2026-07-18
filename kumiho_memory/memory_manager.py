@@ -2018,10 +2018,12 @@ class UniversalMemoryManager:
             receives pre-filtered siblings in that case.
         recall_mode:
             ``"full"`` (default) includes artifact content (raw conversation
-            text, truncated to 4000 chars).  ``"summarized"`` uses only
-            title + summary — lossy but cheaper.  Falls back to the
-            instance's ``self.recall_mode`` when ``None``.
+            text, truncated to the shared
+            :data:`kumiho_memory.context_compose.CONTEXT_BUDGET_CHARS` budget).
+            ``"summarized"`` uses only title + summary — lossy but cheaper.
+            Falls back to the instance's ``self.recall_mode`` when ``None``.
         """
+        from kumiho_memory import context_compose
         from kumiho_memory.evidence_rank import evidence_badge
 
         mode = recall_mode or self.recall_mode
@@ -2053,7 +2055,10 @@ class UniversalMemoryManager:
             facts_suffix = f"\nFacts: {facts}" if facts else ""
 
             if mode == "full" and content:
-                texts.append(badge + content[:4000] + facts_suffix)
+                texts.append(
+                    badge + context_compose.truncate_section(content)
+                    + facts_suffix
+                )
             elif summary:
                 texts.append(
                     (f"{badge}{date_prefix}{title}: {summary}"
@@ -2075,7 +2080,10 @@ class UniversalMemoryManager:
                     sib_badge = evidence_badge(sib, self.evidence_rank_config)
                     sib_content = sib.get("content", "")
                     if sib_content:
-                        texts.append(sib_badge + sib_content[:4000])
+                        texts.append(
+                            sib_badge
+                            + context_compose.truncate_section(sib_content)
+                        )
                     else:
                         sib_title = sib.get("title", "")
                         sib_summary = sib.get("summary", "")
@@ -2095,7 +2103,7 @@ class UniversalMemoryManager:
         *,
         mode: Optional[str] = None,
         top_k: Optional[int] = None,
-        char_limit: int = 8000,
+        char_limit: Optional[int] = None,
     ) -> str:
         """Revision-centric context assembly (see :mod:`kumiho_memory.context_compose`).
 

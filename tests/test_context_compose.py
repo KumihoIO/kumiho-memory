@@ -8,10 +8,16 @@ signal, and the top-k cap treats 0 as unlimited.
 
 import asyncio
 
+import kumiho_memory.context_compose as cc
 from kumiho_memory.context_compose import (
+    CONTEXT_BUDGET_CHARS,
     DEFAULT_CONTEXT_TOP_K,
+    DEFAULT_REVISION_CHAR_LIMIT,
+    TRUNCATION_MARKER,
+    approx_tokens,
     collect_top_revisions,
     compose_context,
+    truncate_section,
 )
 
 
@@ -119,6 +125,9 @@ def test_full_mode_uses_content_with_char_limit_and_summary_fallback():
     without_content = _mem("b", "sb")
     out = compose_context([with_content, without_content],
                           mode="full", char_limit=10)
+    # A limit below the marker width degenerates to a bare hard slice (origin
+    # behavior preserved, budget ceiling honored); the content-less memory
+    # falls back to title+summary.
     assert out == "X" * 10 + "\n\nb: sb"
 
 
@@ -315,3 +324,152 @@ def test_grounding_note_in_full_mode():
     out = compose_context([stale], mode="full")
     assert out.startswith("the raw decision")
     assert "[grounding stale: a fact this was based on was superseded]" in out
+
+
+# ---------------------------------------------------------------------------
+# Unified context budget (#106) — one source of truth + token approx + marker
+# ---------------------------------------------------------------------------
+
+def _make_full_manager():
+    """A manager wired for context assembly (full recall mode, no backend)."""
+    from kumiho_memory.memory_manager import UniversalMemoryManager
+    from kumiho_memory.redis_memory import RedisMemoryBuffer
+    from fakes import FakeRedis
+
+    async def _store(**k):
+        return {}
+
+    async def _retrieve(**k):
+        return []
+
+    return UniversalMemoryManager(
+        redis_buffer=RedisMemoryBuffer(client=FakeRedis(), redis_url="redis://t"),
+        memory_store=_store,
+        memory_retrieve=_retrieve,
+        recall_mode="full",
+    )
+
+
+# --- Single source of truth: env override -----------------------------------
+
+def test_env_override_sets_budget(monkeypatch):
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_BUDGET_CHARS", "1234")
+    assert cc._resolve_context_budget_chars() == 1234
+
+
+def test_env_override_malformed_and_nonpositive_fall_back(monkeypatch):
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_BUDGET_CHARS", "not-an-int")
+    assert cc._resolve_context_budget_chars() == cc._DEFAULT_CONTEXT_BUDGET_CHARS
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_BUDGET_CHARS", "-5")
+    assert cc._resolve_context_budget_chars() == cc._DEFAULT_CONTEXT_BUDGET_CHARS
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_BUDGET_CHARS", "   ")
+    assert cc._resolve_context_budget_chars() == cc._DEFAULT_CONTEXT_BUDGET_CHARS
+
+
+def test_default_budget_matches_bench_path_historical_value():
+    # Unified default = the value the LoCoMo (compose_context, full) path used
+    # before unification — byte-identical for sections at or under the budget;
+    # over-budget sections carry the in-budget marker (measured at the 0.19.0
+    # full-10 RC gate, not claimed neutral).
+    assert cc._DEFAULT_CONTEXT_BUDGET_CHARS == 8000
+    assert DEFAULT_REVISION_CHAR_LIMIT == CONTEXT_BUDGET_CHARS
+
+
+# --- Single source of truth: both assemblers honor the constant -------------
+
+def test_both_assemblers_read_the_shared_budget_constant(monkeypatch):
+    # Monkeypatch the one constant; BOTH assemblers must truncate at it.
+    monkeypatch.setattr(cc, "CONTEXT_BUDGET_CHARS", 20)
+    content = "Y" * 40
+    # Budget-inclusive: cut to (limit - marker) then append → exactly 20 chars.
+    expected = "Y" * (20 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
+    assert len(expected) == 20
+
+    # Bench path: revision-centric compose_context (char_limit=None → constant).
+    bench = compose_context([_mem("a", "sa", score=0.5, content=content)],
+                            mode="full")
+    assert bench == expected
+
+    # MCP engage path: item-centric build_recalled_context.
+    mgr = _make_full_manager()
+    item = mgr.build_recalled_context([_mem("a", "sa", content=content)],
+                                      recall_mode="full")
+    assert item == expected
+
+
+# --- Shared per-section truncation policy: marker parity ---------------------
+
+def test_truncation_marker_parity_across_assemblers(monkeypatch):
+    monkeypatch.setattr(cc, "CONTEXT_BUDGET_CHARS", 16)
+    content = "Z" * 30
+    bench = compose_context([_mem("a", "sa", score=0.5, content=content)],
+                            mode="full")
+    mgr = _make_full_manager()
+    item = mgr.build_recalled_context([_mem("a", "sa", content=content)],
+                                      recall_mode="full")
+    # Identical marker, identical cut point → identical section output, and
+    # the budget is a hard ceiling (marker included in the 16 chars).
+    assert bench.endswith(TRUNCATION_MARKER)
+    assert item.endswith(TRUNCATION_MARKER)
+    assert bench == item == "Z" * (16 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
+    assert len(bench) == 16
+
+
+def test_truncate_section_policy():
+    m = TRUNCATION_MARKER
+    assert truncate_section("short", 100) == "short"    # under budget: unchanged
+    assert truncate_section("abcdef", 6) == "abcdef"    # exact fit: no marker
+    # Truncation is budget-inclusive: marker fits INSIDE the limit, so the
+    # result is exactly `limit` chars — the budget is a hard ceiling.
+    out = truncate_section("a" * 30, 20)
+    assert out == "a" * (20 - len(m)) + m
+    assert len(out) == 20
+    # Limit too small to fit the marker: bare hard slice, ceiling still holds.
+    assert truncate_section("abcdef", 3) == "abc"
+    # 0 passes through like the historical content[:0] slice (NOT unlimited).
+    assert truncate_section("abcdef", 0) == ""
+
+
+def test_truncate_section_none_limit_uses_constant(monkeypatch):
+    monkeypatch.setattr(cc, "CONTEXT_BUDGET_CHARS", 14)
+    out = truncate_section("x" * 30)
+    assert out == "x" * (14 - len(TRUNCATION_MARKER)) + TRUNCATION_MARKER
+    assert len(out) == 14
+
+
+def test_char_limit_zero_empties_content_origin_semantics():
+    # F3 regression: numeric char_limit passes straight through to slicing —
+    # 0 empties the section exactly like origin's content[:0] (NOT unlimited).
+    out = compose_context([_mem("a", "sa", score=0.5, content="RAW" * 10)],
+                          mode="full", char_limit=0)
+    assert out == ""
+
+
+# --- Token approximation -----------------------------------------------------
+
+def test_approx_tokens_is_chars_over_four():
+    assert approx_tokens("") == 0
+    assert approx_tokens("abcd") == 1
+    assert approx_tokens("a" * 41) == 10
+    # Applies to either assembler's rendered string output.
+    bench = compose_context([_mem("a", "sa")])   # "a: sa"
+    assert approx_tokens(bench) == len(bench) // 4
+
+
+# --- Behavior guard: bench assembler byte-identical under budget -------------
+
+def test_bench_assembler_byte_identical_under_budget():
+    # Under-budget raw content is returned unchanged (no marker) — the LoCoMo
+    # benchmark path (compose_context, recall_mode="full") is byte-identical
+    # to pre-#106 for sections AT OR UNDER the budget.  Over-budget sections
+    # carry the in-budget truncation marker — an intentional unification whose
+    # bench impact is measured at the 0.19.0 full-10 RC gate.
+    content = "hello world"          # 11 chars, far under the 8000 default
+    out = compose_context([_mem("a", "sa", score=0.5, content=content)],
+                          mode="full")
+    assert out == content
+    assert TRUNCATION_MARKER not in out
+    # Same when the budget is passed explicitly.
+    out2 = compose_context([_mem("a", "sa", score=0.5, content=content)],
+                           mode="full", char_limit=CONTEXT_BUDGET_CHARS)
+    assert out2 == content
