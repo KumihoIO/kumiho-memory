@@ -234,8 +234,91 @@ def test_relative_inconsistent_date_is_unverified():
 
 
 def test_relative_requires_reference_ts():
-    # Without a reference timestamp the relative path is dormant.
+    # Without a reference timestamp AND no in-content anchor the relative path
+    # is dormant.
     assert classify_event_date("2026-07-17", "that happened yesterday", None) == UNVERIFIED
+
+
+def test_n_weeks_months_years_later_english():
+    # Future 'N <unit> from now / later' branches — reachable but previously
+    # never exercised by any test (a refactor could have silently broken them).
+    assert c("2026-08-01", "two weeks from now we present") == DERIVED
+    assert c("2026-08-01", "two weeks later we present") == DERIVED
+    assert c("2026-10", "three months from now we move") == DERIVED
+    assert c("2028", "two years from now we expand") == DERIVED
+
+
+def test_this_week_and_this_month_windows():
+    # 'this week' / 'this month' branches — previously unexercised.
+    assert c("2026-07-18", "this week we kick off") == DERIVED
+    assert c("2026-07", "this month has been hectic") == DERIVED
+
+
+def test_korean_future_relative_forms():
+    # Korean future forms (주/개월/달/년 후·뒤) — symmetric with the past (전)
+    # forms, which previously had no regex at all (EN/KO asymmetry).
+    assert c("2026-08-01", "2주 후에 출시야") == DERIVED
+    assert c("2026-08-01", "2주 뒤에 출시야") == DERIVED
+    assert c("2026-10", "3개월 후에 이사한다") == DERIVED
+    assert c("2026-10", "3달 후에 이사한다") == DERIVED
+    assert c("2028", "2년 후에 확장한다") == DERIVED
+
+
+# --------------------------------------------------------------------------
+# In-content anchor derivation — backfill/historical case (#119 (1)(b))
+# --------------------------------------------------------------------------
+
+def test_relative_resolves_against_in_content_anchor_not_wall_clock():
+    # The summarizer resolves 'yesterday' against the in-text '[7 May 2023]'
+    # anchor, emitting 2023-05-06. reference_ts here is the wall-clock INGEST
+    # time (REF = 2026-07-18), ~3 years away: derivation must anchor on the
+    # literal in-content date, not the ingest clock. Pre-fix -> unverified.
+    src = "[7 May 2023] I moved into the new place yesterday."
+    assert c("2023-05-06", src, ref=REF) == DERIVED
+
+
+def test_in_content_anchor_derivation_without_reference_ts():
+    # An in-text absolute anchor alone is enough to derive a relative token off,
+    # even with no session timestamp.
+    src = "[7 May 2023] we launched two weeks ago"
+    assert classify_event_date("2023-04-23", src, None) == DERIVED
+
+
+def test_in_content_anchor_does_not_over_derive_far_date():
+    # 'yesterday' + a 2023 anchor, but the extracted date is near neither the
+    # anchor nor the wall clock -> stays unverified (windows remain tight).
+    src = "[7 May 2023] I moved in yesterday"
+    assert c("2019-01-01", src, ref=REF) == UNVERIFIED
+
+
+# --------------------------------------------------------------------------
+# Korean particle glued to an ISO date (#119, day/month precision)
+# --------------------------------------------------------------------------
+
+def test_korean_particle_glued_to_iso_date_verifies():
+    # A day-precision ISO date with a Korean particle directly attached
+    # (2026-07-18에) must still verify: the trailing \b boundary treated the
+    # attached Hangul particle as a word char and dropped the day. Pre-fix these
+    # returned 'unverified' despite the date being literally present.
+    assert c("2026-07-18", "회의는 2026-07-18에 있었어", ref=None) == VERIFIED
+    assert c("2026-07-18", "2026-07-18부터 시작한다", ref=None) == VERIFIED
+    assert c("2026-07-18", "마감은 2026.7.18까지야", ref=None) == VERIFIED
+    assert c("2026-07-18", "07/18/2026에 서명했다", ref=None) == VERIFIED
+    # Year-month precision with an attached particle.
+    assert c("2026-07", "2026-07에는 정신없었다", ref=None) == VERIFIED
+
+
+# --------------------------------------------------------------------------
+# Conflict-guard reject branch in _absolute_match
+# --------------------------------------------------------------------------
+
+def test_yearless_md_rejected_when_source_pins_a_different_year():
+    # Year-less month-NAME mention ('Jul 18') corroborates month+day, but the
+    # source ALSO pins that same month/day to a DIFFERENT year ('July 18 2020').
+    # The explicit conflicting year outranks the year-less inference, so a 2026
+    # day-precision row stays unverified. Pins the conflict guard's reject branch.
+    src = "we met on Jul 18, but the signed contract is dated July 18 2020"
+    assert c("2026-07-18", src, ref=None) == UNVERIFIED
 
 
 def test_absolute_wins_over_relative():

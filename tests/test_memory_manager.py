@@ -1590,3 +1590,20 @@ def test_consolidation_marks_relative_date_derived_via_message_timestamp():
         "We shipped the release yesterday, big relief.", yesterday_of,
     )
     assert meta["event_date_confidence"] == "derived"
+
+
+def test_consolidation_marks_relative_date_derived_via_in_content_anchor():
+    # Historical / backfill case: the message CONTENT carries the date anchor
+    # ('[7 May 2023]') and a relative token ('yesterday'), and the summarizer
+    # emits the resolved historical date 2023-05-06. The buffered message
+    # timestamp is the wall-clock INGEST time (~now, 2026) — NOT the conversation
+    # time — so relative derivation must anchor on the in-content date, not the
+    # ingest clock. Pre-fix this was misclassified 'unverified' and lost the
+    # event-proximity boost, defeating requirement (1)(b) for exactly the
+    # backfill/LoCoMo use case event_date exists for.
+    meta = _consolidate_capturing_metadata(
+        "[7 May 2023] We shipped the release yesterday, big relief.",
+        "2023-05-06",
+    )
+    assert meta["event_date"] == "2023-05-06"
+    assert meta["event_date_confidence"] == "derived"

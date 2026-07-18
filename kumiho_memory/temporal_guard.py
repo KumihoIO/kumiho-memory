@@ -204,17 +204,22 @@ def _extract_source_dates(
         if 1900 <= y <= 2099:
             years.add(y)
 
-    # Numeric year-first: 2026-07-18, 2026.7.18, 2026/07/18
-    for mt in re.finditer(r"\b(\d{4})[./-](\d{1,2})[./-](\d{1,2})\b", low):
+    # Numeric year-first: 2026-07-18, 2026.7.18, 2026/07/18.
+    # Trailing guard is ``(?!\d)`` (not ``\b``): a ``\b`` fails when a Korean
+    # particle is glued to the date (``2026-07-18에``), because Hangul is a word
+    # char, so the day silently drops out and the date is wrongly unverified.
+    # ``(?!\d)`` still forbids extending the number but tolerates any non-digit
+    # follower (particle, punctuation, EOL).
+    for mt in re.finditer(r"\b(\d{4})[./-](\d{1,2})[./-](\d{1,2})(?!\d)", low):
         add_day(int(mt[1]), int(mt[2]), int(mt[3]))
     # Numeric trailing-year (ambiguous order): 07/18/2026 or 18/07/2026 — try
     # both interpretations; only the calendar-valid ones survive add_day.
-    for mt in re.finditer(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b", low):
+    for mt in re.finditer(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)", low):
         a, b, y = int(mt[1]), int(mt[2]), int(mt[3])
         add_day(y, a, b)
         add_day(y, b, a)
     # Numeric year-month: 2026-07, 2026.7, 2026/07
-    for mt in re.finditer(r"\b(\d{4})[./-](\d{1,2})\b", low):
+    for mt in re.finditer(r"\b(\d{4})[./-](\d{1,2})(?!\d)", low):
         add_month(int(mt[1]), int(mt[2]))
 
     # English month-day-year: July 18 2026 / July 18th, 2026
@@ -323,10 +328,13 @@ def _shift_month(year: int, month: int, delta: int) -> Tuple[int, int]:
     return idx // 12, idx % 12 + 1
 
 
-def _relative_derivable(
-    parsed: Tuple[int, int, int, int], source_text: str, reference_ts: datetime
+def _relative_hits(
+    parsed: Tuple[int, int, int, int], low: str, ref: date
 ) -> bool:
-    """True when a relative token in the source resolves (arithmetically) to the date.
+    """True when a relative token in ``low`` resolves (arithmetically) to the date.
+
+    ``low`` is the already-lowercased source; ``ref`` is the single reference
+    anchor date the relative arithmetic is measured from.
 
     Windows are kept deliberately tight/bounded: a legitimate LLM resolution of
     ``yesterday`` / ``two weeks ago`` lands inside them, while a hallucinated
@@ -334,10 +342,6 @@ def _relative_derivable(
     window; calendar tokens (``last month``/``작년``) use exact calendar spans.
     """
     ev_start, ev_end = _iso_range(parsed)
-    ref = reference_ts.date()
-    if not isinstance(source_text, str) or not source_text:
-        return False
-    low = source_text.lower()
 
     hits: List[bool] = []
 
@@ -386,6 +390,8 @@ def _relative_derivable(
         n = int(mt[1]); day_window(7 * n - 3, 7 * n + 3)
     for mt in re.finditer(r"\b" + _NUM + r"\s+weeks?\s+(?:later|from now)\b", low):
         n = _num(mt[1]); day_window(-7 * n - 3, -7 * n + 3)
+    for mt in re.finditer(r"(\d{1,2})\s*주\s*(?:후|뒤)", low):
+        n = int(mt[1]); day_window(-7 * n - 3, -7 * n + 3)
 
     # --- N months / years ago / later ---
     for mt in re.finditer(r"\b" + _NUM + r"\s+months?\s+ago\b", low):
@@ -394,12 +400,16 @@ def _relative_derivable(
         month_offset(-int(mt[1]))
     for mt in re.finditer(r"\b" + _NUM + r"\s+months?\s+(?:later|from now)\b", low):
         month_offset(_num(mt[1]))
+    for mt in re.finditer(r"(\d{1,2})\s*(?:개월|달)\s*(?:후|뒤)", low):
+        month_offset(int(mt[1]))
     for mt in re.finditer(r"\b" + _NUM + r"\s+years?\s+ago\b", low):
         year_offset(-_num(mt[1]))
     for mt in re.finditer(r"(\d{1,2})\s*년\s*전", low):
         year_offset(-int(mt[1]))
     for mt in re.finditer(r"\b" + _NUM + r"\s+years?\s+(?:later|from now)\b", low):
         year_offset(_num(mt[1]))
+    for mt in re.finditer(r"(\d{1,2})\s*년\s*(?:후|뒤)", low):
+        year_offset(int(mt[1]))
 
     # --- vague week/month/year references ---
     if re.search(r"\blast week\b", low) or "지난주" in low or "지난 주" in low \
@@ -438,6 +448,48 @@ def _relative_derivable(
     return any(hits)
 
 
+def _relative_derivable(
+    parsed: Tuple[int, int, int, int],
+    source_text: str,
+    reference_ts: Optional[datetime],
+) -> bool:
+    """True when a relative token resolves to the date against *any* known anchor.
+
+    Relative arithmetic needs a reference instant. Two independent anchors are
+    honored, and a hit against either yields ``derived``:
+
+    * the session/message ``reference_ts`` (the live-conversation anchor), and
+    * every absolute day-precision date literally present in ``source_text``.
+
+    The second is essential for backfilled / historical / LoCoMo-style corpora:
+    ``redis_memory.add_message`` always stamps the *wall-clock ingest* time, so
+    ``reference_ts`` is the time the row was written, not the conversation time.
+    The summarizer, however, resolves relative tokens against an *in-content*
+    anchor (e.g. a ``[7 May 2023]`` message prefix — see the summarizer prompt),
+    so a legitimately derived historical date (``yesterday`` → ``2023-05-06``) is
+    consistent with the in-text anchor, not the ingest clock. Anchoring on the
+    literal source dates recovers those dates instead of misclassifying them
+    ``unverified`` and dropping their event-proximity boost (issue #119 (1)(b)).
+
+    The relative *token* is still required, so a hallucinated date with no
+    relative reference stays ``unverified``; the per-anchor windows stay tight.
+    """
+    if not isinstance(source_text, str) or not source_text:
+        return False
+    low = source_text.lower()
+
+    refs: List[date] = []
+    if reference_ts is not None:
+        refs.append(reference_ts.date())
+    # In-content absolute day anchors the summarizer may have resolved against.
+    _years, _months, days, _md = _extract_source_dates(source_text)
+    refs.extend(date(y, m, d) for (y, m, d) in sorted(days))
+    if not refs:
+        return False
+
+    return any(_relative_hits(parsed, low, ref) for ref in refs)
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -451,8 +503,12 @@ def classify_event_date(
 
     * ``verified``   — literally present in ``source_text`` at the date's precision.
     * ``derived``    — a relative token in ``source_text`` resolves to the date
-      given ``reference_ts`` (the session/message timestamp). Skipped when
-      ``reference_ts`` is ``None``.
+      against a known anchor: the session/message ``reference_ts`` and/or any
+      absolute date literally present in the source (the summarizer resolves
+      relative tokens against in-content anchors, so those must be honored even
+      when ``reference_ts`` is the wall-clock ingest time of a backfilled row).
+      Yields ``unverified`` when neither ``reference_ts`` nor an in-content
+      anchor is available.
     * ``unverified`` — neither; keep as metadata but exclude from ranking boost.
 
     Absolute matching wins over relative derivation (a literal date is the
@@ -464,6 +520,6 @@ def classify_event_date(
         return UNVERIFIED
     if _absolute_match(parsed, source_text):
         return VERIFIED
-    if reference_ts is not None and _relative_derivable(parsed, source_text, reference_ts):
+    if _relative_derivable(parsed, source_text, reference_ts):
         return DERIVED
     return UNVERIFIED
