@@ -199,6 +199,150 @@ class _Materializer:
             return False
 
 
+# --------------------------------------------------------------------------- #
+# Write-time alias resolution (ontology gap G5)                               #
+#                                                                             #
+# Decompose already dedupes entities WITHIN a call (per-call alias dict) and  #
+# ACROSS calls when the surface string is identical (get-or-create keys on    #
+# the slug). What it misses is a NEW surface form of an entity that already   #
+# has a hub under a DIFFERENT slug: "PostgreSQL" mentioned this session       #
+# duplicates an existing "Postgres" hub. This resolver does a bounded lookup  #
+# of existing hubs (normalized name + their stored `aliases`) before a new    #
+# hub is minted; on a match it REUSES the hub and appends the new surface as  #
+# an alias. Additive + flag-gated (default OFF); any lookup failure falls     #
+# back to the current create-new behavior so a write is never blocked.        #
+# --------------------------------------------------------------------------- #
+
+_ALIAS_RESOLUTION_ENV = "KUMIHO_MEMORY_ALIAS_RESOLUTION"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _alias_resolution_enabled() -> bool:
+    """True if write-time alias resolution is opted in via env (default OFF)."""
+    import os
+
+    return str(os.getenv(_ALIAS_RESOLUTION_ENV, "")).strip().casefold() in _TRUTHY
+
+
+def _entity_slug_from_uri(uri: str) -> str:
+    """``kref://proj/entities/<slug>.entity[?r=N]`` → ``<slug>`` ('' if none).
+
+    Mirrors ``graph_maintenance._node_slug`` (kept local to avoid importing the
+    maintenance module, which imports this one)."""
+    seg = (uri or "").split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+    return seg[:-len(".entity")] if seg.endswith(".entity") else seg
+
+
+class _AliasResolver:
+    """Bounded, per-call-cached lookup of an existing entity hub a new surface
+    form is an alias of.
+
+    One ``kumiho.search`` per distinct new entity surface (cached), matching the
+    new surface set (name + supplied aliases) against each candidate hub's
+    surface set (slug + display_name + stored aliases). Returns the reused
+    ``(canonical_slug, anchor_rev)`` only for a hub whose slug DIFFERS from the
+    new one — exact-slug dedup stays the get-or-create path's job, so this is
+    purely additive: with no alias hub in the graph, behavior is unchanged.
+    """
+
+    def __init__(self, project_name: str, schema: OntologySchema, *, enabled: bool):
+        self.project_name = project_name
+        self.schema = schema
+        self.enabled = enabled
+        self._cache: Dict[str, Optional[Tuple[str, Any]]] = {}
+
+    def resolve(self, name: str, aliases=None) -> Optional[Tuple[str, Any]]:
+        if not self.enabled:
+            return None
+        slug = slugify((name or "").strip(), hash_on_truncate=True)
+        if not slug:
+            return None
+        if slug in self._cache:
+            return self._cache[slug]
+        result = self._lookup(name, slug, aliases)
+        self._cache[slug] = result
+        return result
+
+    @staticmethod
+    def _surface_slugs(*names) -> set:
+        out: set = set()
+        for n in names:
+            s = slugify(str(n).strip(), hash_on_truncate=True)
+            if s:
+                out.add(s)
+        return out
+
+    def _lookup(self, name: str, slug: str, aliases) -> Optional[Tuple[str, Any]]:
+        import kumiho
+
+        our = self._surface_slugs(name, *(aliases or []))
+        context = f"{self.project_name}/{self.schema.entities_space}"
+        try:
+            results = kumiho.search(
+                name[:150], context=context, kind="entity",
+                include_revision_metadata=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block a write on lookup
+            logger.debug("alias resolution: search failed for %s: %s", slug, exc)
+            return None
+        match: Optional[Tuple[str, Any, Dict[str, Any], set]] = None
+        for r in results or []:
+            item = getattr(r, "item", None)
+            if item is None:
+                continue
+            cand_slug = _entity_slug_from_uri(
+                getattr(getattr(item, "kref", None), "uri", "")
+            )
+            if not cand_slug:
+                continue
+            # Exact-slug identity ALWAYS wins and is the get-or-create path's
+            # job: if a hub with our own slug already exists, defer to it (return
+            # None) rather than folding our surface into a different hub that
+            # merely lists it as an alias — never override true identity.
+            if cand_slug == slug:
+                return None
+            if match is not None:
+                continue  # already have an alias candidate; keep scanning for exact
+            try:
+                cand_rev = item.get_latest_revision()
+            except Exception:  # noqa: BLE001
+                continue
+            if cand_rev is None:
+                continue
+            meta = getattr(cand_rev, "metadata", {}) or {}
+            cand_surfaces = self._surface_slugs(
+                cand_slug, meta.get("display_name", ""),
+                *str(meta.get("aliases", "")).split(","),
+            )
+            if our & cand_surfaces:
+                match = (cand_slug, cand_rev, meta, cand_surfaces)
+        if match is None:
+            return None
+        cand_slug, cand_rev, meta, cand_surfaces = match
+        self._append_aliases(cand_rev, meta, cand_surfaces, name, aliases)
+        return (cand_slug, cand_rev)
+
+    @staticmethod
+    def _append_aliases(cand_rev, meta, cand_surfaces, name, aliases) -> None:
+        """Best-effort: append the new surfaces not already listed as aliases."""
+        new_surfaces: List[str] = []
+        for surf in [name] + [str(a) for a in (aliases or [])]:
+            surf = str(surf).strip()
+            if not surf:
+                continue
+            s = slugify(surf, hash_on_truncate=True)
+            if s and s not in cand_surfaces:
+                new_surfaces.append(surf)
+                cand_surfaces.add(s)  # de-dup within this append
+        if not new_surfaces:
+            return
+        existing = [a.strip() for a in str(meta.get("aliases", "")).split(",") if a.strip()]
+        try:
+            cand_rev.set_metadata({"aliases": ", ".join(existing + new_surfaces)})
+        except Exception as exc:  # noqa: BLE001 — metadata append is best-effort
+            logger.debug("alias resolution: append alias failed: %s", exc)
+
+
 def _sync_decompose(
     conversation_kref: str,
     summary: Dict[str, Any],
@@ -217,13 +361,19 @@ def _sync_decompose(
         return {}
 
     m = _Materializer(project, project_name, schema)
-    stats: Dict[str, int] = {"entities": 0, "facts": 0, "decisions": 0,
-                             "events": 0, "actions": 0, "questions": 0, "edges": 0}
+    stats: Dict[str, int] = {"entities": 0, "entities_reused": 0, "facts": 0,
+                             "decisions": 0, "events": 0, "actions": 0,
+                             "questions": 0, "edges": 0}
 
-    # --- Entities (deduped hubs; name -> anchor) ---
-    entity_anchors: Dict[str, Any] = {}  # slug -> anchor rev
-    entity_display: Dict[str, str] = {}  # slug -> display name
-    entity_tokens: Dict[str, List[str]] = {}  # slug -> name word-tokens
+    resolver = _AliasResolver(
+        project_name, schema, enabled=_alias_resolution_enabled(),
+    )
+
+    # --- Entities (deduped hubs; slug -> anchor) ---
+    entity_anchors: Dict[str, Any] = {}  # canonical slug -> anchor rev
+    entity_display: Dict[str, str] = {}  # canonical slug -> display name
+    entity_tokens: Dict[str, List[str]] = {}  # canonical slug -> name word-tokens
+    entity_resolved: Dict[str, str] = {}  # surface slug -> canonical slug (seen set)
 
     def _ensure_entity(name: str) -> Optional[str]:
         name = (name or "").strip()
@@ -232,15 +382,28 @@ def _sync_decompose(
         slug = slugify(name, hash_on_truncate=True)
         if not slug:
             return None
-        if slug not in entity_anchors:
-            anchor = m.node(schema.entities_space, "entity", slug,
-                            {"display_name": name, "promoted_from": conversation_kref})
-            if anchor is None:
-                return None
-            entity_anchors[slug] = anchor
-            entity_display[slug] = name
-            entity_tokens[slug] = _word_tokens(name)
-            stats["entities"] += 1
+        if slug in entity_resolved:
+            return entity_resolved[slug]
+        # G5: reuse an existing hub this surface is an alias of, before minting.
+        resolved = resolver.resolve(name)
+        if resolved is not None:
+            canonical_slug, anchor = resolved
+            if canonical_slug not in entity_anchors:
+                entity_anchors[canonical_slug] = anchor
+                entity_display[canonical_slug] = name
+                entity_tokens[canonical_slug] = _word_tokens(name)
+                stats["entities_reused"] += 1
+            entity_resolved[slug] = canonical_slug
+            return canonical_slug
+        anchor = m.node(schema.entities_space, "entity", slug,
+                        {"display_name": name, "promoted_from": conversation_kref})
+        if anchor is None:
+            return None
+        entity_anchors[slug] = anchor
+        entity_display[slug] = name
+        entity_tokens[slug] = _word_tokens(name)
+        entity_resolved[slug] = slug
+        stats["entities"] += 1
         return slug
 
     classification = summary.get("classification") or {}
@@ -488,11 +651,16 @@ def _sync_decompose_agent(
         return {}
 
     m = _Materializer(project, project_name, schema)
-    stats: Dict[str, int] = {"entities": 0, "facts": 0, "relations": 0,
-                             "supersedes": 0, "contradicts": 0, "edges": 0}
+    stats: Dict[str, int] = {"entities": 0, "entities_reused": 0, "facts": 0,
+                             "relations": 0, "supersedes": 0, "contradicts": 0,
+                             "edges": 0}
 
-    entity_anchors: Dict[str, Any] = {}   # slug -> anchor rev
-    alias_to_slug: Dict[str, str] = {}    # slug(name or alias) -> primary slug
+    resolver = _AliasResolver(
+        project_name, schema, enabled=_alias_resolution_enabled(),
+    )
+    entity_anchors: Dict[str, Any] = {}   # canonical slug -> anchor rev
+    alias_to_slug: Dict[str, str] = {}    # surface slug -> canonical slug (for _resolve)
+    entity_seen: Dict[str, str] = {}      # surface slug -> canonical slug (fast guard)
 
     def _ensure_entity(name: str, entity_type: str = "", aliases=None) -> Optional[str]:
         name = (name or "").strip()
@@ -501,23 +669,35 @@ def _sync_decompose_agent(
         slug = slugify(name, hash_on_truncate=True)
         if not slug:
             return None
-        if slug not in entity_anchors:
-            md = {"display_name": name, "promoted_from": conversation_kref}
-            if entity_type:
-                md["entity_type"] = entity_type
-            alist = [str(a).strip() for a in (aliases or []) if str(a).strip()]
-            if alist:
-                md["aliases"] = ", ".join(alist)
-            anchor = m.node(schema.entities_space, "entity", slug, md)
-            if anchor is None:
-                return None
-            entity_anchors[slug] = anchor
-            alias_to_slug[slug] = slug
-            for a in alist:
-                a_slug = slugify(a, hash_on_truncate=True)
-                if a_slug:
-                    alias_to_slug.setdefault(a_slug, slug)
-            stats["entities"] += 1
+        if slug in entity_seen:
+            return entity_seen[slug]
+        # G5: reuse an existing hub this surface (or its aliases) already names,
+        # before minting a duplicate. Miss / disabled / lookup-failure => create.
+        resolved = resolver.resolve(name, aliases)
+        if resolved is not None:
+            canonical_slug, anchor = resolved
+            entity_anchors.setdefault(canonical_slug, anchor)
+            alias_to_slug.setdefault(slug, canonical_slug)
+            entity_seen[slug] = canonical_slug
+            stats["entities_reused"] += 1
+            return canonical_slug
+        md = {"display_name": name, "promoted_from": conversation_kref}
+        if entity_type:
+            md["entity_type"] = entity_type
+        alist = [str(a).strip() for a in (aliases or []) if str(a).strip()]
+        if alist:
+            md["aliases"] = ", ".join(alist)
+        anchor = m.node(schema.entities_space, "entity", slug, md)
+        if anchor is None:
+            return None
+        entity_anchors[slug] = anchor
+        alias_to_slug[slug] = slug
+        entity_seen[slug] = slug
+        for a in alist:
+            a_slug = slugify(a, hash_on_truncate=True)
+            if a_slug:
+                alias_to_slug.setdefault(a_slug, slug)
+        stats["entities"] += 1
         return slug
 
     def _resolve(name: str) -> Optional[str]:
@@ -539,10 +719,24 @@ def _sync_decompose_agent(
         if not statement:
             continue
         slug = slugify(statement, hash_on_truncate=True)
-        anchor = m.node(schema.facts_space, "fact", slug, {
+        fact_md = {
             "title": _title_of(statement), "summary": statement, "claim": statement,
             "certainty": "", "fact_type": str(fact.get("type", "")) if is_dict else "",
-        })
+        }
+        # Valid-time interval (ontology G8): additive metadata alongside the
+        # fact, validated as ISO dates. Only written when the agent supplied a
+        # clean bound — never touches event_date or event_date_confidence (#119).
+        if is_dict:
+            from .valid_time import (
+                VALID_FROM_META, VALID_TO_META, normalize_valid_date,
+            )
+            vf = normalize_valid_date(fact.get(VALID_FROM_META))
+            if vf:
+                fact_md[VALID_FROM_META] = vf
+            vt = normalize_valid_date(fact.get(VALID_TO_META))
+            if vt:
+                fact_md[VALID_TO_META] = vt
+        anchor = m.node(schema.facts_space, "fact", slug, fact_md)
         if anchor is None:
             continue
         stats["facts"] += 1

@@ -20,6 +20,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from kumiho_memory.evidence import EVIDENCE_LEVELS, evidence_tag
 from kumiho_memory.grounding import apply_grounding_marker
 from kumiho_memory.privacy import PIIRedactor
+from kumiho_memory.valid_time import (
+    apply_as_of_recall,
+    apply_valid_interval_marker,
+    as_of_recall_enabled,
+)
 from kumiho_memory.redis_memory import RedisMemoryBuffer
 from kumiho_memory.retry import RetryQueue, retry_with_backoff
 from kumiho_memory.summarization import LLMAdapter, MemorySummarizer
@@ -306,6 +311,15 @@ class UniversalMemoryManager:
             and os.getenv("KUMIHO_MEMORY_RELATION_TRAVERSAL", "").strip() == "1"
         ):
             self.graph_augmentation_config.relation_traversal = True
+
+        # As-of recall (ontology G8). DEFAULT OFF — opt IN with
+        # KUMIHO_MEMORY_AS_OF_RECALL=1. When on AND the caller passes a
+        # query_time, recall demotes (never deletes) facts whose valid-time
+        # interval excludes that instant. Read once here (env convention); the
+        # flag-OFF path never touches the reranked list, so recall is
+        # byte-identical by default. Awaits the same pair-measured gate as the
+        # other Phase 3 flips.
+        self.as_of_recall_enabled = as_of_recall_enabled()
 
         # Multi-draw reformulation override (angle-union harvesting for
         # oblique triggers). Applies whenever graph augmentation is active.
@@ -1654,11 +1668,28 @@ class UniversalMemoryManager:
                 )
                 if len(memories) > target:
                     memories = memories[:target]
-                return await self._enrich_with_siblings(memories, query)
+                enriched = await self._enrich_with_siblings(memories, query)
+                return self._apply_as_of_recall(enriched, query_time)
 
-        return await self._base_recall(
+        base = await self._base_recall(
             query, limit=limit, space_paths=space_paths,
             memory_types=memory_types, query_time=query_time,
+        )
+        return self._apply_as_of_recall(base, query_time)
+
+    def _apply_as_of_recall(
+        self, memories: List[Dict[str, Any]], query_time: Optional[datetime],
+    ) -> List[Dict[str, Any]]:
+        """Opt-in as-of demotion (ontology G8), applied once at the recall exit.
+
+        A strict no-op unless the ``KUMIHO_MEMORY_AS_OF_RECALL`` flag is on AND a
+        ``query_time`` was supplied — so the default recall path is unchanged
+        (byte-identical). The instant is the query's temporal reference
+        (``query_time``); facts whose valid-time interval excludes it are moved
+        after the still-valid results (never deleted).
+        """
+        return apply_as_of_recall(
+            memories, query_time, enabled=self.as_of_recall_enabled,
         )
 
     async def _graph_base_recall(
@@ -2411,6 +2442,11 @@ class UniversalMemoryManager:
             # the one mode that is otherwise date-blind (no content loaded).
             if meta.get("event_date"):
                 entry["event_date"] = meta["event_date"]
+            # Valid-time interval (G8): additive valid_from/valid_to alongside
+            # event_date, surfaced only when present + ISO-valid. Feeds the
+            # opt-in as-of recall filter (KUMIHO_MEMORY_AS_OF_RECALL); absent on
+            # legacy revisions, so recall is unchanged there.
+            apply_valid_interval_marker(entry, meta)
 
             # Read the raw conversation from the local artifact file.
             if load_artifacts:

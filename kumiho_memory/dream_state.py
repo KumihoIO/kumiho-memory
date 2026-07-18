@@ -516,6 +516,16 @@ class DreamState:
         ("Postgres"/"PostgreSQL"), applied through the same keyless write
         path.  Requires a working summarizer key; no-op (recorded as an
         error) if the model call fails.
+    embed_fact_dedup:
+        When *maintain_graph* is on, additionally nominate near-duplicate fact
+        pairs with server-side vector scoring (``score_revisions`` — keyless, no
+        LLM key) and merge them through the SAME lexical-confirmation + budget +
+        published-protection path as the keyless per-entity scan (ontology G6).
+        Widens candidate pairing beyond one entity's ``ABOUT`` fan-in without
+        loosening the unrecoverable-merge threshold.  Tri-state like
+        *maintain_graph*: explicit ``True``/``False`` wins; ``None`` (default)
+        lets ``KUMIHO_DREAM_EMBED_FACT_DEDUP`` decide.  Default OFF pending the
+        paired gate.
     code_project:
         Explicit ``{repo}-code`` project for the Decision Memory passes.
         When None, derived via ``resolve_project_name`` only if code memory
@@ -553,6 +563,7 @@ class DreamState:
         extra_instructions: Optional[str] = None,
         maintain_graph: Optional[bool] = None,
         maintenance_llm: bool = False,
+        embed_fact_dedup: Optional[bool] = None,
         code_project: Optional[str] = None,
         verifier: Optional[LLMAdapter] = None,
         verifier_model: Optional[str] = None,
@@ -635,6 +646,18 @@ class DreamState:
         else:
             self.maintain_graph = bool(maintain_graph)
         self.maintenance_llm = bool(maintenance_llm)
+        # Embedding-assisted fact dedup (ontology G6). Same tri-state sentinel
+        # as maintain_graph: explicit True/False is authoritative; None lets
+        # KUMIHO_DREAM_EMBED_FACT_DEDUP decide. Rides inside the graph-
+        # maintenance pass (only meaningful when maintain_graph is on) and is
+        # keyless — server vector scoring, no LLM key, default OFF pending the
+        # paired gate.
+        if embed_fact_dedup is None:
+            self.embed_fact_dedup = os.getenv(
+                "KUMIHO_DREAM_EMBED_FACT_DEDUP", ""
+            ).strip().casefold() in ("1", "true", "yes", "on")
+        else:
+            self.embed_fact_dedup = bool(embed_fact_dedup)
         # Resolve the Decision Memory project. Both the explicit arg and the
         # derived name go through resolve_project_name so the physical-
         # isolation guard (a code project must differ from the conversation
@@ -819,6 +842,17 @@ class DreamState:
                 allow_published_deprecation=self.allow_published_deprecation,
             )
             await asyncio.to_thread(maintainer.run_keyless, stats)
+
+            # Embedding-assisted fact dedup (G6, opt-in): keyless server vector
+            # nomination, routed through the same budgeted+protected merge path.
+            # Runs after run_keyless so it sees already-merged facts deprecated.
+            if self.embed_fact_dedup:
+                try:
+                    await asyncio.to_thread(
+                        maintainer.apply_embedding_fact_dedup, stats
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    stats.errors.append(f"embed_fact_dedup: {exc}")
 
             if self.maintenance_llm:
                 try:

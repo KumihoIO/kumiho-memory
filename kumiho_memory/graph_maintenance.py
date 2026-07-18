@@ -105,6 +105,33 @@ _DECISION_DEDUP_JACCARD = 0.82
 #: not wedge the run.  Truncation is logged (never silent).
 _MAX_DEDUP_NODES = 400
 
+#: Embedding-assisted fact-dedup candidate stage (ontology G6, opt-in via
+#: ``KUMIHO_DREAM_EMBED_FACT_DEDUP``).  Server-side vector scoring
+#: (``score_revisions`` — no client embeddings, no LLM key) WIDENS candidate
+#: pairing beyond a single entity's ``ABOUT`` fan-in, catching paraphrase
+#: duplicates filed under different entities that the lexical per-entity scan
+#: never compares.  The merge itself still routes through the SAME
+#: ``_FACT_DEDUP_JACCARD`` confirmation + fact budget + published protection, so
+#: the unrecoverable-merge safety threshold is never loosened — embeddings only
+#: nominate, they never authorize.  Bounds honor the typed-node vector-crowding
+#: constraint (small k, kind=fact filter, capped query fan-out).
+_EMBED_FACT_DEDUP_ENV = "KUMIHO_DREAM_EMBED_FACT_DEDUP"
+#: Facts used as a vector query per run (each costs one ``score_revisions`` RPC).
+_EMBED_MAX_QUERY_FACTS = 50
+#: Nearest neighbours examined per query fact — deliberately SMALL (k), so the
+#: stage samples the densest duplicate clusters without flooding recall.
+_EMBED_TOP_K = 5
+#: Server-similarity floor for a nomination.  Only bounds candidate volume — the
+#: lexical Jaccard gate is the actual merge authority, so this is intentionally
+#: permissive rather than a second safety threshold.
+_EMBED_MIN_SCORE = 0.6
+#: Server score methods that count as "vector" evidence.  Pure ``fulltext`` is
+#: skipped: it is the lexical signal the existing pass already covers, and G6 is
+#: specifically the semantic (embedding) leg.
+_EMBED_VECTOR_METHODS = frozenset({"vector", "hybrid"})
+#: Max revision krefs a single ``score_revisions`` call accepts (server limit).
+_SCORE_REVISIONS_MAX = 100
+
 # Edge-direction constants (mirror kumiho.OUTGOING / INCOMING; imported lazily
 # via the injected sdk so this module has no hard kumiho import at load time).
 _OUTGOING = 0
@@ -135,6 +162,12 @@ class MaintenanceStats:
     #: entity deprecation budget was exhausted this run — lets an operator
     #: distinguish "budget starvation" from "the model found nothing to merge".
     llm_merges_skipped: int = 0
+    #: Embedding-assisted fact-dedup (G6, opt-in): candidate pairs the server
+    #: vector stage nominated, and how many of those actually merged (cleared
+    #: the lexical confirmation + budget).  ``embed_facts_merged`` is a subset of
+    #: ``facts_merged``.
+    embed_fact_candidates: int = 0
+    embed_facts_merged: int = 0
     errors: List[str] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -153,6 +186,8 @@ class MaintenanceStats:
             "dependents_kept": self.dependents_kept,
             "llm_merges": self.llm_merges,
             "llm_merges_skipped": self.llm_merges_skipped,
+            "embed_fact_candidates": self.embed_fact_candidates,
+            "embed_facts_merged": self.embed_facts_merged,
             "errors": list(self.errors),
         }
 
@@ -331,6 +366,131 @@ class GraphMaintainer:
                 "entity deprecation budget exhausted this run",
                 stats.llm_merges_skipped,
             )
+
+    # ------------------------------------------------------------------
+    # (A) Ontology — embedding-assisted fact dedup (G6, opt-in)
+    # ------------------------------------------------------------------
+
+    def apply_embedding_fact_dedup(self, stats: MaintenanceStats) -> None:
+        """Nominate near-duplicate fact pairs via server vector scoring, then
+        merge them through the SAME verification path as the keyless pass.
+
+        The *nomination* is semantic (server embeddings saw two statements as
+        near-identical across whatever entities they are filed under); the
+        *application* is the identical deterministic, dry-run-safe,
+        budget-and-published-protected :meth:`_confirm_and_collapse_fact` the
+        keyless per-entity scan uses — embeddings never authorize a merge, and
+        the ``_FACT_DEDUP_JACCARD`` safety threshold is unchanged.  Runs after
+        :meth:`run_keyless` so it sees already-merged facts as deprecated.
+        """
+        candidates = self.embedding_fact_candidates(stats)
+        if not candidates:
+            return
+        # Share the fact budget the keyless pass sized+spent; size it here only
+        # if this is the sole fact-deprecating pass (setdefault never revives an
+        # exhausted budget).
+        live_facts = sum(
+            1 for f in self._search(self.project, "fact") if not _is_deprecated(f)
+        )
+        self._budgets.setdefault(
+            "fact", max(1, int(live_facts * self.max_deprecation_ratio))
+        )
+        seen_pairs: set = set()
+        for a, b in candidates:
+            if self._confirm_and_collapse_fact(a, b, stats, seen_pairs):
+                stats.embed_facts_merged += 1
+
+    def embedding_fact_candidates(
+        self, stats: MaintenanceStats
+    ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Server-side vector nomination of near-duplicate fact pairs (G6).
+
+        Keyless: ``score_revisions`` ranks each query fact's statement against
+        the other live fact revisions using the server's STORED embeddings — no
+        client-side embedding, no LLM key.  Returns a de-duplicated list of
+        ``(a, b)`` fact dicts (the ``_about_sources`` shape the merge path
+        expects).  Bounded on every axis (query fan-out, k, candidate pool) and
+        ``kind=fact``-filtered so it never floods vector recall.  No-op when the
+        SDK/server exposes no vector scoring.
+        """
+        score_fn = getattr(self.sdk, "score_revisions", None)
+        if not callable(score_fn):
+            return []  # server/SDK without vector scoring — silently skip
+        facts = [
+            f for f in self._search(self.project, "fact") if not _is_deprecated(f)
+        ]
+        if len(facts) < 2:
+            return []
+        if len(facts) > _MAX_DEDUP_NODES:
+            logger.info(
+                "embedding fact dedup: %d live facts exceed cap %d — truncating",
+                len(facts), _MAX_DEDUP_NODES,
+            )
+            facts = facts[:_MAX_DEDUP_NODES]
+
+        entries: List[Dict[str, Any]] = []
+        by_uri: Dict[str, Dict[str, Any]] = {}
+        for item in facts:
+            rev = _latest(item)
+            if rev is None:
+                continue
+            uri = _uri(rev)
+            if not uri:
+                continue
+            meta = _meta(rev)
+            claim = str(
+                meta.get("claim", "") or meta.get("summary", "") or meta.get("title", "")
+            )
+            if not claim.strip():
+                continue
+            entry = {
+                "item": item,
+                "rev": rev,
+                "slug": _node_slug(uri, "fact"),
+                "tokens": _tokens(claim),
+                "statement": claim,
+                "uri": uri,
+            }
+            entries.append(entry)
+            by_uri[uri] = entry
+        if len(entries) < 2:
+            return []
+
+        all_uris = [e["uri"] for e in entries]
+        pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        seen: set = set()
+        for q in entries[:_EMBED_MAX_QUERY_FACTS]:
+            others = [u for u in all_uris if u != q["uri"]][:_SCORE_REVISIONS_MAX]
+            if not others:
+                continue
+            try:
+                scored = score_fn(q["statement"], others)
+            except Exception as exc:  # noqa: BLE001 — a scoring failure is a no-op
+                logger.debug("embedding fact dedup: score_revisions failed: %s", exc)
+                continue
+            taken = 0
+            for sr in scored or []:
+                if taken >= _EMBED_TOP_K:
+                    break
+                if str(sr.get("score_method", "")).lower() not in _EMBED_VECTOR_METHODS:
+                    continue
+                try:
+                    score = float(sr.get("score", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if score < _EMBED_MIN_SCORE:
+                    continue
+                taken += 1
+                other = by_uri.get(str(sr.get("kref", "")))
+                if other is None or other["slug"] == q["slug"]:
+                    continue
+                key = tuple(sorted((q["slug"], other["slug"])))
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append((q, other))
+        stats.embed_fact_candidates += len(pairs)
+        return pairs
 
     # ------------------------------------------------------------------
     # Loading
@@ -523,15 +683,45 @@ class GraphMaintainer:
                     b = facts[j]
                     if _is_deprecated(b["item"]):
                         continue
-                    key = tuple(sorted((a["slug"], b["slug"])))
-                    if key in seen_pairs:
-                        continue
-                    seen_pairs.add(key)
-                    if _jaccard(a["tokens"], b["tokens"]) < _FACT_DEDUP_JACCARD:
-                        continue
-                    keeper, loser = _pick_keeper(a, b)
-                    if self._collapse_node(keeper, loser, stats):
-                        stats.facts_merged += 1
+                    self._confirm_and_collapse_fact(a, b, stats, seen_pairs)
+
+    def _confirm_and_collapse_fact(
+        self,
+        a: Dict[str, Any],
+        b: Dict[str, Any],
+        stats: MaintenanceStats,
+        seen_pairs: set,
+    ) -> bool:
+        """The single fact-merge verification+application path.
+
+        A candidate pair — whether nominated by the per-entity lexical scan or
+        the opt-in embedding stage — merges ONLY when it clears the
+        ``_FACT_DEDUP_JACCARD`` lexical confirmation (the unrecoverable-merge
+        safety threshold), and even then through ``_collapse_node``, which
+        enforces published protection and the per-kind fact deprecation budget.
+        Returns ``True`` when a merge was applied (or, in ``dry_run``, would
+        have been).  Idempotent per pair via *seen_pairs*.
+        """
+        key = tuple(sorted((a["slug"], b["slug"])))
+        if key in seen_pairs:
+            return False
+        seen_pairs.add(key)
+        if a["slug"] == b["slug"]:
+            return False
+        if _is_deprecated(a["item"]) or _is_deprecated(b["item"]):
+            return False
+        if _jaccard(a["tokens"], b["tokens"]) < _FACT_DEDUP_JACCARD:
+            return False
+        # Keeper selection needs the edge count; compute it lazily so the
+        # embedding stage only pays the round-trip for a confirmed pair.
+        for entry in (a, b):
+            if "edges" not in entry:
+                entry["edges"] = len(_edges(entry["rev"], None, _BOTH))
+        keeper, loser = _pick_keeper(a, b)
+        if self._collapse_node(keeper, loser, stats):
+            stats.facts_merged += 1
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # (A) Ontology — orphan prune

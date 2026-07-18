@@ -29,6 +29,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Union
 
 from kumiho_memory._bounded import run_bounded_in_thread
 from kumiho_memory.grounding import apply_grounding_marker
+from kumiho_memory.valid_time import apply_valid_interval_marker
 from kumiho_memory.summarization import (
     LLMAdapter,
     build_string_array_wrapper_schema,
@@ -1090,6 +1091,11 @@ class GraphAugmentedRecall:
                             # fetched here — additive, zero extra round-trip
                             # (mirrors evidence_level/source above).
                             apply_grounding_marker(entry, connected_rev.metadata)
+                            # Valid-time interval (G8): additive valid_from/
+                            # valid_to surfaced from the same fetched metadata so
+                            # graph-hopped facts also carry an interval for the
+                            # opt-in as-of recall filter. Absent on legacy nodes.
+                            apply_valid_interval_marker(entry, connected_rev.metadata)
                             graph_augmented_results.append(entry)
                             found += 1
                         except Exception as e:
