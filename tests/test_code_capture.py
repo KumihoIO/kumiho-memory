@@ -1228,3 +1228,254 @@ def test_validate_decisions_stats_none_does_not_crash():
         CodeMemoryConfig(), redactor=PIIRedactor(),  # stats omitted
     )
     assert out == []  # credential decision still dropped, no crash
+
+
+# ---------------- overall capture deadline + partial success (#98) ----------
+#
+# The keyless capture tool must return before the MCP client's request timeout
+# fires (a live capture hit -32001 against the cloud).  capture_decisions bounds
+# the WHOLE tool with an overall deadline and checkpoints per decision: on
+# deadline it returns a PARTIAL result naming what landed + what's pending +
+# how to finish.  A retry with the same args must NOT duplicate (get-or-create
+# nodes + existence-checked edges).
+
+
+class _FakeClock:
+    """A frozen monotonic clock the test advances explicitly, so a deadline
+    can be tripped at an exact point in the batch with no wall-clock races."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def monotonic(self):
+        return self.t
+
+
+def _two_distinct_decisions():
+    """Two decisions with disjoint titles + evidence so 'which landed' is
+    unambiguous when a deadline cuts the batch in half."""
+    return [
+        {"title": "Decision ONE single worker",
+         "decision": "run the CE rerank on one dedicated worker",
+         "rationale": "a shared pool oversubscribes the cross-encoder",
+         "why_question": "why one worker?",
+         "symbols": ["rerank_async"],
+         "files": ["a.py"],
+         "evidence": [{"kind": "measurement",
+                       "text": "concurrency-4 collapsed to ~1 effective (decision one)"}],
+         "confidence": "high"},
+        {"title": "Decision TWO cache policy",
+         "decision": "invalidate the cache on every write",
+         "rationale": "readers saw stale rows after a write",
+         "why_question": "why invalidate eagerly?",
+         "symbols": ["cache_put"],
+         "files": ["a.py"],
+         "evidence": [{"kind": "constraint",
+                       "text": "stale reads observed after write (decision two)"}],
+         "confidence": "high"},
+    ]
+
+
+def _count_items(project, kind):
+    return [i for (s, k), i in project.items.items()
+            if k == kind and i.get_latest_revision() is not None]
+
+
+async def _run_synchronously(fn, *, timeout, label="", on_timeout=None,
+                             on_error=None):
+    """Drop-in for run_bounded_in_thread that runs fn INLINE (no daemon
+    thread, no clock of its own).  Used only by the deadline tests so the
+    fake clock's sole consumer is capture_decisions' own deadline math —
+    the real bounded runner is exercised by the other tests."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 — mirror the helper's swallow-and-report
+        return on_error
+
+
+def test_capture_deadline_env_parsing(monkeypatch):
+    """The overall budget comes from KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE;
+    blanks/garbage/non-positive fall back to the (sub-MCP-timeout) default."""
+    import kumiho_memory.code_capture as cc
+
+    monkeypatch.delenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", raising=False)
+    assert cc._capture_deadline() == cc._CAPTURE_DEADLINE_DEFAULT
+    assert cc._CAPTURE_DEADLINE_DEFAULT < 60.0  # comfortably under the MCP timeout
+
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", "30")
+    assert cc._capture_deadline() == 30.0
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", "12.5")
+    assert cc._capture_deadline() == 12.5
+    for bad in ("", "   ", "abc", "0", "-5"):
+        monkeypatch.setenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", bad)
+        assert cc._capture_deadline() == cc._CAPTURE_DEADLINE_DEFAULT
+
+
+def test_capture_generous_deadline_full_success_unchanged(tmp_path, monkeypatch):
+    """A generous deadline is a no-op: every decision + the marker land, and
+    the result carries NO partial fields (fast-path shape unchanged)."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", "600")
+
+    stats = asyncio.run(capture_decisions(
+        str(repo), _two_distinct_decisions(), commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert stats.partial is False
+    assert stats.decisions == 2 and stats.evidence == 2 and not stats.errors
+    d = stats.as_dict()
+    for k in ("partial", "landed_krefs", "pending_decisions", "resume"):
+        assert k not in d  # omitted on the non-partial path
+
+    import kumiho
+    project = kumiho.get_project("p-code")
+    assert len(_count_items(project, "code_decision")) == 2
+    assert len(_count_items(project, "code_commit")) == 1  # marker written
+
+
+def test_capture_idempotent_double_run_no_duplicates(tmp_path, monkeypatch):
+    """Idempotency proof: capturing the SAME commit+decisions twice produces an
+    IDENTICAL graph — no new items, revisions, or edges.  This is the retry-
+    safety the partial result promises (get-or-create nodes, edge prechecks)."""
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    decisions = _two_distinct_decisions()
+
+    s1 = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert s1.partial is False and s1.decisions == 2 and not s1.errors
+
+    import kumiho
+    project = kumiho.get_project("p-code")
+    items_before = {(s, k): len(i.revisions) for (s, k), i in project.items.items()}
+    edges_before = len(_FAKE.edges)
+    revs_before = len(_FAKE.revs)
+
+    # second run, byte-identical args → converge, add nothing
+    s2 = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert s2.decisions == 0 and s2.evidence == 0  # nothing newly written
+    assert not s2.errors and s2.partial is False
+
+    items_after = {(s, k): len(i.revisions) for (s, k), i in project.items.items()}
+    assert items_after == items_before          # no new items, no new revisions
+    assert len(_FAKE.edges) == edges_before      # no duplicate edges
+    assert len(_FAKE.revs) == revs_before        # no duplicate revisions
+
+
+def test_capture_partial_on_deadline_mid_batch(tmp_path, monkeypatch):
+    """Deadline reached BETWEEN decisions: decision one lands whole, decision
+    two is pending, and the marker is withheld — never a half-written decision.
+    The result reports landed krefs, the pending title, and an idempotent-retry
+    resume token."""
+    import kumiho_memory.code_capture as cc
+
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+
+    clock = _FakeClock(0.0)
+    monkeypatch.setattr(cc.time, "monotonic", clock.monotonic)
+    # Inline the bounded runner so the fake clock's ONLY consumer is the
+    # deadline math in capture_decisions (no daemon-thread poll race).
+    monkeypatch.setattr(cc, "run_bounded_in_thread", _run_synchronously)
+
+    orig_write = cc._sync_write_decision
+    seen = {"n": 0}
+
+    def jump_after_first(*a, **kw):
+        payload = orig_write(*a, **kw)     # decision fully written first
+        seen["n"] += 1
+        if seen["n"] == 1:
+            clock.t = 10_000.0             # now blow past the 45s deadline
+        return payload
+
+    monkeypatch.setattr(cc, "_sync_write_decision", jump_after_first)
+
+    stats = asyncio.run(capture_decisions(
+        str(repo), _two_distinct_decisions(), commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+
+    d = stats.as_dict()
+    assert d["partial"] is True
+    assert len(d["landed_krefs"]) == 1 and d["landed_krefs"][0]
+    assert d["pending_decisions"] == ["Decision TWO cache policy"]
+    assert "commit_ref=" in d["resume"] and "idempotent" in d["resume"]
+    assert stats.decisions == 1 and stats.evidence == 1
+
+    import kumiho
+    project = kumiho.get_project("p-code")
+    dec_items = _count_items(project, "code_decision")
+    assert len(dec_items) == 1                       # only decision one landed
+    ev_texts = [i.get_latest_revision().metadata["statement"]
+                for i in _count_items(project, "code_evidence")]
+    assert ev_texts == ["concurrency-4 collapsed to ~1 effective (decision one)"]
+    assert _count_items(project, "code_commit") == []  # marker withheld (partial)
+    # decision one is WHOLE — its anchor + evidence edges are present
+    drev = dec_items[0].get_latest_revision()
+    etypes = {e.edge_type for e in drev.edges}
+    assert "IMPLEMENTED_IN" in etypes and "MOTIVATED_BY" in etypes
+
+
+def test_capture_partial_then_retry_completes_without_duplicates(tmp_path, monkeypatch):
+    """The resume contract end-to-end: a deadline-truncated capture followed by
+    a re-call with the SAME args finishes the batch and writes the marker, with
+    NO duplicate of the decision that already landed."""
+    import kumiho_memory.code_capture as cc
+
+    repo = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+    cfg = CodeMemoryConfig(repo="testrepo")
+    decisions = _two_distinct_decisions()
+
+    clock = _FakeClock(0.0)
+    monkeypatch.setattr(cc.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(cc, "run_bounded_in_thread", _run_synchronously)
+
+    orig_write = cc._sync_write_decision
+    state = {"n": 0, "jump": True}
+
+    def jump_after_first(*a, **kw):
+        payload = orig_write(*a, **kw)
+        state["n"] += 1
+        if state["jump"] and state["n"] == 1:
+            clock.t = 10_000.0
+        return payload
+
+    monkeypatch.setattr(cc, "_sync_write_decision", jump_after_first)
+
+    # first pass — deadline truncates after decision one
+    s1 = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert s1.partial is True and s1.pending_decisions == ["Decision TWO cache policy"]
+
+    import kumiho
+    project = kumiho.get_project("p-code")
+    assert len(_count_items(project, "code_decision")) == 1
+
+    # retry with the SAME args, deadline no longer trips
+    clock.t = 0.0
+    state["jump"] = False
+    s2 = asyncio.run(capture_decisions(
+        str(repo), decisions, commit_ref="HEAD",
+        project_name="p-code", config=cfg,
+    ))
+    assert s2.partial is False and not s2.errors
+    # decision two written now; decision one converged (no new decision node)
+    assert s2.decisions == 1
+
+    dec_items = _count_items(project, "code_decision")
+    assert len(dec_items) == 2                        # both decisions, no dup
+    assert len(_count_items(project, "code_commit")) == 1  # marker now written
+    # no decision node was duplicated — each carries exactly one revision
+    assert all(len(i.revisions) == 1 for i in dec_items)

@@ -32,7 +32,9 @@ import asyncio
 import fnmatch
 import json
 import logging
+import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -112,8 +114,25 @@ class IngestStats:
     failed_commits: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
+    # --- partial-success tracking (keyless capture deadline path, #98) ---
+    #: Set only when the overall capture deadline is reached mid-batch. The
+    #: fields are omitted from ``as_dict`` unless ``partial`` is True, so the
+    #: ingest path and the full-success capture path keep their exact result
+    #: shape (no behavior change for the fast paths).
+    partial: bool = False
+    landed_krefs: List[str] = field(default_factory=list)      # decisions written
+    pending_decisions: List[str] = field(default_factory=list)  # titles not yet written
+    resume: str = ""                                            # how to finish (idempotent re-call)
+
+    #: Keys surfaced only on a partial result (see ``partial`` above).
+    _PARTIAL_KEYS = ("partial", "landed_krefs", "pending_decisions", "resume")
+
     def as_dict(self) -> Dict[str, Any]:
-        return dict(self.__dict__)
+        d = dict(self.__dict__)
+        if not self.partial:
+            for k in self._PARTIAL_KEYS:
+                d.pop(k, None)
+        return d
 
 
 #: Rev-range charset: hashes, refs, ``..``/``...``, ``~^@{}`` navigation.
@@ -783,20 +802,20 @@ def _evidence_grade(evidence_atoms: List[Dict[str, Any]]) -> str:
     return UNVERIFIED
 
 
-def _sync_write_commit(
-    project_name: str,
-    config: CodeMemoryConfig,
-    repo: str,
-    commit: CommitInfo,
-    decisions: List[Dict[str, Any]],
-    capture_version: str,
-    stats: IngestStats,
-    force: bool = False,
-    redactor: Any = None,
-) -> None:
-    """Stages [6]-[8] for one commit.  Crash-safe: the marker revision is
-    the very last write, so any partial failure leaves the commit unmarked
-    and the next run retries it (all writes are get-or-create)."""
+# A decision payload carries the written decision revision, its metadata, the
+# evidence revisions it MOTIVATED_BY, and the commit sha — everything the
+# marker/provenance stage needs and everything the partial-result reporter
+# reads for its landed-kref list.
+DecisionPayload = Tuple[Any, Dict[str, str], List[Any], str]
+
+
+def _sync_prepare_project(project_name: str, config: CodeMemoryConfig) -> Any:
+    """Get-or-create the code project and its four spaces (idempotent).
+
+    Split out of :func:`_sync_write_commit` so the deadline-aware capture path
+    (#98) can run it as its own bounded segment and hand the project handle to
+    the per-decision writes without re-deriving it each round-trip.
+    """
     import kumiho
 
     project = kumiho.get_project(project_name)
@@ -805,117 +824,161 @@ def _sync_write_commit(
     for space in (config.decisions_space, config.anchors_space,
                   config.commits_space, config.evidence_space):
         ensure_space(project, space)
+    return project
 
-    # Privacy boundary (issue #99): the commit subject is stored verbatim on
-    # the marker AND injected into every decision's embedding text, so it
-    # leaves for the cloud graph independently of the mined decisions.  Screen
-    # it once here — PII redacted in place; a credential-bearing subject is
-    # replaced by a literal placeholder (counted).  NOT "" — write_revision
-    # treats an empty embedding_text as "embed ALL metadata" (the server
-    # fallback), which would pollute the marker vector with hashes/author/
-    # bookkeeping keys.
+
+def _screen_subject(commit: CommitInfo, redactor: Any, stats: IngestStats) -> str:
+    """Privacy-screen the commit subject (CPU-only, no round-trip).
+
+    The subject is stored verbatim on the marker AND injected into every
+    decision's embedding text (issue #99), so it leaves for the cloud graph
+    independently of the mined decisions.  PII is redacted in place; a
+    credential-bearing subject is replaced by a literal placeholder (counted).
+    NOT "" — ``write_revision`` treats an empty ``embedding_text`` as "embed
+    ALL metadata" (the server fallback), which would pollute the marker vector
+    with hashes/author/bookkeeping keys.
+    """
     subject = commit.subject
     if redactor is not None:
         if _drop_if_credential(redactor, subject, stats):
             subject = "[redacted]"
         else:
             subject = redactor.anonymize_summary(subject)
+    return subject
 
-    decision_payloads: List[Tuple[Any, Dict[str, str], List[Any], str]] = []
-    for d in decisions:
-        files_csv = ",".join(a["file"] for a in d["anchors"])
-        ranges = ";".join(
-            f"{a['file']}:{a['line_start']}-{a['line_end']}"
-            for a in d["anchors"] if a.get("line_start")
+
+def _sync_write_decision(
+    project: Any,
+    project_name: str,
+    config: CodeMemoryConfig,
+    repo: str,
+    commit: CommitInfo,
+    subject: str,
+    d: Dict[str, Any],
+    stats: IngestStats,
+    force: bool = False,
+) -> DecisionPayload:
+    """Stage [6]-[7] for ONE decision: evidence + anchor + decision nodes,
+    IMPLEMENTED_IN/MOTIVATED_BY edges, and the anchor-scoped supersede pass.
+
+    This is the decision-granular checkpoint unit (#98): the capture path runs
+    each call in its own bounded thread, so a deadline reached between two
+    decisions leaves whole decisions written and whole decisions pending —
+    never a half-written one.  Every write is get-or-create (nodes) or
+    existence-checked (edges), so a retry converges without duplicating.
+    """
+    files_csv = ",".join(a["file"] for a in d["anchors"])
+    ranges = ";".join(
+        f"{a['file']}:{a['line_start']}-{a['line_end']}"
+        for a in d["anchors"] if a.get("line_start")
+    )
+    meta = {
+        "title": str(d["title"])[:80],
+        "summary": f"{d.get('decision', '')} — {d.get('rationale', '')}"[:400],
+        "decision": str(d.get("decision", "")),
+        "rationale": str(d.get("rationale", "")),
+        "why_question": str(d.get("why_question", "")),
+        "symbols": ",".join(d.get("symbols") or []),
+        "repo": repo,
+        "commit_hash": commit.hash,
+        "files": files_csv,
+        "line_ranges": ranges,
+        "author": commit.author,
+        "decided_at": commit.author_date,
+        "confidence": str(d.get("confidence", "medium")),
+        "status": "active",
+        # Level-of-Evidence grade, derived deterministically from the
+        # decision's evidence atoms (§6) — code_why weights it into
+        # ranking so well-substantiated decisions surface first.
+        "evidence_level": _evidence_grade(d["evidence"]),
+        "schema_version": SCHEMA_VERSION,
+    }
+
+    # evidence nodes first (decision edges point at them)
+    evidence_revs: List[Tuple[Any, Dict[str, Any]]] = []
+    for ev in d["evidence"]:
+        slug = evidence_slug(str(ev["text"]))
+        if not slug:
+            continue
+        item = get_or_create_item(
+            project, slug, KIND_EVIDENCE,
+            f"/{project_name}/{config.evidence_space}",
         )
-        meta = {
-            "title": str(d["title"])[:80],
-            "summary": f"{d.get('decision', '')} — {d.get('rationale', '')}"[:400],
-            "decision": str(d.get("decision", "")),
-            "rationale": str(d.get("rationale", "")),
-            "why_question": str(d.get("why_question", "")),
-            "symbols": ",".join(d.get("symbols") or []),
-            "repo": repo,
+        rev = item.get_latest_revision()
+        if rev is None:
+            rev = write_revision(item, {
+                "statement": str(ev["text"]),
+                "evidence_kind": str(ev.get("kind", "constraint")),
+                "source_ref": str(ev.get("source_ref", f"commit:{commit.hash[:12]}")),
+                "schema_version": SCHEMA_VERSION,
+            }, embedding_text=str(ev["text"]))
+            stats.evidence += 1
+        evidence_revs.append((rev, ev))
+
+    # anchors
+    anchor_revs: List[Tuple[Any, Dict[str, Any]]] = []
+    for a in d["anchors"]:
+        rev = get_or_create_anchor(project, config, repo, a["file"])
+        if rev is not None:
+            anchor_revs.append((rev, a))
+            stats.anchors += 1
+
+    # decision node (embedding_text injected — §1.6)
+    item = get_or_create_decision_item(
+        project, config, meta["title"], commit.author_date, meta["decision"],
+    )
+    if force:
+        undeprecate_item(item)
+    decision_rev = item.get_latest_revision()
+    if decision_rev is None or force:
+        # force always writes a NEW revision — a re-capture exists to
+        # replace stale extraction content, not to converge silently.
+        decision_rev = write_revision(
+            item, meta, _compose_embedding_text(meta, subject),
+        )
+        stats.decisions += 1
+
+    # edges: IMPLEMENTED_IN + MOTIVATED_BY (existence-checked)
+    for rev, a in anchor_revs:
+        _create_edge_once(decision_rev, rev, EDGE_IMPLEMENTED_IN, {
             "commit_hash": commit.hash,
-            "files": files_csv,
-            "line_ranges": ranges,
-            "author": commit.author,
-            "decided_at": commit.author_date,
-            "confidence": str(d.get("confidence", "medium")),
-            "status": "active",
-            # Level-of-Evidence grade, derived deterministically from the
-            # decision's evidence atoms (§6) — code_why weights it into
-            # ranking so well-substantiated decisions surface first.
-            "evidence_level": _evidence_grade(d["evidence"]),
-            "schema_version": SCHEMA_VERSION,
-        }
+            "line_start": str(a.get("line_start", 0) or ""),
+            "line_end": str(a.get("line_end", 0) or ""),
+            "role": str(a.get("role", "touched")),
+        }, stats)
+    for rev, _ev in evidence_revs:
+        _create_edge_once(decision_rev, rev, EDGE_MOTIVATED_BY,
+                          {"commit_hash": commit.hash}, stats)
 
-        # evidence nodes first (decision edges point at them)
-        evidence_revs: List[Tuple[Any, Dict[str, Any]]] = []
-        for ev in d["evidence"]:
-            slug = evidence_slug(str(ev["text"]))
-            if not slug:
-                continue
-            item = get_or_create_item(
-                project, slug, KIND_EVIDENCE,
-                f"/{project_name}/{config.evidence_space}",
-            )
-            rev = item.get_latest_revision()
-            if rev is None:
-                rev = write_revision(item, {
-                    "statement": str(ev["text"]),
-                    "evidence_kind": str(ev.get("kind", "constraint")),
-                    "source_ref": str(ev.get("source_ref", f"commit:{commit.hash[:12]}")),
-                    "schema_version": SCHEMA_VERSION,
-                }, embedding_text=str(ev["text"]))
-                stats.evidence += 1
-            evidence_revs.append((rev, ev))
+    # [7] supersede pass
+    _supersede_pass(
+        project, config, decision_rev, meta,
+        [r for r, _ in anchor_revs], str(d.get("supersedes_hint", "")), stats,
+    )
+    return (decision_rev, meta, [r for r, _ in evidence_revs], commit.hash)
 
-        # anchors
-        anchor_revs: List[Tuple[Any, Dict[str, Any]]] = []
-        for a in d["anchors"]:
-            rev = get_or_create_anchor(project, config, repo, a["file"])
-            if rev is not None:
-                anchor_revs.append((rev, a))
-                stats.anchors += 1
 
-        # decision node (embedding_text injected — §1.6)
-        item = get_or_create_decision_item(
-            project, config, meta["title"], commit.author_date, meta["decision"],
-        )
-        if force:
-            undeprecate_item(item)
-        decision_rev = item.get_latest_revision()
-        if decision_rev is None or force:
-            # force always writes a NEW revision — a re-capture exists to
-            # replace stale extraction content, not to converge silently.
-            decision_rev = write_revision(
-                item, meta, _compose_embedding_text(meta, subject),
-            )
-            stats.decisions += 1
+def _sync_write_marker(
+    project: Any,
+    project_name: str,
+    config: CodeMemoryConfig,
+    repo: str,
+    commit: CommitInfo,
+    subject: str,
+    decision_payloads: List[DecisionPayload],
+    capture_version: str,
+    stats: IngestStats,
+    force: bool = False,
+) -> None:
+    """Stage [8]: the commit marker + provenance edges, written LAST.
 
-        # edges: IMPLEMENTED_IN + MOTIVATED_BY (existence-checked)
-        for rev, a in anchor_revs:
-            _create_edge_once(decision_rev, rev, EDGE_IMPLEMENTED_IN, {
-                "commit_hash": commit.hash,
-                "line_start": str(a.get("line_start", 0) or ""),
-                "line_end": str(a.get("line_end", 0) or ""),
-                "role": str(a.get("role", "touched")),
-            }, stats)
-        for rev, _ev in evidence_revs:
-            _create_edge_once(decision_rev, rev, EDGE_MOTIVATED_BY,
-                              {"commit_hash": commit.hash}, stats)
-
-        # [7] supersede pass
-        _supersede_pass(
-            project, config, decision_rev, meta,
-            [r for r, _ in anchor_revs], str(d.get("supersedes_hint", "")), stats,
-        )
-        decision_payloads.append(
-            (decision_rev, meta, [r for r, _ in evidence_revs], commit.hash)
-        )
-
-    # [8] marker LAST: commit node + provenance edges
+    The marker is the idempotency/completeness signal — its presence (with the
+    promised ``decisions_count`` provenance edges) is what
+    :func:`_marker_complete` checks.  Writing it only after every decision has
+    landed keeps the crash/deadline property: a partial capture leaves the
+    commit unmarked, so the retry (or an incremental ``ingest_repo`` run)
+    re-runs it and all writes get-or-create.
+    """
     slug = commit_slug(repo, commit.hash)
     marker_item = get_or_create_item(
         project, slug, KIND_COMMIT, f"/{project_name}/{config.commits_space}",
@@ -936,6 +999,41 @@ def _sync_write_commit(
         _create_edge_once(decision_rev, marker_rev, EDGE_DERIVED_FROM, {}, stats)
         for ev_rev in evidence_revs:
             _create_edge_once(ev_rev, marker_rev, EDGE_DERIVED_FROM, {}, stats)
+
+
+def _sync_write_commit(
+    project_name: str,
+    config: CodeMemoryConfig,
+    repo: str,
+    commit: CommitInfo,
+    decisions: List[Dict[str, Any]],
+    capture_version: str,
+    stats: IngestStats,
+    force: bool = False,
+    redactor: Any = None,
+) -> None:
+    """Stages [6]-[8] for one commit.  Crash-safe: the marker revision is
+    the very last write, so any partial failure leaves the commit unmarked
+    and the next run retries it (all writes are get-or-create).
+
+    The ``ingest_repo`` (LLM batch) path runs this whole function in ONE
+    bounded thread — its behavior is unchanged.  The stages are factored into
+    :func:`_sync_prepare_project` / :func:`_sync_write_decision` /
+    :func:`_sync_write_marker` so the keyless capture path can run them as
+    separately bounded segments under an overall deadline (#98).
+    """
+    project = _sync_prepare_project(project_name, config)
+    subject = _screen_subject(commit, redactor, stats)
+    decision_payloads = [
+        _sync_write_decision(
+            project, project_name, config, repo, commit, subject, d, stats, force,
+        )
+        for d in decisions
+    ]
+    _sync_write_marker(
+        project, project_name, config, repo, commit, subject,
+        decision_payloads, capture_version, stats, force,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1118,6 +1216,68 @@ async def ingest_repo(
     return stats
 
 
+# ---------------------------------------------------------------------------
+# Keyless capture — overall deadline (#98)
+# ---------------------------------------------------------------------------
+#
+# STRUCTURAL PROFILE of the kumiho_code_capture tool path (capture_decisions),
+# by sequential blocking segment, worst-case per-segment bound:
+#
+#   segment                       blocking work        worst-case bound
+#   ----------------------------  -------------------  ---------------------
+#   [A] git resolve (2× _run_git) 2 local subprocess   2×(20s+5s grace)=~50s*
+#       enumerate + changed-files  (log, show/diff)     *typical <1s
+#   [B] validate_decisions        CPU (regex/jaccard)  ~ms, no I/O
+#   [C] project + spaces prepare  5 gRPC round-trips    write_timeout (60s)
+#   [D] PER DECISION (×D, ≤4):    N gRPC round-trips    write_timeout (60s)
+#         evidence  (≤6): ~3 RT each   get/rev/write
+#         anchors   (≤8): ~3 RT each   get/rev/create
+#         decision node : ~4 RT        get-or-create + collision probe + write
+#         IMPLEMENTED_IN(≤8): ~2 RT ea edge-exists + create
+#         MOTIVATED_BY (≤6): ~2 RT ea  edge-exists + create
+#         supersede pass: VARIABLE     get_edges/anchor + get_revision/sibling
+#   [E] marker + provenance       ~3 + 2·(D+ΣE) RT     write_timeout (60s)
+#
+# DOMINANT COST = the [D] graph writes: total ≈ write_count × cloud RT latency.
+# Per decision that is ~5·anchors + ~3·evidence + edges ≈ tens of round-trips,
+# and the supersede pass scales with the number of prior sibling decisions on a
+# shared anchor file — so a large capture is hundreds of RTs. At cloud latency
+# that overruns the per-write bound, and [A]+[C..E] SUM is what the MCP client
+# actually enforces (it timed out at -32001 in #98). The overall deadline below
+# caps that SUM; the per-decision segmentation of [D] gives decision-granular
+# checkpoints so a deadline leaves whole decisions landed, none half-written.
+
+#: Overall wall-clock budget for one keyless capture (git resolve + all graph
+#: writes).  It must sit UNDER the MCP client's own request timeout — the MCP
+#: SDK default is 60s, the timeout that fired in #98 — so 45s leaves ~15s of
+#: headroom for the transport/serialization the client layers on top of tool
+#: execution.  It is deliberately BELOW the per-write convention
+#: (``write_timeout``/``_DECOMPOSE_TIMEOUT`` = 60s): 60s is the ceiling for a
+#: SINGLE blocking write, whereas this is the ceiling for the WHOLE tool, which
+#: must return before the client gives up.  A typical capture writes in
+#: ~5-15s, so 45s is generous for the happy path while still bounding the tail.
+_CAPTURE_DEADLINE_DEFAULT = 45.0
+_CAPTURE_DEADLINE_ENV = "KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE"
+
+
+def _capture_deadline() -> float:
+    """Overall capture budget in seconds (env override, positive float)."""
+    raw = os.getenv(_CAPTURE_DEADLINE_ENV, "").strip()
+    if not raw:
+        return _CAPTURE_DEADLINE_DEFAULT
+    try:
+        val = float(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r; using default %.0fs",
+                       _CAPTURE_DEADLINE_ENV, raw, _CAPTURE_DEADLINE_DEFAULT)
+        return _CAPTURE_DEADLINE_DEFAULT
+    if val <= 0:
+        logger.warning("non-positive %s=%r; using default %.0fs",
+                       _CAPTURE_DEADLINE_ENV, raw, _CAPTURE_DEADLINE_DEFAULT)
+        return _CAPTURE_DEADLINE_DEFAULT
+    return val
+
+
 def _commit_info_for_ref(repo_path: str, ref: str) -> Optional[CommitInfo]:
     """CommitInfo for a single git ref (default HEAD), with changed files
     loaded — the deterministic ground truth the agent-driven capture path
@@ -1154,6 +1314,16 @@ async def capture_decisions(
     PII/credential gate as every other write path, so a credential cannot be
     stored even by accident.  ``redactor=None`` constructs a default
     :class:`PIIRedactor` (screen always on).
+
+    Bounded by an OVERALL deadline (#98): the whole tool — git resolution plus
+    every graph write — must return before the MCP client's request timeout
+    fires (a live capture hit ``-32001 Request timed out`` against the cloud).
+    Writes are checkpointed per decision, so on deadline the call returns a
+    PARTIAL-SUCCESS result (``partial``/``landed_krefs``/``pending_decisions``/
+    ``resume``) naming what landed and telling the agent to re-call with the
+    SAME args — which is safe because every write is get-or-create and every
+    edge is existence-checked, so a retry never duplicates.  See
+    ``KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE``.
     """
     config = config or CodeMemoryConfig()
     redactor = redactor or PIIRedactor()
@@ -1161,6 +1331,21 @@ async def capture_decisions(
     if not decisions:
         stats.errors.append("no decisions provided")
         return stats
+
+    # The deadline clock starts here — git resolution counts against it too, so
+    # a slow/hung git can't blow the total tool budget (its own _run_git bounds
+    # cap each subprocess; this bounds the sum).
+    deadline = time.monotonic() + _capture_deadline()
+
+    def _remaining() -> float:
+        return deadline - time.monotonic()
+
+    def _write_budget() -> float:
+        # Per-segment bound: never exceed the overall deadline, never exceed the
+        # per-write convention. Floored at a small positive value so a
+        # near-exhausted deadline still ATTEMPTS (and cleanly times out) the
+        # in-flight segment instead of passing timeout<=0 to the bounded helper.
+        return max(0.5, min(config.write_timeout, _remaining()))
 
     repo = (config.repo or derive_repo_id(repo_path)).strip()
     try:
@@ -1183,15 +1368,96 @@ async def capture_decisions(
         )
         return stats
 
-    ok = await run_bounded_in_thread(
-        lambda: _sync_write_commit(
-            project_name, config, repo, commit, validated, SCHEMA_VERSION, stats,
-            redactor=redactor,
-        ) or True,
-        timeout=config.write_timeout, label="code capture write",
+    # [C] project + spaces (idempotent gRPC setup) — one bounded segment.
+    project = await run_bounded_in_thread(
+        lambda: _sync_prepare_project(project_name, config),
+        timeout=_write_budget(), label="code capture prepare",
         on_timeout=None, on_error=None,
     )
-    if ok is not True:
+    if project is None:
         stats.failed_commits.append(commit.hash[:12])
-        stats.errors.append("write failed or timed out")
+        stats.errors.append("write failed or timed out (project setup)")
+        return stats
+    subject = _screen_subject(commit, redactor, stats)  # CPU, no round-trip
+
+    # [D] decision-granular writes: each decision is its own bounded segment, so
+    # a deadline reached between two decisions leaves whole decisions landed and
+    # whole decisions pending — never a half-written one.
+    payloads: List[DecisionPayload] = []
+    pending: List[Dict[str, Any]] = []
+    for idx, d in enumerate(validated):
+        if _remaining() <= 0:
+            pending = validated[idx:]
+            break
+        payload = await run_bounded_in_thread(
+            lambda d=d: _sync_write_decision(
+                project, project_name, config, repo, commit, subject, d, stats,
+            ),
+            timeout=_write_budget(), label="code capture decision",
+            on_timeout=None, on_error=None,
+        )
+        if payload is None:
+            # In-flight decision didn't finish (deadline or error). It is NOT
+            # counted as landed; the retry re-runs it idempotently.
+            pending = validated[idx:]
+            break
+        payloads.append(payload)
+
+    # [E] marker + provenance — written ONLY when every decision landed. The
+    # marker is the completeness signal, so a partial capture must leave it
+    # unwritten (the retry, or an incremental ingest_repo run, finishes it).
+    marker_written = False
+    if not pending:
+        ok = await run_bounded_in_thread(
+            lambda: _sync_write_marker(
+                project, project_name, config, repo, commit, subject,
+                payloads, SCHEMA_VERSION, stats,
+            ) or True,
+            timeout=_write_budget(), label="code capture marker",
+            on_timeout=None, on_error=None,
+        )
+        marker_written = ok is True
+
+    if pending or not marker_written:
+        _finalize_partial(stats, commit, payloads, pending)
     return stats
+
+
+def _finalize_partial(
+    stats: IngestStats,
+    commit: CommitInfo,
+    payloads: List[DecisionPayload],
+    pending: List[Dict[str, Any]],
+) -> None:
+    """Populate the PARTIAL-SUCCESS fields (#98).
+
+    ``payloads`` are the decisions that landed (their revision krefs), ``pending``
+    the ones the deadline cut off (empty when only the marker is left). The resume
+    instruction pins the re-call to the resolved commit hash so the same
+    title+date identity (and therefore the same get-or-create slug) is reproduced
+    exactly — the retry converges with zero duplicate nodes/edges.
+    """
+    stats.partial = True
+    stats.landed_krefs = [
+        getattr(getattr(p[0], "kref", None), "uri", "") for p in payloads
+    ]
+    stats.pending_decisions = [str(d.get("title", "")) for d in pending]
+    # The commit isn't fully captured until the marker lands, so it is reported
+    # failed (parity with the pre-#98 timeout path) — the retry clears it.
+    if commit.hash[:12] not in stats.failed_commits:
+        stats.failed_commits.append(commit.hash[:12])
+    remainder = (
+        f"{len(pending)} decision(s)" if pending else "the provenance marker"
+    )
+    stats.resume = (
+        f"PARTIAL: {len(payloads)} decision(s) landed, {remainder} not written "
+        f"(overall capture deadline reached). Re-call kumiho_code_capture with "
+        f"the SAME decisions and commit_ref={commit.hash} to finish — captured "
+        f"writes are idempotent (get-or-create on title+author-date, edges "
+        f"existence-checked), so a retry adds no duplicates."
+    )
+    if not stats.errors:
+        stats.errors.append(
+            f"capture deadline reached; {remainder} not written "
+            f"(see 'resume' — re-call with the same args, it is idempotent)"
+        )
