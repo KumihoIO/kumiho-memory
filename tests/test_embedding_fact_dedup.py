@@ -185,6 +185,115 @@ def test_cross_entity_lexical_duplicate_is_merged():
 
 
 # --------------------------------------------------------------------------- #
+# distinguishing-asymmetry guard (2026-07-19 live gate-check finding)          #
+#                                                                              #
+# High token-Jaccard overlap is not sufficient evidence of duplication when   #
+# the sentences flip polarity (negation) or state a different named day —    #
+# a real local-CE gate-check merged both before this guard existed.          #
+# --------------------------------------------------------------------------- #
+
+def test_asymmetric_negation_blocks_merge_english():
+    """'happy' vs 'NOT happy' — near-identical tokens, opposite meaning."""
+    g = FakeGraph()
+    f_a = g.fact("Mem", "The user is happy with the results of the recent product launch")
+    f_b = g.fact("Mem", "The user is not happy with the results of the recent product launch")
+    scores = {f_a.get_latest_revision().metadata["claim"]: [_vec(f_b, 0.95)]}
+    sdk = _sdk_with_scores(g, scores)
+
+    stats = MaintenanceStats()
+    _maintainer(sdk).apply_embedding_fact_dedup(stats)
+
+    assert stats.embed_facts_merged == 0
+    assert not f_a.deprecated and not f_b.deprecated
+
+
+def test_asymmetric_negation_blocks_merge_korean():
+    """'satisfied' vs 'NOT satisfied' — Korean negation is a verb-ending
+    change, not a standalone inserted word; the guard checks raw text so it
+    still catches this even though the 2-char negation tokens are dropped by
+    the length-filtered tokenizer before Jaccard ever sees them."""
+    g = FakeGraph()
+    f_a = g.fact("Mem", "사용자는 이번 프로젝트 진행 상황에 만족하고 있다")
+    f_b = g.fact("Mem", "사용자는 이번 프로젝트 진행 상황에 만족하고 있지 않다")
+    scores = {f_a.get_latest_revision().metadata["claim"]: [_vec(f_b, 0.95)]}
+    sdk = _sdk_with_scores(g, scores)
+
+    stats = MaintenanceStats()
+    _maintainer(sdk).apply_embedding_fact_dedup(stats)
+
+    assert stats.embed_facts_merged == 0
+    assert not f_a.deprecated and not f_b.deprecated
+
+
+def test_differing_weekday_blocks_merge():
+    """Same meeting, different day — near-identical tokens, different fact."""
+    g = FakeGraph()
+    f_a = g.fact("Mem", "The user's weekly team status meeting has been scheduled for 3pm this Friday in the main conference room")
+    f_b = g.fact("Mem", "The user's weekly team status meeting has been scheduled for 3pm this Monday in the main conference room")
+    scores = {f_a.get_latest_revision().metadata["claim"]: [_vec(f_b, 0.95)]}
+    sdk = _sdk_with_scores(g, scores)
+
+    stats = MaintenanceStats()
+    _maintainer(sdk).apply_embedding_fact_dedup(stats)
+
+    assert stats.embed_facts_merged == 0
+    assert not f_a.deprecated and not f_b.deprecated
+
+
+def test_symmetric_negation_does_not_block_merge():
+    """Both statements negated (same polarity) is not an asymmetry — a true
+    near-verbatim restatement that happens to share a negation word must
+    still merge; the guard is asymmetric-only, not a blanket negation ban."""
+    g = FakeGraph()
+    f_a = g.fact("Mem", "The user is not satisfied with the current pricing plan")
+    f_b = g.fact("Mem", "User is not satisfied with the current pricing plan")
+    scores = {f_a.get_latest_revision().metadata["claim"]: [_vec(f_b, 0.95)]}
+    sdk = _sdk_with_scores(g, scores)
+
+    stats = MaintenanceStats()
+    _maintainer(sdk).apply_embedding_fact_dedup(stats)
+
+    assert stats.embed_facts_merged == 1
+    assert (f_a.deprecated ^ f_b.deprecated)
+
+
+def test_reordered_duplicate_without_markers_still_merges():
+    """Regression pin: the guard must not interfere with an ordinary
+    near-verbatim duplicate that contains neither negation nor weekday
+    markers (the true-positive case from the live gate-check)."""
+    g = FakeGraph()
+    f_a = g.fact("Mem", "사용자는 아침 회의보다 저녁 회의를 더 선호한다")
+    f_b = g.fact("Mem", "사용자는 저녁 회의를 아침 회의보다 더 선호한다")
+    scores = {f_a.get_latest_revision().metadata["claim"]: [_vec(f_b, 0.95)]}
+    sdk = _sdk_with_scores(g, scores)
+
+    stats = MaintenanceStats()
+    _maintainer(sdk).apply_embedding_fact_dedup(stats)
+
+    assert stats.embed_facts_merged == 1
+    assert (f_a.deprecated ^ f_b.deprecated)
+
+
+def test_keyless_per_entity_path_also_gets_the_guard():
+    """The guard lives in the shared confirmation gate, so the ALWAYS-
+    available keyless per-entity scan (run_keyless, no opt-in flag) is
+    protected too, not just the embedding-assisted stage."""
+    g = FakeGraph()
+    e1 = g.entity("Mem", "Feature")
+    f_a = g.fact("Mem", "The feature is enabled for all users")
+    f_b = g.fact("Mem", "The feature is not enabled for all users")
+    g.link(f_a, e1, "ABOUT")
+    g.link(f_b, e1, "ABOUT")
+    sdk = g.sdk()
+
+    stats = MaintenanceStats()
+    _maintainer(sdk).run_keyless(stats)
+
+    assert stats.facts_merged == 0
+    assert not f_a.deprecated and not f_b.deprecated
+
+
+# --------------------------------------------------------------------------- #
 # protection + caps carried over unchanged                                    #
 # --------------------------------------------------------------------------- #
 
