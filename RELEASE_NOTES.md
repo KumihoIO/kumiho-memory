@@ -45,8 +45,10 @@ invariance, paired conv-26 answer-only runs, permutation tests), each run
 inside a write-quiet window on the benchmark CE. The full-10 re-verification
 was invalidated mid-campaign by a subtler mechanism, isolated via a
 three-way controlled comparison: large writes to *other* projects on the
-same server (a second corpus ingest plus a memory backfill) shifted this
-project's recall rankings through corpus-global BM25 statistics
+same server (a second LoCoMo corpus ingest — a semantic near-clone of the
+benchmark corpus, doubling document frequency for its most distinctive
+terms) shifted this project's recall rankings through corpus-global BM25
+statistics
 (kumiho-server#28) — same code, same corpus, 1,142 recall differences
 across time, with same-code stability controls clean at both endpoints.
 Client code was exonerated; the 0.5435 baseline remains internally valid
