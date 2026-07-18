@@ -42,11 +42,13 @@ independent v0.18.0 review.
 
 Gate note: every change above passed its per-change gate (byte-diff recall
 invariance, paired conv-26 answer-only runs, permutation tests) on a stable
-benchmark environment. The full-10 re-verification was superseded mid-cycle
-by the CE embedding migration to BGE-M3 (a deliberate infra change that
-invalidates cross-environment score comparisons — the old 0.5435 baseline
-describes a server state that no longer exists); a fresh post-migration
-baseline will be established as the new reference.
+benchmark environment. The full-10 re-verification could not be completed
+honestly: the local benchmark CE was running in-progress (unreleased)
+server development whose behavior changed mid-cycle — live-confirmed via
+the bytediff harness (1,587 recall differences on identical code and
+corpus) — so the old 0.5435 baseline describes a server state that no
+longer exists on that machine. A fresh baseline will be established once
+the new server ships as a versioned release.
 
 ## v0.18.0
 
