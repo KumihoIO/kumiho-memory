@@ -8,10 +8,18 @@
 
 ### Status
 
-> **Beta (0.18.x)**
+
+**Privacy invariant:** every write path — session mining, commit mining,
+skill ingestion — and every LLM-bound packet passes the same per-atom
+PII/credential boundary. Credential-bearing atoms are dropped, never stored.
+> **Beta (0.19.x)**
 > Actively developed; the public API is stabilizing but may still change
 > between minor versions.
-> Latest release: `0.18.0` (2026-07-17) — **Ontology Phase 1**: canonical
+> Latest release: `0.19.0` (2026-07-18) — **Ontology Phase 2**: first-class
+> CONTRADICTS with contested markers, grounding-staleness ripple,
+> basis-labeled belief edges, one privacy boundary on every write path, and
+> the deterministic traversal contract.
+> Previous: `0.18.0` (2026-07-17) — **Ontology Phase 1**: canonical
 > relation predicate registry, a fetchable ontology spec policy Item, the
 > trust-vocabulary mapping, and opt-in relation traversal at recall
 > (`KUMIHO_MEMORY_RELATION_TRAVERSAL=1`).

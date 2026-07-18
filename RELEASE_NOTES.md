@@ -1,5 +1,53 @@
 # Release Notes — kumiho-memory
 
+## v0.19.0
+
+**Release Date:** 2026-07-18
+
+**Ontology Phase 2 — coherence becomes executable** (epic #86, PR #96) plus
+the security, reliability, and performance workstream driven by Hugh Kim's
+independent v0.18.0 review.
+
+- **Explicit belief change** — decompose accepts agent-declared
+  `supersedes` / `contradicts` (basis-labeled edges: `agent`,
+  `lexical-overlap`, `evidence-assessor`); the lexical heuristic yields to
+  explicit declarations.
+- **CONTRADICTS is first-class** — assessor conflict verdicts bridge into
+  graph edges; the reader traverses them and stamps bounded `contested_by`
+  markers; composed context renders a disputed note. Dispute-basis scoping
+  keeps entity-relation domain claims (from the predicate registry) out of
+  the belief lane.
+- **Grounding-staleness ripple** — superseding a fact flags its DEPENDS_ON
+  dependents (`grounding_stale` + mirrored tag), recall surfaces the flag,
+  and a keyless Dream State pass clears re-confirmed grounding. Closes the
+  paper's deferred §15.6 loop.
+- **One privacy boundary everywhere** — commit mining, session mining,
+  skill ingestion, and every LLM-bound packet now pass the same per-atom
+  PII/credential gate (modernized patterns incl. `sk-proj-`, JWT, AIza,
+  Slack, DB URLs); external skills are statically scanned and quarantined
+  until cleared. *Every write path passes the same privacy boundary.*
+- **Reliability** — background auto-assess survives MCP per-call loop
+  teardown (it silently died before); recall failures surface a
+  `backend_error` field instead of masquerading as empty; session IDs
+  retry before forking; `code_capture` runs under a 45s deadline with
+  partial-success results and proven-idempotent retry.
+- **Performance** — event-driven recall waits (the 0.5s poll floor is
+  gone); sibling LLM reranking is capped and gathered; a deterministic
+  belief-safety-first traversal contract (spec v3) makes identical graphs
+  traverse identically; one context budget with token accounting.
+- **Dream State destructive proposals** now pass keyless guards (min-age,
+  evidence severity read across metadata AND tags — the LLM can no longer
+  write the trust axis at all) with an optional second-model refutation
+  layer.
+
+Gate note: every change above passed its per-change gate (byte-diff recall
+invariance, paired conv-26 answer-only runs, permutation tests) on a stable
+benchmark environment. The full-10 re-verification was superseded mid-cycle
+by the CE embedding migration to BGE-M3 (a deliberate infra change that
+invalidates cross-environment score comparisons — the old 0.5435 baseline
+describes a server state that no longer exists); a fresh post-migration
+baseline will be established as the new reference.
+
 ## v0.18.0
 
 **Release Date:** 2026-07-17
