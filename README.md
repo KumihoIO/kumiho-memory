@@ -12,17 +12,19 @@
 **Privacy invariant:** every write path — session mining, commit mining,
 skill ingestion — and every LLM-bound packet passes the same per-atom
 PII/credential boundary. Credential-bearing atoms are dropped, never stored.
-> **Beta (0.19.x)**
+> **Beta (0.20.x)**
 > Actively developed; the public API is stabilizing but may still change
 > between minor versions.
-> Latest release: `0.19.0` (2026-07-18) — **Ontology Phase 2**: first-class
+> Latest release: `0.20.0` (2026-07-19) — **Ontology Phase 3 + reliability**:
+> write-time entity alias resolution, embedding-assisted fact dedup in Dream
+> State, valid-time intervals with opt-in as-of recall, a source-corroborated
+> confidence marker on `event_date` (unverified dates no longer boost
+> ranking), and a 3-way LLM failure classification with a cross-run parking
+> ledger for deterministically-failing content.
+> Previous: `0.19.0` (2026-07-18) — **Ontology Phase 2**: first-class
 > CONTRADICTS with contested markers, grounding-staleness ripple,
 > basis-labeled belief edges, one privacy boundary on every write path, and
 > the deterministic traversal contract.
-> Previous: `0.18.0` (2026-07-17) — **Ontology Phase 1**: canonical
-> relation predicate registry, a fetchable ontology spec policy Item, the
-> trust-vocabulary mapping, and opt-in relation traversal at recall
-> (`KUMIHO_MEMORY_RELATION_TRAVERSAL=1`).
 > See `RELEASE_NOTES.md` for the full version-by-version history — this
 > status block names only the latest release.
 > Earlier highlights: `0.16` Dream State graph maintenance · `0.11-0.13`

@@ -1,5 +1,63 @@
 # Release Notes — kumiho-memory
 
+## v0.20.0
+
+**Release Date:** 2026-07-19
+
+**Ontology Phase 3 — identity and time** (epic #86) plus a reliability
+workstream driven by Hugh Kim's independent review, all additive and
+flag-gated default-OFF.
+
+- **Write-time entity alias resolution (G5)** — before minting a new entity
+  hub, decompose resolves against existing graph hubs by normalized name
+  and stored aliases; on a match the existing hub is reused and the new
+  alias appended instead of creating a duplicate node. Bounded to one
+  cached lookup per new entity; any lookup failure falls back to today's
+  behavior rather than blocking the write. Opt in with
+  `KUMIHO_MEMORY_ALIAS_RESOLUTION=1`.
+- **Embedding-assisted fact dedup in Dream State (G6)** — near-duplicate
+  fact candidates are nominated via the server's existing hybrid
+  `score_revisions` (no client-side embeddings, no LLM key, `kind=fact`
+  filtered, capped fan-out), then routed through the unchanged
+  `_confirm_and_collapse_fact` merge path — the same Jaccard threshold,
+  per-kind budget, published protection, and soft deprecation guard every
+  other Dream State merge already passes through. Opt in with
+  `KUMIHO_DREAM_EMBED_FACT_DEDUP=1` (also requires `maintain_graph`).
+- **Valid-time intervals + as-of recall (G8)** — additive `valid_from` /
+  `valid_to` metadata alongside `event_date` (never touches `event_date`
+  itself or its new confidence marker below). An opt-in as-of filter
+  (`KUMIHO_MEMORY_AS_OF_RECALL=1`) deprioritizes facts whose interval
+  excludes the requested date; with the flag off, recall is byte-identical
+  to today.
+- **`event_date` hallucination guard** — the LLM-extracted valid-time field
+  is now cross-checked against the source text at write time: absolute
+  dates (including Korean formats) are matched by normalized comparison,
+  relative expressions ("yesterday", "지난주", "3개월 뒤") are verified by
+  date arithmetic against the known session timestamp, and anything that
+  doesn't corroborate is marked `unverified` and excluded from the
+  event-proximity ranking boost. Existing rows without the new
+  `event_date_confidence` key are treated as verified — the boost path for
+  all previously-stored dates is unchanged.
+- **LLM failure classification + parking ledger** — `retry.py` now
+  classifies failures as transient / deterministic / unknown instead of a
+  binary retry decision. A local, atomically-written, corruption-safe
+  ledger (keyed by content identity) tracks cross-run attempts; content
+  that fails deterministically twice is parked out of Dream State and
+  consolidation selection, and un-parks automatically after 14 days
+  (`KUMIHO_FAILURE_PARK_THRESHOLD`, TTL both env-tunable) so a fixed model
+  or prompt gets another chance instead of a permanent poison loop.
+  Wired on by default at the MCP/CLI entrypoints; opt out with
+  `KUMIHO_FAILURE_LEDGER_DISABLED=1`.
+
+Every item above is additive — no renamed keys, no data migration, no
+default-recall reordering when its flag is off. The failure-parking ledger
+is the one production default-path change (new local ledger file under
+`~/.kumiho/failure_ledger`), documented for the opt-out above. The three
+Phase 3 flags default OFF pending the same paired-benchmark gate that has
+governed every prior default flip in this project; the confidence guard on
+`event_date` ships unconditionally since it only ever *removes* a
+ranking boost from a date that could not be corroborated.
+
 ## v0.19.0
 
 **Release Date:** 2026-07-18
