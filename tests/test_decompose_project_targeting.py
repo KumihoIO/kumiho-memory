@@ -125,6 +125,29 @@ def test_explicit_project_routes_materialization(monkeypatch):
     # The manager's configured project received NOTHING.
     assert configured._items == {}
 
+    # Requirement #3 / findings 1 & 2 (test-coverage half): the DERIVED_FROM
+    # provenance edge must be WIRED regardless of the materialization target.
+    # ``conv`` is the source memory revision — resolved GLOBALLY by kref
+    # (``kumiho.get_revision(_CONV)``), independent of the target project — so a
+    # fact node in /OtherProj links back to it across the project boundary. We
+    # assert the edge exists and points at the global ``_CONV`` anchor (not a
+    # node re-minted inside OtherProj), proving the code threads the correct
+    # cross-project anchor. Whether the REAL backend accepts a cross-project
+    # edge is a backend-capability question the in-memory fake cannot model
+    # (``create_edge`` always succeeds) and is flagged for a live check.
+    assert stats["edges"] >= 1
+    fact_nodes = [it for (sp, _slug), it in other._items.items() if sp == "/OtherProj/facts"]
+    assert fact_nodes
+    assert any(
+        ("DERIVED_FROM", _CONV) in node._rev.edges for node in fact_nodes
+    ), "fact node in target project must link DERIVED_FROM to the global source revision"
+    # Reverse cross-project direction: source-project conversation -> target
+    # entity ABOUT edge (its target is an OtherProj entity uri).
+    assert any(
+        et == "ABOUT" and "OtherProj/entities/" in turi
+        for (et, turi) in conv.edges
+    ), "conversation must link ABOUT to the entity materialized in the target project"
+
 
 # --- (b) omitting project is byte-identical to today -----------------------
 
