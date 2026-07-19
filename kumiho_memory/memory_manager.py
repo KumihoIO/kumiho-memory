@@ -2404,6 +2404,39 @@ class UniversalMemoryManager:
         )
         return stats.as_dict()
 
+    def _resolve_decompose_project(self, project: Optional[str]) -> str:
+        """Resolve the target project for decompose materialization.
+
+        Defaults to the manager's configured project (``self.project``). When
+        ``project`` is omitted (or already equals the configured project) this
+        returns ``self.project`` untouched — no probe — so behavior is
+        byte-identical to the pre-parameter path.  An explicit, resolvable
+        project routes the typed nodes there instead; an explicit project that
+        is absent / inaccessible (``kumiho.get_project`` returns ``None`` or
+        raises) falls back to ``self.project`` with a non-blocking notice —
+        matching decompose's best-effort contract, it never raises over a bad
+        target.
+        """
+        if not project or project == self.project:
+            return self.project
+        try:
+            import kumiho
+
+            if kumiho.get_project(project) is not None:
+                return project
+            logger.info(
+                "memory_decompose: target project %r not found; "
+                "falling back to configured project %r",
+                project, self.project,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; bad target never blocks
+            logger.info(
+                "memory_decompose: target project %r inaccessible (%s); "
+                "falling back to configured project %r",
+                project, exc, self.project,
+            )
+        return self.project
+
     async def memory_decompose(
         self,
         kref: str,
@@ -2413,6 +2446,7 @@ class UniversalMemoryManager:
         relations: Optional[List[Dict[str, Any]]] = None,
         supersedes: Optional[List[Dict[str, Any]]] = None,
         contradicts: Optional[List[Dict[str, Any]]] = None,
+        project: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Keyless agent-driven ontology decomposition of a stored memory.
 
@@ -2423,6 +2457,13 @@ class UniversalMemoryManager:
         path the LLM decomposition uses.  No external LLM key — mirrors
         :meth:`memory_reflect` / :meth:`code_capture`.  ``kref`` is the stored
         memory revision (from consolidate/reflect) the typed nodes anchor to.
+
+        ``project`` optionally targets a DIFFERENT project for the materialized
+        typed nodes; omitted, it defaults to the manager's configured project
+        (today's behavior).  An explicit project that is absent / inaccessible
+        falls back to the configured project with a non-blocking notice.  The
+        ``kref`` anchor is a globally-resolved memory revision, so its
+        DERIVED_FROM linkage holds regardless of the materialization target.
         """
         if not getattr(self, "ontology_enabled", False):
             return {"errors": ["ontology is disabled (set KUMIHO_MEMORY_ONTOLOGY=1)"]}
@@ -2430,11 +2471,13 @@ class UniversalMemoryManager:
             return {"errors": ["kref is required (the stored memory revision to decompose)"]}
         from kumiho_memory.ontology import decompose_and_link_agent
 
+        target_project = self._resolve_decompose_project(project)
+
         stats = await decompose_and_link_agent(
             kref,
             {"entities": entities or [], "facts": facts or [], "relations": relations or [],
              "supersedes": supersedes or [], "contradicts": contradicts or []},
-            project_name=self.project,
+            project_name=target_project,
         )
         return {"decomposed": stats, "kref": kref}
 

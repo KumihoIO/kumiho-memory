@@ -813,6 +813,17 @@ def test_decompose_schema_exposes_belief_change_fields():
     assert props["contradicts"]["items"]["required"] == ["statement", "conflicts_with"]
 
 
+def test_decompose_schema_exposes_optional_project_target():
+    """Agents learn the optional project-targeting field from the schema (#136)."""
+    from kumiho_memory.mcp_tools import MEMORY_TOOLS
+    decompose = next(t for t in MEMORY_TOOLS if t["name"] == "kumiho_memory_decompose")
+    schema = decompose["inputSchema"]
+    assert "project" in schema["properties"]
+    assert schema["properties"]["project"]["type"] == "string"
+    # Additive + backward-compatible: only kref stays required.
+    assert schema["required"] == ["kref"]
+
+
 # ---------------------------------------------------------------------------
 # Tests — tool execution
 # ---------------------------------------------------------------------------

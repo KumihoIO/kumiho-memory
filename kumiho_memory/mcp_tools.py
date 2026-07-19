@@ -1581,6 +1581,7 @@ def tool_memory_decompose(args: Dict[str, Any]) -> Dict[str, Any]:
             relations=args.get("relations") or [],
             supersedes=args.get("supersedes") or [],
             contradicts=args.get("contradicts") or [],
+            project=args.get("project"),
         )
     )
 
@@ -1798,13 +1799,17 @@ _ONTOLOGY_TOOLS: List[Dict[str, Any]] = [
             "declare belief changes you observed: `supersedes` (a new fact "
             "replaces a prior one) and `contradicts` (a fact conflicts with "
             "another) — each names a fact from THIS call and its target (a prior "
-            "fact's statement or its kref); unresolvable targets are dropped."
+            "fact's statement or its kref); unresolvable targets are dropped. "
+            "Optionally set `project` to materialize the typed nodes into a "
+            "different project (defaults to the manager's configured project)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "kref": {"type": "string",
                          "description": "The stored memory revision kref the typed nodes anchor to (from consolidate/reflect)."},
+                "project": {"type": "string",
+                            "description": "Optional target project for the materialized typed nodes; defaults to the manager's configured project. An absent/inaccessible project falls back to the configured one."},
                 "entities": {
                     "type": "array",
                     "description": "Reusable named hubs (people, systems, files, concepts).",
