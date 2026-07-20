@@ -15,6 +15,7 @@ import tempfile
 
 from kumiho_memory.memory_manager import (
     UniversalMemoryManager,
+    _redact_message_content,
     _redact_messages_for_llm,
 )
 from kumiho_memory.privacy import PIIRedactor
@@ -126,8 +127,7 @@ def test_planted_needles_never_reach_summarizer_or_implications():
         assert PLANTED_EMAIL not in seen
         assert PLANTED_CREDENTIAL not in seen
 
-        # PII is redacted IN PLACE; the credential LINE is dropped whole —
-        # exactly the code_capture / code_session policy.
+        # PII is redacted IN PLACE; the credential SPAN is excised.
         assert "[email]" in seen
         assert "[redacted]" in seen
         # Structure survives: surrounding prose and both roles are intact.
@@ -177,6 +177,170 @@ def test_redaction_copies_and_never_mutates_the_original():
 def test_redaction_is_a_noop_without_a_redactor():
     messages = [{"role": "user", "content": PLANTED_EMAIL}]
     assert _redact_messages_for_llm(None, messages) is messages
+
+
+# --------------------------------------------------------------------------
+# multi-line secrets: the BODY must go, not just the BEGIN header
+# --------------------------------------------------------------------------
+
+def test_multiline_private_key_body_never_reaches_the_llm():
+    # Only `private_key_header` matches a PEM key, and it matches the HEADER
+    # line alone — line-oriented screening would strip the label and ship the
+    # whole base64 body.  The block is excised as a unit instead.
+    body_a = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ"
+    body_b = "AAAAB3NzaC1yc2EAAAADAQABAAABAQDb1n3qWjKmA7hZ0pQrs2"
+    pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        + body_a + "\n" + body_b + "\n"
+        + "-----END RSA PRIVATE KEY-----"
+    )
+    content = f"Here is the key:\n{pem}\nUse it for staging."
+
+    redacted, dropped = _redact_message_content(PIIRedactor(), content)
+
+    assert body_a not in redacted
+    assert body_b not in redacted
+    assert "BEGIN RSA PRIVATE KEY" not in redacted
+    assert dropped == 1
+    # the surrounding prose survives — only the block was excised
+    assert "Here is the key:" in redacted
+    assert "Use it for staging." in redacted
+
+
+def test_unterminated_private_key_block_fails_closed():
+    # No END marker: excise to end-of-text rather than let the body through.
+    body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ"
+    redacted, _ = _redact_message_content(
+        PIIRedactor(), f"key follows\n-----BEGIN PRIVATE KEY-----\n{body}",
+    )
+    assert body not in redacted
+    assert "key follows" in redacted
+
+
+# --------------------------------------------------------------------------
+# blast radius: a chat turn is ONE line — excise the span, keep the turn
+# --------------------------------------------------------------------------
+
+def test_credential_false_positive_costs_a_span_not_the_whole_turn():
+    # "Bearer token" is benign prose that trips the `bearer_token` pattern.
+    # Dropping the containing line would drop this entire message, and the
+    # summary would then be built from a transcript with the turn blanked.
+    content = (
+        "We should use Bearer token auth for the gateway and set the "
+        "timeout to 30s, then roll it out to prod on Friday."
+    )
+    redacted, _ = _redact_message_content(PIIRedactor(), content)
+
+    assert redacted != "[redacted]"
+    assert "We should use" in redacted
+    assert "roll it out to prod on Friday." in redacted
+
+
+# --------------------------------------------------------------------------
+# ordering: credentials are screened BEFORE the PII pass can break their regex
+# --------------------------------------------------------------------------
+
+def test_pii_pass_cannot_disarm_the_credential_detector():
+    # The digit run in this key is exactly what the `phone` pattern eats.
+    # If PII ran first the key would become "sk-[phone]-<tail>", which
+    # `api_key_generic` no longer matches — and the tail would ship intact.
+    tail = "abcdEFGHijklMNOPqrstuv"
+    key = "sk-" + "1234567890" + "-" + tail
+
+    redacted, dropped = _redact_message_content(PIIRedactor(), key)
+
+    assert tail not in redacted
+    assert redacted == "[redacted]"
+    assert dropped == 1
+
+
+# --------------------------------------------------------------------------
+# structure is preserved but NOT unscreened
+# --------------------------------------------------------------------------
+
+def test_metadata_is_deep_copied_and_screened():
+    # A shallow copy shares `metadata` (and its `attachments`) by reference
+    # with the raw message and never screens it.  Inert while the summarizer
+    # reads only role/content — a live leak the moment it does not.
+    messages = [{
+        "role": "user",
+        "content": "see attached",
+        "metadata": {"attachments": [{"name": f"resume-{PLANTED_EMAIL}.pdf"}]},
+    }]
+
+    redacted = _redact_messages_for_llm(PIIRedactor(), messages)
+
+    assert redacted[0]["metadata"] is not messages[0]["metadata"]
+    assert PLANTED_EMAIL not in str(redacted[0]["metadata"])
+    # raw side untouched
+    assert PLANTED_EMAIL in str(messages[0]["metadata"])
+
+
+def test_generated_iso_timestamps_survive_screening_unchanged():
+    # Screening every non-`role` value is only safe because generated
+    # ISO-8601 timestamps match none of the PII patterns.  Pin that.
+    stamp = "2026-07-20T10:15:30.123456+00:00"
+    redacted = _redact_messages_for_llm(
+        PIIRedactor(), [{"role": "user", "content": "hi", "timestamp": stamp}],
+    )
+    assert redacted[0]["timestamp"] == stamp
+    assert redacted[0]["role"] == "user"
+
+
+def test_non_string_content_keeps_its_shape():
+    # Multimodal block lists must stay lists on the redacted copy — coercing
+    # them to a repr string would hand a provider adapter a different shape
+    # for the redacted path than for the raw one.
+    messages = [{
+        "role": "user",
+        "content": [{"type": "text", "text": f"mail {PLANTED_EMAIL}"}],
+    }]
+
+    redacted = _redact_messages_for_llm(PIIRedactor(), messages)
+
+    content = redacted[0]["content"]
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert PLANTED_EMAIL not in content[0]["text"]
+    assert "[email]" in content[0]["text"]
+
+
+# --------------------------------------------------------------------------
+# the OTHER pre-LLM path in this file: auto-assess
+# --------------------------------------------------------------------------
+
+def test_auto_assess_also_receives_the_redacted_copy():
+    """`create_llm_assessor` renders the last turns straight into a prompt, so
+    auto-assess fired on the same buffer consolidation screens — leaving it raw
+    would ship a pasted key to the provider anyway."""
+    from kumiho_memory.memory_manager import MemoryAssessResult
+
+    seen = []
+
+    async def assess_fn(messages, recalled):
+        seen.append("\n".join(str(m.get("content", "")) for m in messages))
+        return MemoryAssessResult(should_store=False, content="", memory_type="fact")
+
+    manager = UniversalMemoryManager(
+        redis_buffer=RedisMemoryBuffer(client=FakeRedis(), redis_url="redis://test"),
+        summarizer=RecordingSummarizer(),
+        pii_redactor=PIIRedactor(),
+        auto_assess_fn=assess_fn,
+        auto_assess_min_messages=1,
+    )
+
+    async def drive():
+        ingest = await manager.ingest_message(
+            user_id="user-1",
+            message=f"key {PLANTED_CREDENTIAL}, ping {PLANTED_EMAIL}",
+        )
+        await manager._background_assess(ingest["session_id"])
+
+    asyncio.run(drive())
+
+    assert seen, "the assessor must have been invoked"
+    assert PLANTED_CREDENTIAL not in seen[0]
+    assert PLANTED_EMAIL not in seen[0]
 
 
 # --------------------------------------------------------------------------

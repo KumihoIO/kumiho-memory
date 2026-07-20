@@ -1128,6 +1128,53 @@ def test_session_line_with_credential_is_dropped(monkeypatch, tmp_path):
     assert all("sk-" not in t for t in _FAKE.embedding_texts)
 
 
+class _RecordingAdapter(_StubAdapter):
+    """_StubAdapter that keeps every prompt the structuring model was given."""
+
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.seen = []
+
+    async def chat(self, *, messages, model, system="", max_tokens=1024,
+                   json_mode=False):
+        self.seen.append("\n".join(str(m.get("content", "")) for m in messages))
+        return await super().chat(
+            messages=messages, model=model, system=system,
+            max_tokens=max_tokens, json_mode=json_mode,
+        )
+
+
+def test_packets_are_credential_screened_before_the_structuring_model(
+    monkeypatch, tmp_path,
+):
+    """Step [3] used to be ``anonymize_summary`` alone — PII only, no
+    credential screen, unlike every other leg of this module.  A key pasted
+    into chat was chunked by build_chunks and handed to the structuring model
+    INTACT, and consolidate_session drives exactly this path with the buffered
+    conversation.  What the model sees must be screened."""
+    from kumiho_memory.privacy import PIIRedactor
+
+    repo, _sha = _make_repo(tmp_path)
+    _install_fake_kumiho(monkeypatch)
+
+    key = "sk-" + "abcdefghij0123456789ABCDEF"
+    quote = "defer the bge-m3 migration because the release cycle comes first"
+    msgs = [_msg("user", f"use {key} then migrate the embeddings to bge-m3?"),
+            _msg("assistant", quote),
+            _msg("user", "yes, agreed")]
+    adapter = _RecordingAdapter(_bge_payload(quote))
+
+    stats = _mine(repo, adapter, messages=msgs, redactor=PIIRedactor())
+
+    assert adapter.seen, "the structuring model must have been called"
+    assert all(key not in prompt for prompt in adapter.seen)
+    assert stats.credentials_dropped >= 1
+    # the SPAN went, the packet did not: the surrounding turns still reach
+    # the model, so the session still mines.
+    assert any("bge-m3" in prompt for prompt in adapter.seen)
+    assert stats.decisions_created == 1
+
+
 def test_correlate_anchored_dead_zone_regression(monkeypatch, tmp_path):
     """S2 regression: lex moved to FULL prose (honest pairs ~0.26), so the
     anchored floor moved to the same measured basis — a same-decision pair

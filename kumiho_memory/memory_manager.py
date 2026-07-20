@@ -174,42 +174,107 @@ _SIBLING_LLM_CONCURRENCY = 4
 _ISO_EVENT_DATE_RE = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
 
 
+# Message keys carried through to the LLM copy VERBATIM.  ``role`` is pure
+# structure ("user"/"assistant"), never user text, and the summarizer keys its
+# transcript rendering off it.  Everything else on a message — content,
+# timestamp, metadata and anything nested inside it — is treated as
+# potentially user-supplied and is screened.
+_STRUCTURAL_MESSAGE_KEYS = frozenset({"role"})
+
+
 def _redact_message_content(redactor: Any, content: str) -> Tuple[str, int]:
-    """Redact one message's CONTENT for the LLM — the conversation-path twin of
-    :func:`code_capture._anonymize_packet` (itself the twin of the session
-    path's :mod:`code_session` step [3]: "redact BEFORE the LLM").
+    """Redact one string of message text for the LLM — the conversation-path
+    twin of :func:`code_capture._anonymize_packet` (itself the twin of the
+    session path's :mod:`code_session` step [3]: "redact BEFORE the LLM").
 
-    Mirrors the sibling policy exactly: PII is redacted IN PLACE
-    (``anonymize_summary``); a credential-bearing LINE is dropped whole to a
-    ``[redacted]`` placeholder (counted) — the same drop-the-unit discipline,
-    because ``reject_credentials`` RAISES and a whole-message reject would make
-    one pasted key permanently unsummarizable (every retry hits the same raise).
-    Screening per line (not per message) keeps the drop surgical: the
-    surrounding turn survives so the model still has enough to summarize.
+    Three ordered passes, and the ORDER is load-bearing:
 
-    Returns ``(redacted_content, credentials_dropped)``.  Best-effort by
-    construction: if the redactor itself raises on a line, that line
-    fails CLOSED to ``[redacted]`` rather than propagating — a redaction
-    failure must never crash consolidation, and must never leak either.
+    1. **Credentials, on the RAW text**, excised span-wise via
+       :meth:`PIIRedactor.redact_credentials`.  Running the PII pass first —
+       as the older sibling implementations did — strictly WEAKENS the
+       credential detector, because the PII pass rewrites the very runs the
+       credential regexes anchor on: ``sk-1234567890-abcd…`` becomes
+       ``sk-[phone]-abcd…``, which ``api_key_generic`` no longer matches, so
+       the key tail ships intact.  Screening credentials first cannot be
+       undone by a later pass.
+    2. **PII in place** (``anonymize_summary``).
+    3. **Verification** with the raising gate (``reject_credentials``).  A
+       residual match here means a pattern fired that span excision did not
+       remove, so the whole string fails CLOSED to ``[redacted]``.
+
+    Span excision — not dropping the containing LINE — is a deliberate
+    divergence from the line-oriented sibling policy, for two measured
+    reasons.  (a) A chat turn is usually ONE line, so drop-the-line
+    degenerates into drop-the-whole-turn: a benign sentence containing
+    "use Bearer token auth" would lose the entire message before the
+    summarizer ever saw it, and the stored memory is built from that gapped
+    transcript.  (b) Line-oriented screening cannot see a multi-line secret:
+    a pasted PEM key matches only on its BEGIN header line, so dropping that
+    line removes the label and ships the whole base64 body.  Excising spans —
+    including multi-line blocks — fixes both.
+
+    Returns ``(redacted_text, credentials_removed)``.  Best-effort by
+    construction: if the redactor itself raises, the text fails CLOSED to
+    ``[redacted]`` rather than propagating — a redaction failure must never
+    crash consolidation, and must never leak either.
     """
     if redactor is None:
         return content, 0
     dropped = 0
-    out: List[str] = []
-    for line in content.split("\n"):
+    text = content
+
+    # [1] credentials first, on the raw text
+    redact_credentials = getattr(redactor, "redact_credentials", None)
+    if callable(redact_credentials):
         try:
-            line = redactor.anonymize_summary(line)
+            text, dropped = redact_credentials(text)
         except Exception:  # noqa: BLE001 — fail closed, never crash
-            out.append("[redacted]")
-            dropped += 1
-            continue
-        try:
-            redactor.reject_credentials(line)
-        except Exception:  # noqa: BLE001 — CredentialDetectedError et al.
-            line = "[redacted]"
-            dropped += 1
-        out.append(line)
-    return "\n".join(out), dropped
+            return "[redacted]", 1
+
+    # [2] PII in place
+    try:
+        text = redactor.anonymize_summary(text)
+    except Exception:  # noqa: BLE001 — fail closed, never crash
+        return "[redacted]", dropped + 1
+
+    # [3] verify against the raising gate
+    try:
+        redactor.reject_credentials(text)
+    except Exception:  # noqa: BLE001 — CredentialDetectedError et al.
+        return "[redacted]", dropped + 1
+
+    return text, dropped
+
+
+def _redact_value_for_llm(redactor: Any, value: Any) -> Tuple[Any, int]:
+    """Screen one message VALUE, preserving its shape.
+
+    Strings are redacted; ``dict``/``list``/``tuple`` are rebuilt element-wise
+    (which also breaks the reference to the caller's nested containers, so the
+    LLM copy never shares mutable state with the raw transcript); every other
+    scalar passes through untouched.  Rebuilding rather than ``str()``-ing a
+    non-string ``content`` matters for multimodal block lists: coercing them
+    would hand the provider adapter a different SHAPE for the redacted copy
+    than for the raw path, so the copy's type is preserved deliberately.
+    """
+    if isinstance(value, str):
+        return _redact_message_content(redactor, value)
+    if isinstance(value, dict):
+        out: Dict[Any, Any] = {}
+        total = 0
+        for key, item in value.items():
+            out[key], found = _redact_value_for_llm(redactor, item)
+            total += found
+        return out, total
+    if isinstance(value, (list, tuple)):
+        items = []
+        total = 0
+        for item in value:
+            redacted_item, found = _redact_value_for_llm(redactor, item)
+            items.append(redacted_item)
+            total += found
+        return (tuple(items) if isinstance(value, tuple) else items), total
+    return value, 0
 
 
 def _redact_messages_for_llm(
@@ -219,25 +284,42 @@ def _redact_messages_for_llm(
 
     The original ``messages`` are never mutated: the raw transcript is written
     verbatim to the local artifact (``~/.kumiho/artifacts``) as the local source
-    of truth.  Only what leaves the machine is redacted.  Each message is
-    shallow-copied so structure survives intact — role, ordering, timestamps and
-    metadata are preserved and only ``content`` is transformed (anonymize
-    content, not structure).
+    of truth.  Only what leaves the machine is redacted.
+
+    Structure survives — keys, ordering, roles and value shapes are all
+    preserved — but every value except ``role`` is SCREENED, not merely copied.
+    Today ``_format_messages`` reads only ``role`` and ``content``, so screening
+    ``metadata`` (attachment names in particular) and ``timestamp`` is inert;
+    that is the point.  A shallow copy would leave those keys sharing the raw
+    objects by reference, so the first time the summarizer prompt is widened to
+    include them raw PII would flow again with nothing to catch it.  Screening
+    is keyed to what the message CARRIES, not to what today's prompt happens to
+    read.
+
+    Note: generated ISO-8601 timestamps provably match none of the PII
+    patterns, so screening them is a no-op in practice (pinned by test).
     """
     if redactor is None:
         return messages
     redacted: List[Dict[str, Any]] = []
     total_dropped = 0
     for msg in messages:
-        copy = dict(msg)
-        content = str(msg.get("content", "") or "")
-        if content:
-            copy["content"], dropped = _redact_message_content(redactor, content)
+        if not isinstance(msg, dict):
+            value, dropped = _redact_value_for_llm(redactor, msg)
+            redacted.append(value)
+            total_dropped += dropped
+            continue
+        copy: Dict[str, Any] = {}
+        for key, value in msg.items():
+            if key in _STRUCTURAL_MESSAGE_KEYS:
+                copy[key] = value
+                continue
+            copy[key], dropped = _redact_value_for_llm(redactor, value)
             total_dropped += dropped
         redacted.append(copy)
     if total_dropped:
         logger.warning(
-            "pre-LLM redaction dropped %d credential-bearing line(s) "
+            "pre-LLM redaction removed %d credential span(s) "
             "from the conversation sent to the summarizer",
             total_dropped,
         )
@@ -703,7 +785,14 @@ class UniversalMemoryManager:
                 recalled = await self.recall_memories(query_text, limit=5)
 
             # 4. Invoke the model-agnostic assess function.
-            assess_result: MemoryAssessResult = await self.auto_assess_fn(messages, recalled)
+            # Second pre-LLM leg in this file (#138): the shipped assessor
+            # (`create_llm_assessor`) renders the last turns straight into a
+            # prompt, so auto-assess would ship a pasted key to the provider
+            # on the very same buffer consolidation now screens.  Same gate,
+            # same helper, same raw buffer left untouched.
+            assess_result: MemoryAssessResult = await self.auto_assess_fn(
+                _redact_messages_for_llm(self.pii_redactor, messages), recalled,
+            )
 
             # Always advance cursor so we don't re-examine the same window.
             self._auto_store_cursors[session_id] = total
@@ -1278,6 +1367,13 @@ class UniversalMemoryManager:
                 "memory_type": summary_result.get("type", "summary"),
                 "title": title,
                 "summary": redacted_summary,
+                # KNOWN BOUNDARY, deliberately unchanged by #138: these carry
+                # the RAW turns, and the credential gate above screens only
+                # `redacted_summary`.  #138 closes the pre-LLM leg — what an
+                # LLM *provider* sees — it does NOT make the transcript stop
+                # leaving the machine.  Screening the stored transcript is a
+                # separate call (it changes what the graph holds and what
+                # `code_why`/recall can quote back), tracked on its own.
                 "user_text": "\n".join(user_lines),
                 "assistant_text": "\n".join(assistant_lines),
                 "artifact_location": artifact_path,

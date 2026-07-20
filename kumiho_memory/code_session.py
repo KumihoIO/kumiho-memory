@@ -616,6 +616,45 @@ def _drop_if_credential(redactor: Any, text: str, stats: SessionMineStats) -> bo
         return True
 
 
+def _redact_packet_for_llm(
+    redactor: Any, packet: str, stats: SessionMineStats,
+) -> str:
+    """Pre-LLM screen over one chunk packet (step [3]).
+
+    Step [3] used to be ``anonymize_summary`` alone — PII only, no credential
+    screen — while every OTHER leg of this module (``_drop_if_credential`` over
+    decisions, quotes and ``session_line``) does screen credentials.  The gap
+    was live on the consolidation flow: ``consolidate_session`` calls
+    ``code_mine_session`` with the buffered conversation, so an API key pasted
+    into chat was chunked and handed to the structuring model intact.
+
+    Credentials are excised span-wise on the RAW packet FIRST — before the PII
+    pass, which rewrites the digit runs the credential regexes anchor on and
+    would otherwise defeat them — then PII is redacted in place.  Excising the
+    matched span rather than dropping the containing line keeps hunk headers,
+    paths and surrounding diff structure intact (anonymize content, not
+    structure), and is the only screening that can see a multi-line PEM block.
+
+    Deliberately does NOT add a whole-packet ``reject_credentials`` verdict:
+    a packet is a large unit, and dropping one wholesale would starve the
+    structuring model of a whole chunk.  The per-atom screen over what comes
+    BACK (:func:`_drop_if_credential` over decisions, quotes and
+    ``session_line``) stays as the second layer.
+    """
+    if redactor is None:
+        return packet
+    text = packet
+    redact_credentials = getattr(redactor, "redact_credentials", None)
+    if callable(redact_credentials):
+        try:
+            text, dropped = redact_credentials(text)
+            stats.credentials_dropped += dropped
+        except Exception:  # noqa: BLE001 — never crash the mine on redaction
+            stats.credentials_dropped += 1
+            return "[redacted]"
+    return redactor.anonymize_summary(text)
+
+
 def validate_session_decisions(
     candidates: List[Dict[str, Any]],
     *,
@@ -1464,8 +1503,10 @@ async def mine_session(
 
     # --- [3] redact BEFORE the LLM: what the model sees is what the
     # validator checks against is what gets stored (single text stream).
+    # Credentials AND PII — see _redact_packet_for_llm for why the order
+    # (credentials first, on the raw text) is load-bearing.
     if redactor is not None:
-        packets = [redactor.anonymize_summary(p) for p in packets]
+        packets = [_redact_packet_for_llm(redactor, p, stats) for p in packets]
 
     # --- [4] structure (concurrency 2)
     sem = asyncio.Semaphore(2)

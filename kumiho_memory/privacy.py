@@ -78,6 +78,22 @@ class PIIRedactor:
         "generic_secret_assignment": r"""(?:api[_-]?key|secret|token|password|passwd|credential)\s*[:=]\s*['"][^'"]{8,}['"]""",
     }
 
+    # Multi-line credential BLOCKS.  Everything in ``CREDENTIAL_PATTERNS`` is a
+    # single-line shape, and for PEM keys that shape is the BEGIN *header* only
+    # — the key material itself is bare base64, explicitly uncovered (see the
+    # module docstring).  Line-oriented screening therefore removes the label
+    # and keeps the secret.  These patterns span the whole block so
+    # :meth:`redact_credentials` excises the key, not just its header.  A block
+    # with no END marker matches to end-of-text (the ``\Z`` branch) — fail
+    # closed rather than let an unterminated key body through.
+    CREDENTIAL_BLOCK_PATTERNS = {
+        "private_key_block": (
+            r"-----BEGIN (?:[A-Z][A-Z0-9 ]*)?PRIVATE KEY-----"
+            r"[\s\S]*?"
+            r"(?:-----END (?:[A-Z][A-Z0-9 ]*)?PRIVATE KEY-----|\Z)"
+        ),
+    }
+
     def __init__(self) -> None:
         self.entity_counter: Dict[str, int] = {}
 
@@ -110,6 +126,36 @@ class PIIRedactor:
             descriptor = f"[{entity['type']}]"
             redacted = redacted.replace(placeholder, descriptor)
         return redacted
+
+    def redact_credentials(self, text: str) -> Tuple[str, int]:
+        """Excise credential SPANS in place; return ``(redacted, count)``.
+
+        The span-level counterpart to :meth:`reject_credentials`, which raises
+        on the whole text.  A hard reject (or dropping the containing line) is
+        the right blast radius for a diff, where one dropped line out of
+        hundreds still leaves the model plenty to work with.  It is the wrong
+        one for a chat turn, which is typically a SINGLE line: there,
+        drop-the-line degenerates into drop-the-whole-turn, and a benign phrase
+        that trips a pattern (``"use Bearer token auth"`` matches
+        ``bearer_token``) costs the entire message.  Excising only the matched
+        span keeps the surrounding prose.
+
+        Blocks are excised before single-line patterns so a PEM body can never
+        outlive its header.
+
+        Best-effort, like everything in this module: it removes what the
+        patterns match and nothing more.  Use :meth:`reject_credentials` after
+        it as a verification pass — never treat this as proof text is clean.
+        """
+        redacted = text
+        count = 0
+        patterns = list(self.CREDENTIAL_BLOCK_PATTERNS.values()) + list(
+            self.CREDENTIAL_PATTERNS.values()
+        )
+        for pattern in patterns:
+            redacted, found = re.subn(pattern, "[redacted]", redacted)
+            count += found
+        return redacted, count
 
     def reject_credentials(self, text: str) -> None:
         """Reject text containing credential patterns.
