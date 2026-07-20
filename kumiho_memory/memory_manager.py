@@ -174,6 +174,76 @@ _SIBLING_LLM_CONCURRENCY = 4
 _ISO_EVENT_DATE_RE = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
 
 
+def _redact_message_content(redactor: Any, content: str) -> Tuple[str, int]:
+    """Redact one message's CONTENT for the LLM — the conversation-path twin of
+    :func:`code_capture._anonymize_packet` (itself the twin of the session
+    path's :mod:`code_session` step [3]: "redact BEFORE the LLM").
+
+    Mirrors the sibling policy exactly: PII is redacted IN PLACE
+    (``anonymize_summary``); a credential-bearing LINE is dropped whole to a
+    ``[redacted]`` placeholder (counted) — the same drop-the-unit discipline,
+    because ``reject_credentials`` RAISES and a whole-message reject would make
+    one pasted key permanently unsummarizable (every retry hits the same raise).
+    Screening per line (not per message) keeps the drop surgical: the
+    surrounding turn survives so the model still has enough to summarize.
+
+    Returns ``(redacted_content, credentials_dropped)``.  Best-effort by
+    construction: if the redactor itself raises on a line, that line
+    fails CLOSED to ``[redacted]`` rather than propagating — a redaction
+    failure must never crash consolidation, and must never leak either.
+    """
+    if redactor is None:
+        return content, 0
+    dropped = 0
+    out: List[str] = []
+    for line in content.split("\n"):
+        try:
+            line = redactor.anonymize_summary(line)
+        except Exception:  # noqa: BLE001 — fail closed, never crash
+            out.append("[redacted]")
+            dropped += 1
+            continue
+        try:
+            redactor.reject_credentials(line)
+        except Exception:  # noqa: BLE001 — CredentialDetectedError et al.
+            line = "[redacted]"
+            dropped += 1
+        out.append(line)
+    return "\n".join(out), dropped
+
+
+def _redact_messages_for_llm(
+    redactor: Any, messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Build the LLM-bound REDACTED COPY of a transcript.
+
+    The original ``messages`` are never mutated: the raw transcript is written
+    verbatim to the local artifact (``~/.kumiho/artifacts``) as the local source
+    of truth.  Only what leaves the machine is redacted.  Each message is
+    shallow-copied so structure survives intact — role, ordering, timestamps and
+    metadata are preserved and only ``content`` is transformed (anonymize
+    content, not structure).
+    """
+    if redactor is None:
+        return messages
+    redacted: List[Dict[str, Any]] = []
+    total_dropped = 0
+    for msg in messages:
+        copy = dict(msg)
+        content = str(msg.get("content", "") or "")
+        if content:
+            copy["content"], dropped = _redact_message_content(redactor, content)
+            total_dropped += dropped
+        redacted.append(copy)
+    if total_dropped:
+        logger.warning(
+            "pre-LLM redaction dropped %d credential-bearing line(s) "
+            "from the conversation sent to the summarizer",
+            total_dropped,
+        )
+    return redacted
+
+
 def _tokenize(text: str) -> List[str]:
     """Lowercase split + strip punctuation, filtering stopwords."""
     return [
@@ -984,9 +1054,17 @@ class UniversalMemoryManager:
         # in parallel — implications don't depend on the summary result.
         # Use return_exceptions so an implication failure doesn't crash
         # the summarizer (implications are non-critical).
+        # Redact BEFORE the LLM (the conversation-path leg of the same gate
+        # code_capture/code_session apply on their paths).  BOTH calls below
+        # get the redacted COPY — raw `messages` stay untouched because the
+        # verbatim transcript is the local artifact's source of truth
+        # (~/.kumiho/artifacts never leaves the machine).  The
+        # anonymize_summary pass over the model's OUTPUT below remains as the
+        # second layer.
+        llm_messages = _redact_messages_for_llm(self.pii_redactor, messages)
         _summary_or_exc, _impl_or_exc = await asyncio.gather(
-            self.summarizer.summarize_conversation(messages),
-            self.summarizer.generate_implications(messages),
+            self.summarizer.summarize_conversation(llm_messages),
+            self.summarizer.generate_implications(llm_messages),
             return_exceptions=True,
         )
         # Summary is critical — propagate its exception.
