@@ -1428,8 +1428,8 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                 "code_project": {
                     "type": "string",
                     "description": (
-                        "Explicit {repo}-code project for the Decision Memory "
-                        "maintenance passes. Derived from KUMIHO_MEMORY_CODE "
+                        "Explicit {repo}-decisions project for the Decision Memory "
+                        "maintenance passes. Derived from KUMIHO_MEMORY_DECISIONS "
                         "wiring when omitted."
                     ),
                 },
@@ -1509,7 +1509,7 @@ MEMORY_TOOL_HANDLERS: Dict[str, Any] = {
 
 
 # ---------------------------------------------------------------------------
-# Code Decision Memory (opt-in: KUMIHO_MEMORY_CODE=1)
+# Code Decision Memory (opt-in: KUMIHO_MEMORY_DECISIONS=1)
 # ---------------------------------------------------------------------------
 # Registered only when the gate is on — with the gate off this module is
 # byte-identical in behavior to the pre-code-domain version (the conversation

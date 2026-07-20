@@ -27,9 +27,9 @@ LLM saw, mentioned files against ``git ls-files``, mentioned commits against
 rejector applied to the whole session would make one pasted key permanently
 unmineable (privacy.py raises; verified).
 
-Everything is opt-in behind ``KUMIHO_MEMORY_CODE=1``; nothing here is
+Everything is opt-in behind ``KUMIHO_MEMORY_DECISIONS=1``; nothing here is
 imported by the conversation recall/consolidation paths unless the
-additional ``KUMIHO_MEMORY_CODE_AUTOMINE=1`` chain gate is set.
+additional ``KUMIHO_MEMORY_DECISIONS_AUTOMINE=1`` chain gate is set.
 """
 
 from __future__ import annotations

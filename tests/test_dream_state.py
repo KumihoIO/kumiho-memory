@@ -494,11 +494,11 @@ def test_maintain_graph_explicit_false_overrides_env(monkeypatch):
 
 def test_code_project_isolation_guard():
     """An explicit code_project equal to the conversation project is corrected
-    to {project}-code (physical-isolation guard applies to every path)."""
+    to {project}-decisions (physical-isolation guard applies to every path)."""
     ds = DreamState(summarizer=StubSummarizer(), project="Mem", code_project="Mem")
-    assert ds._code_project == "Mem-code"
-    ds2 = DreamState(summarizer=StubSummarizer(), project="Mem", code_project="Custom-code")
-    assert ds2._code_project == "Custom-code"
+    assert ds._code_project == "Mem-decisions"
+    ds2 = DreamState(summarizer=StubSummarizer(), project="Mem", code_project="Custom-decisions")
+    assert ds2._code_project == "Custom-decisions"
 
 
 def test_load_last_run_at_first_run():

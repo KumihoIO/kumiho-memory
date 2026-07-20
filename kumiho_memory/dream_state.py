@@ -529,9 +529,9 @@ class DreamState:
         lets ``KUMIHO_DREAM_EMBED_FACT_DEDUP`` decide.  Default OFF pending the
         paired gate.
     code_project:
-        Explicit ``{repo}-code`` project for the Decision Memory passes.
+        Explicit ``{repo}-decisions`` project for the Decision Memory passes.
         When None, derived via ``resolve_project_name`` only if code memory
-        is enabled (``KUMIHO_MEMORY_CODE``); otherwise the code-graph passes
+        is enabled (``KUMIHO_MEMORY_DECISIONS``); otherwise the code-graph passes
         are skipped.
     verifier:
         Optional *independent* :class:`LLMAdapter` used only to refute

@@ -18,7 +18,7 @@ Machine-judged (verbatim evidence makes substring matching honest):
   [6] idempotent re-mine          (zero LLM calls, zero new nodes)
   [7] bridge-only reconciliation  (DISCUSSED_IN resolves to the kref)
 
-Usage (env: KUMIHO_MEMORY_CODE=1, an LLM key, and a reachable CE)::
+Usage (env: KUMIHO_MEMORY_DECISIONS=1, an LLM key, and a reachable CE)::
 
     python scripts/dogfood_session_memory.py --preflight   # 1-chunk dry run
     python scripts/dogfood_session_memory.py               # full gate
@@ -147,7 +147,7 @@ async def main() -> int:
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
 
-    os.environ["KUMIHO_MEMORY_CODE"] = "1"
+    os.environ["KUMIHO_MEMORY_DECISIONS"] = "1"
 
     from kumiho_memory.code_decisions import CodeMemoryConfig
     from kumiho_memory.code_capture import _run_git, ingest_repo

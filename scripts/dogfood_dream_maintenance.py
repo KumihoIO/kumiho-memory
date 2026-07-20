@@ -17,7 +17,7 @@ Mirrors scripts/dogfood_ontology_agent.py + scripts/dogfood_loe_code.py.
 import asyncio, os, sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 os.environ["KUMIHO_MEMORY_ONTOLOGY"] = "1"
-os.environ["KUMIHO_MEMORY_CODE"] = "1"
+os.environ["KUMIHO_MEMORY_DECISIONS"] = "1"
 
 import grpc
 import kumiho

@@ -468,7 +468,7 @@ char_limit 기본 4000, 초과 시 하위 decision부터 절단 (additive 원칙
 ```
 
 - `anyOf`로 file|question 최소 입력 강제 (C).
-- 핸들러는 기존 관례대로 sync + 내부 `asyncio.run`. `KUMIHO_MEMORY_CODE=1`일 때만 등록
+- 핸들러는 기존 관례대로 sync + 내부 `asyncio.run`. `KUMIHO_MEMORY_DECISIONS=1`일 때만 등록
   (기본 OFF — opt-in; 대화 도메인의 default-ON과 달리 아직 paired evidence가 없다.
   `KUMIHO_MEMORY_ONTOLOGY`와 완전 독립 — LoCoMo 게이트 0 영향이 릴리즈 안전핀).
 
@@ -495,7 +495,7 @@ kumiho_memory/
 ```python
 @dataclass
 class CodeMemoryConfig:
-    project: str = ""                 # 기본: f"{memory_project}-code" 파생
+    project: str = ""                 # 기본: f"{memory_project}-decisions" 파생
     repo: str = ""                    # 기본: origin URL slug, 없으면 dir명
     decisions_space: str = "decisions"
     anchors_space: str = "anchors"
@@ -516,7 +516,8 @@ class CodeMemoryConfig:
     schema_version: str = "kumiho.code_memory.v1"
 ```
 
-- env: `KUMIHO_MEMORY_CODE` (기본 unset=off), `KUMIHO_MEMORY_CODE_PROJECT` 오버라이드.
+- env: `KUMIHO_MEMORY_DECISIONS` (기본 unset=off), `KUMIHO_MEMORY_DECISIONS_PROJECT` 오버라이드.
+  레거시 `KUMIHO_MEMORY_CODE*` 이름은 폐지 예정이나 폴백으로 계속 인식(신규 이름 우선).
 - **의존성 신규 0** — git은 subprocess (GitPython 불채택), LLM은 기존 어댑터.
   `[code]` optional-extra는 만들지 않는다 (빈 extra는 소음 — 이슈의 extra 항목에 대한 답:
   불필요 확인).
@@ -560,7 +561,7 @@ class CodeMemoryConfig:
 `python/kumiho-memory/scripts/dogfood_code_memory.py` (수동 실행, CI 제외):
 
 ```python
-os.environ["KUMIHO_MEMORY_CODE"] = "1"
+os.environ["KUMIHO_MEMORY_DECISIONS"] = "1"
 # 0) Paid-run preflight 원칙: 1커밋 드라이런으로 LLM 발화·JSON 준수 확인 후 발사
 # 1) 전용 project get-or-create (끝나면 delete_project로 잔여물 0 — SmokeTest 관례)
 stats = await ingest_repo("G:/git/KumihoIO/kumiho-SDKs", "HEAD~30..HEAD")
@@ -621,7 +622,7 @@ CASES = [
 ### P1 — core (스키마·앵커·쿼리의 결정적 부분; LLM 무관)
 
 1. **`kumiho_memory/code_decisions.py`** (신규)
-   - `CodeMemoryConfig` dataclass (§6) + env 읽기 (`KUMIHO_MEMORY_CODE*`)
+   - `CodeMemoryConfig` dataclass (§6) + env 읽기 (`KUMIHO_MEMORY_DECISIONS*`, 레거시 `KUMIHO_MEMORY_CODE*` 폴백)
    - `normalize_path()` — 단일 소스 계약 (§3.2)
    - slug 함수들: `anchor_slug(repo, path)`, `decision_slug(title, author_date)`(충돌 가드 포함),
      `commit_slug`, `evidence_slug`
