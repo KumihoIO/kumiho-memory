@@ -54,7 +54,7 @@
 ### 1.1 프로젝트/스페이스 레이아웃 — 전용 project (A·C 합의)
 
 ```
-project: "{agent_project}-code"      # 기본값. CodeMemoryConfig.project / env로 오버라이드
+project: "{agent_project}-decisions" # 기본값. CodeMemoryConfig.project / env로 오버라이드
 ├── /decisions      ← code_decision (1차 콘텐츠, 렉시컬+벡터 검색 대상)
 ├── /anchors        ← code_anchor   (파일 허브, waypoint 전용)
 ├── /commits        ← code_commit   (provenance + 멱등 마커)
@@ -601,7 +601,7 @@ CASES = [
 | R8 | CE가 code-domain 텍스트에 약함 | 저 | 구조 prior가 사전식 우선이라 CE 실패가 anchor 매치를 못 뒤집음 |
 
 **Open questions** (구현 전/중 확정):
-1. `-code` 접미 project의 자동 생성 권한 — MCP 테넌트에서 create_project 허용 여부를 CE에서 확인
+1. `-decisions` 접미 project의 자동 생성 권한 — MCP 테넌트에서 create_project 허용 여부를 CE에서 확인
    (도그푸드 스크립트 첫 단계에 포함).
 2. repo 식별자 정규화 — origin 없는 로컬 repo의 dir명 충돌. Phase 1은 `config.repo` 명시로 회피
    가능, 기본 휴리스틱만 제공.

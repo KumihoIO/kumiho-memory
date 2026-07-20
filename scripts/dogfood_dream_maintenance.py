@@ -30,7 +30,7 @@ from kumiho_memory.code_decisions import (
 )
 
 PROJECT = "dream-maint-dogfood"
-CODE_PROJECT = PROJECT + "-code"
+CODE_PROJECT = PROJECT + "-decisions"
 KEEP = "--keep" in sys.argv
 
 
