@@ -1,5 +1,7 @@
 # Kumiho Memory
 
+📄 **Paper:** [*Graph-Native Cognitive Memory for AI Agents*](https://arxiv.org/abs/2603.17244) — formal belief-revision semantics for versioned memory (arXiv:2603.17244)
+
 ---
 
 ## Client-side memory provider for AI agents — working memory, consolidation, and belief revision on the Kumiho Cognitive Memory graph
@@ -514,6 +516,39 @@ core `kumiho` MCP server:
 
 The scope of this package will remain limited to **client-side concerns**
 — no kumiho-server changes are required by anything on this roadmap.
+
+---
+
+### Research
+
+kumiho-memory is the client-side implementation of the memory architecture
+formalized in:
+
+> **Graph-Native Cognitive Memory for AI Agents: Formal Belief Revision
+> Semantics for Versioned Memory Architectures** — Young Bin Park.
+> arXiv:2603.17244 (2026), cs.AI. <https://arxiv.org/abs/2603.17244>
+
+The paper proves a correspondence between the AGM belief-revision framework and
+the operational semantics of a property-graph memory system — satisfying the
+basic AGM postulates (K\*2–K\*6) and Hansson's belief-base postulates
+(Relevance, Core-Retainment). That is the formal grounding for the
+consolidation and belief-revision behavior this package exposes on the Kumiho
+Cognitive Memory graph.
+
+If you use kumiho-memory in academic work, please cite:
+
+```bibtex
+@misc{park2026kumiho,
+  title         = {Graph-Native Cognitive Memory for AI Agents: Formal Belief Revision Semantics for Versioned Memory Architectures},
+  author        = {Park, Young Bin},
+  year          = {2026},
+  eprint        = {2603.17244},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AI},
+  doi           = {10.48550/arXiv.2603.17244},
+  url           = {https://arxiv.org/abs/2603.17244}
+}
+```
 
 ---
 
