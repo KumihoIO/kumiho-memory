@@ -45,6 +45,7 @@ from kumiho_memory.evidence import CORROBORATED, SINGLE_SOURCE, UNVERIFIED
 from kumiho_memory.privacy import PIIRedactor
 from kumiho_memory.code_decisions import (
     CodeMemoryConfig,
+    _env_with_legacy,
     EDGE_DERIVED_FROM,
     EDGE_IMPLEMENTED_IN,
     EDGE_MOTIVATED_BY,
@@ -1257,12 +1258,17 @@ async def ingest_repo(
 #: must return before the client gives up.  A typical capture writes in
 #: ~5-15s, so 45s is generous for the happy path while still bounding the tail.
 _CAPTURE_DEADLINE_DEFAULT = 45.0
-_CAPTURE_DEADLINE_ENV = "KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE"
+_CAPTURE_DEADLINE_ENV = "KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE"
+_CAPTURE_DEADLINE_ENV_LEGACY = "KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE"
 
 
 def _capture_deadline() -> float:
-    """Overall capture budget in seconds (env override, positive float)."""
-    raw = os.getenv(_CAPTURE_DEADLINE_ENV, "").strip()
+    """Overall capture budget in seconds (env override, positive float).
+
+    Reads ``KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE``, falling back to the
+    deprecated ``KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE``.
+    """
+    raw = _env_with_legacy(_CAPTURE_DEADLINE_ENV, _CAPTURE_DEADLINE_ENV_LEGACY).strip()
     if not raw:
         return _CAPTURE_DEADLINE_DEFAULT
     try:
@@ -1323,7 +1329,7 @@ async def capture_decisions(
     ``resume``) naming what landed and telling the agent to re-call with the
     SAME args — which is safe because every write is get-or-create and every
     edge is existence-checked, so a retry never duplicates.  See
-    ``KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE``.
+    ``KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE``.
     """
     config = config or CodeMemoryConfig()
     redactor = redactor or PIIRedactor()

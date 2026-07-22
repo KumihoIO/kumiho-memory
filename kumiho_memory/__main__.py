@@ -264,7 +264,7 @@ def cmd_code_ingest(args: argparse.Namespace) -> int:
 
     if not code_memory_enabled():
         print(json.dumps({
-            "errors": ["code memory is disabled — set KUMIHO_MEMORY_CODE=1"],
+            "errors": ["code memory is disabled — set KUMIHO_MEMORY_DECISIONS=1"],
         }))
         return 1
 
@@ -300,7 +300,7 @@ def cmd_code_mine_session(args: argparse.Namespace) -> int:
 
     if not code_memory_enabled():
         print(json.dumps({
-            "errors": ["code memory is disabled — set KUMIHO_MEMORY_CODE=1"],
+            "errors": ["code memory is disabled — set KUMIHO_MEMORY_DECISIONS=1"],
         }))
         return 1
 
@@ -498,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
     # -- code-ingest subcommand (Decision Memory, opt-in) --
     code_ingest = sub.add_parser(
         "code-ingest",
-        help="Mine git commits into Decision Memory (KUMIHO_MEMORY_CODE=1)",
+        help="Mine git commits into Decision Memory (KUMIHO_MEMORY_DECISIONS=1)",
         description="LLM-structure a git commit range into decision nodes "
         "with git anchors and evidence chains. Idempotent: already-captured "
         "commits are skipped without LLM cost. Omit --range for incremental "
@@ -518,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
     code_ingest.add_argument(
         "--project",
         default="CognitiveMemory",
-        help="Memory project; decisions go to '{project}-code' (default: CognitiveMemory)",
+        help="Memory project; decisions go to '{project}-decisions' (default: CognitiveMemory)",
     )
     code_ingest.add_argument(
         "--max-commits",
@@ -558,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     code_mine.add_argument(
         "--project",
         default="CognitiveMemory",
-        help="Memory project; decisions go to '{project}-code' (default: CognitiveMemory)",
+        help="Memory project; decisions go to '{project}-decisions' (default: CognitiveMemory)",
     )
     code_mine.add_argument(
         "--conversation-kref",

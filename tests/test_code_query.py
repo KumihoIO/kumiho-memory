@@ -85,7 +85,7 @@ def test_commit_and_evidence_slugs():
 
 
 def test_resolve_project_name():
-    assert resolve_project_name("agent", CodeMemoryConfig()) == "agent-code"
+    assert resolve_project_name("agent", CodeMemoryConfig()) == "agent-decisions"
     assert resolve_project_name("agent", CodeMemoryConfig(project="explicit")) == "explicit"
 
 
@@ -164,7 +164,7 @@ def _scenario():
     """Anchored decisions D1 (active) + D2 (superseded), semantic D3 whose
     evidence E1 also matches the question (bridge promotion)."""
     cfg = CodeMemoryConfig(repo="sdks")
-    proj_name = "agent-code"
+    proj_name = "agent-decisions"
     f = "kumiho_memory/recall_rerank.py"
 
     d1 = _Rev("kref://c/d/1", {

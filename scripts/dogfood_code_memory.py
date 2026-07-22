@@ -9,7 +9,7 @@ matching honest).
 Success criterion 5 of issue #43: all three queries must surface a decision
 derived from the expected commit, with the expected evidence terms.
 
-Usage (env: KUMIHO_MEMORY_CODE=1, an LLM key, and a reachable CE)::
+Usage (env: KUMIHO_MEMORY_DECISIONS=1, an LLM key, and a reachable CE)::
 
     python scripts/dogfood_code_memory.py --preflight   # 1-commit dry run
     python scripts/dogfood_code_memory.py               # full gate
@@ -107,7 +107,7 @@ async def main() -> int:
     parser.add_argument("--max-commits", type=int, default=40)
     args = parser.parse_args()
 
-    os.environ["KUMIHO_MEMORY_CODE"] = "1"
+    os.environ["KUMIHO_MEMORY_DECISIONS"] = "1"
 
     from kumiho_memory.code_decisions import CodeMemoryConfig
     from kumiho_memory.code_capture import ingest_repo

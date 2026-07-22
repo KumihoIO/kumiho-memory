@@ -1452,7 +1452,7 @@ class UniversalMemoryManager:
                 )
 
             # Decision Memory session mining chain (double opt-in:
-            # KUMIHO_MEMORY_CODE=1 AND KUMIHO_MEMORY_CODE_AUTOMINE=1 — see
+            # KUMIHO_MEMORY_DECISIONS=1 AND KUMIHO_MEMORY_DECISIONS_AUTOMINE=1 — see
             # docs/SESSION_MINING_DESIGN.md §2.2c).  This exact spot is the
             # point: the Redis buffer is still alive, `messages` is already
             # in memory (zero re-reads), and `stored_kref` is in-band — the
@@ -2460,12 +2460,12 @@ class UniversalMemoryManager:
 
         return two_pass_rerank(query, memories, self.embedding_adapter)
 
-    _CODE_MEMORY_DISABLED = "code memory is disabled (set KUMIHO_MEMORY_CODE=1)"
+    _CODE_MEMORY_DISABLED = "code memory is disabled (set KUMIHO_MEMORY_DECISIONS=1)"
 
     def _code_memory_context(self) -> Optional[Tuple[Any, str, Any, str]]:
         """Gate + shared wiring for the Decision Memory delegations.
 
-        ``(cfg, project_name, adapter, model)`` when ``KUMIHO_MEMORY_CODE=1``,
+        ``(cfg, project_name, adapter, model)`` when ``KUMIHO_MEMORY_DECISIONS=1``,
         else ``None``.  The LLM wiring reuses the summarizer's adapter +
         light model — no separate key.  Lazy import so the conversation
         paths carry zero code-domain imports while the gate is off.
@@ -2496,9 +2496,9 @@ class UniversalMemoryManager:
         """Ask why code is the way it is (Decision Memory, opt-in).
 
         Thin delegation into the code-decision domain — everything is lazy
-        and gated behind ``KUMIHO_MEMORY_CODE=1`` so the conversation paths
+        and gated behind ``KUMIHO_MEMORY_DECISIONS=1`` so the conversation paths
         carry zero new imports or behavior when the domain is off.  Code
-        decisions live in a dedicated ``{project}-code`` kumiho project
+        decisions live in a dedicated ``{project}-decisions`` kumiho project
         (physical isolation from conversation recall); see
         ``docs/DECISION_MEMORY_DESIGN.md``.
         """
@@ -2567,7 +2567,7 @@ class UniversalMemoryManager:
         )
 
         if not code_memory_enabled():
-            return {"errors": ["code memory is disabled (set KUMIHO_MEMORY_CODE=1)"]}
+            return {"errors": ["code memory is disabled (set KUMIHO_MEMORY_DECISIONS=1)"]}
         from kumiho_memory.code_capture import capture_decisions
 
         cfg = config_from_env()

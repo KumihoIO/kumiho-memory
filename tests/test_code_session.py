@@ -499,7 +499,7 @@ def test_correlate_sha_path_needs_sanity_floor(monkeypatch, tmp_path):
     _install_fake_kumiho(monkeypatch)
     import kumiho
 
-    project = kumiho.create_project("p-code")
+    project = kumiho.create_project("p-decisions")
     _seed_commit_decision(project, "repo", sha,
                           title="Use a dedicated single-worker executor",
                           decision="run rerank on one dedicated worker executor",
@@ -526,7 +526,7 @@ def test_correlate_anchor_needs_conjunction_and_window(monkeypatch, tmp_path):
     _install_fake_kumiho(monkeypatch)
     import kumiho
 
-    project = kumiho.create_project("p-code")
+    project = kumiho.create_project("p-decisions")
     _seed_commit_decision(project, "repo", sha,
                           title="Use a dedicated single-worker executor",
                           decision="run the CE rerank on a dedicated single-worker executor",
@@ -559,7 +559,7 @@ def test_correlate_multiple_targets_picks_best_single(monkeypatch, tmp_path):
     _install_fake_kumiho(monkeypatch)
     import kumiho
 
-    project = kumiho.create_project("p-code")
+    project = kumiho.create_project("p-decisions")
     _seed_commit_decision(project, "repo", sha,
                           title="Use a dedicated single-worker executor",
                           decision="run the CE rerank on a dedicated single-worker executor",
@@ -621,7 +621,7 @@ def _enrich_payload(quote, sha):
 
 def _mine(repo, adapter, session_id="s1", **kw):
     return asyncio.run(mine_session(
-        session_id, project_name="p-code", repo_path=str(repo),
+        session_id, project_name="p-decisions", repo_path=str(repo),
         config=_cfg(), adapter=adapter, model="stub", **kw,
     ))
 
@@ -631,7 +631,7 @@ def test_enrichment_is_additive_and_idempotent(monkeypatch, tmp_path):
     _install_fake_kumiho(monkeypatch)
     import kumiho
 
-    project = kumiho.create_project("p-code")
+    project = kumiho.create_project("p-decisions")
     target = _seed_commit_decision(
         project, "repo", sha,
         title="Use a dedicated single-worker executor",
@@ -696,7 +696,7 @@ def test_standalone_capture_origin_session(monkeypatch, tmp_path):
 
     import kumiho
 
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     d_item = next(i for (s, k), i in project.items.items()
                   if k == KIND_DECISION)
     rev = d_item.get_latest_revision()
@@ -751,7 +751,7 @@ def test_session_marker_credential_line_uses_redacted_placeholder(
 
     import kumiho
 
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     marker = project.get_item(session_slug("repo", "s1"), KIND_SESSION)
     assert marker.get_latest_revision() is not None
     # The marker embedding_text is EXACTLY the placeholder — proving the
@@ -767,7 +767,7 @@ def test_evidence_dedup_slug_convergence_and_near_dup(monkeypatch, tmp_path):
     _install_fake_kumiho(monkeypatch)
     import kumiho
 
-    project = kumiho.create_project("p-code")
+    project = kumiho.create_project("p-decisions")
     target = _seed_commit_decision(
         project, "repo", sha,
         title="Use a dedicated single-worker executor",
@@ -849,7 +849,7 @@ def test_bridge_and_bridge_only_reconciliation(monkeypatch, tmp_path):
                    conversation_kref=conv_rev.kref.uri)
     assert stats2.skipped_marker and stats2.llm_calls == 0
     assert stats2.bridged == 1
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     d_item = next(i for (s, k), i in project.items.items() if k == KIND_DECISION)
     edges = d_item.get_latest_revision().get_edges(
         edge_type_filter=EDGE_DISCUSSED_IN, direction=0,
@@ -897,7 +897,7 @@ def test_marker_written_last_on_crash(monkeypatch, tmp_path):
     assert stats.errors  # write failed, loudly
     import kumiho
 
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     assert (session_slug("repo", "s1"), KIND_SESSION) not in project.items
 
     # next run retries cleanly and completes
@@ -939,7 +939,7 @@ def test_force_deprecates_only_this_sessions_decisions(monkeypatch, tmp_path):
     _install_fake_kumiho(monkeypatch)
     import kumiho
 
-    project = kumiho.create_project("p-code")
+    project = kumiho.create_project("p-decisions")
     commit_decision = _seed_commit_decision(
         project, "repo", sha,
         title="Use a dedicated single-worker executor",
@@ -986,7 +986,7 @@ def test_no_transcript_is_a_loud_error(monkeypatch, tmp_path):
     repo, _sha = _make_repo(tmp_path)
     _install_fake_kumiho(monkeypatch)
     stats = asyncio.run(mine_session(
-        "s-gone", project_name="p-code", repo_path=str(repo),
+        "s-gone", project_name="p-decisions", repo_path=str(repo),
         config=_cfg(), adapter=_StubAdapter("{}"), model="stub",
         redis_buffer=_StubRedis([]),
     ))
@@ -1001,7 +1001,7 @@ def test_redis_source_loads_messages(monkeypatch, tmp_path):
             _msg("user", "yes, agreed")]
     adapter = _StubAdapter(_payload([]))
     stats = asyncio.run(mine_session(
-        "s1", project_name="p-code", repo_path=str(repo),
+        "s1", project_name="p-decisions", repo_path=str(repo),
         config=_cfg(), adapter=adapter, model="stub",
         redis_buffer=_StubRedis(msgs), memory_project="p",
     ))
@@ -1011,15 +1011,18 @@ def test_redis_source_loads_messages(monkeypatch, tmp_path):
 
 
 def test_gate_off_manager_returns_error(monkeypatch):
+    monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS", raising=False)
+    monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS_AUTOMINE", raising=False)
     monkeypatch.delenv("KUMIHO_MEMORY_CODE", raising=False)
+    monkeypatch.delenv("KUMIHO_MEMORY_CODE_AUTOMINE", raising=False)
     from kumiho_memory.code_decisions import code_automine_enabled, code_memory_enabled
 
     assert not code_memory_enabled()
     assert not code_automine_enabled()
     # AUTOMINE alone must not open the chain (double opt-in)
-    monkeypatch.setenv("KUMIHO_MEMORY_CODE_AUTOMINE", "1")
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_AUTOMINE", "1")
     assert not code_automine_enabled()
-    monkeypatch.setenv("KUMIHO_MEMORY_CODE", "1")
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS", "1")
     assert code_automine_enabled()
 
 
@@ -1184,7 +1187,7 @@ def test_correlate_anchored_dead_zone_regression(monkeypatch, tmp_path):
     _install_fake_kumiho(monkeypatch)
     import kumiho
 
-    project = kumiho.create_project("p-code")
+    project = kumiho.create_project("p-decisions")
     target = _seed_commit_decision(
         project, "repo", sha,
         title="offload fastembed cross-encoder rerank",
@@ -1226,7 +1229,7 @@ def test_correlate_lex_uses_full_prose(monkeypatch, tmp_path):
     _install_fake_kumiho(monkeypatch)
     import kumiho
 
-    project = kumiho.create_project("p-code")
+    project = kumiho.create_project("p-decisions")
     # commit side, styled like the real cfec845 extraction
     from kumiho_memory.code_decisions import commit_slug, decision_slug
 
@@ -1293,7 +1296,7 @@ def test_delta_remine_refreshes_marker_message_count(monkeypatch, tmp_path):
     assert adapter.calls == calls                             # zero new LLM
 
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     marker = project.get_item(session_slug("repo", "s1"), KIND_SESSION)
     assert marker.get_latest_revision().metadata["message_count"] == str(len(grown))
 
@@ -1330,7 +1333,7 @@ def test_force_does_not_self_correlate_anchored_session_decision(monkeypatch, tm
     assert stats2.decisions_created == 1 and stats2.decisions_enriched == 0
 
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     d_item = next(i for (s, k), i in project.items.items()
                   if k == KIND_DECISION and i.get_latest_revision()
                   .metadata.get("origin") == "session")
@@ -1364,7 +1367,7 @@ def test_chunk_structuring_failure_withholds_marker_for_retry(monkeypatch, tmp_p
     assert not stats.skipped_marker
 
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     # no complete marker was written -> the session can be retried
     marker = project.items.get((session_slug("repo", "s1"), KIND_SESSION))
     assert marker is None or marker.get_latest_revision() is None

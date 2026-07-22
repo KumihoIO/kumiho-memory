@@ -13,19 +13,75 @@ from kumiho_memory.code_decisions import code_memory_enabled
 
 
 def test_gate_defaults_off(monkeypatch):
+    monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS", raising=False)
     monkeypatch.delenv("KUMIHO_MEMORY_CODE", raising=False)
     assert code_memory_enabled() is False
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS", "1")
+    assert code_memory_enabled() is True
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS", "true")
+    assert code_memory_enabled() is True  # common truthy spellings accepted
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS", "YES")
+    assert code_memory_enabled() is True
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS", "0")
+    assert code_memory_enabled() is False
+
+
+def test_gate_legacy_env_fallback(monkeypatch):
+    """The env family renamed KUMIHO_MEMORY_CODE* -> KUMIHO_MEMORY_DECISIONS*,
+    but the deprecated gate name is still read as a fallback (the plugin's
+    SKILL.md — a different repo — documents KUMIHO_MEMORY_CODE=1).  New name
+    wins when both are set."""
+    from kumiho_memory.code_decisions import code_automine_enabled
+
+    # Legacy gate alone still activates the feature.
+    monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS", raising=False)
     monkeypatch.setenv("KUMIHO_MEMORY_CODE", "1")
     assert code_memory_enabled() is True
-    monkeypatch.setenv("KUMIHO_MEMORY_CODE", "true")
-    assert code_memory_enabled() is True  # common truthy spellings accepted
-    monkeypatch.setenv("KUMIHO_MEMORY_CODE", "YES")
-    assert code_memory_enabled() is True
-    monkeypatch.setenv("KUMIHO_MEMORY_CODE", "0")
+
+    # New name wins when both are set: new=off overrides legacy=on ...
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS", "0")
     assert code_memory_enabled() is False
+    # ... and new=on overrides legacy=off.
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS", "1")
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE", "0")
+    assert code_memory_enabled() is True
+
+    # The same fallback applies to the AUTOMINE chain gate.
+    monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS_AUTOMINE", raising=False)
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE_AUTOMINE", "1")
+    assert code_automine_enabled() is True  # gate already on above
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_AUTOMINE", "0")
+    assert code_automine_enabled() is False  # new AUTOMINE name wins
+
+
+def test_config_from_env_legacy_fallback(monkeypatch):
+    """config_from_env reads the DECISIONS_* names, falling back to the
+    deprecated CODE_* names; the new name wins when both are set."""
+    from kumiho_memory.code_decisions import config_from_env
+
+    for var in (
+        "KUMIHO_MEMORY_DECISIONS_PROJECT", "KUMIHO_MEMORY_CODE_PROJECT",
+        "KUMIHO_MEMORY_DECISIONS_REPO", "KUMIHO_MEMORY_CODE_REPO",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    # Legacy names alone still populate the config.
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE_PROJECT", "LegacyProj")
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE_REPO", "legacy/repo")
+    cfg = config_from_env()
+    assert cfg.project == "LegacyProj"
+    assert cfg.repo == "legacy/repo"
+
+    # New names win when both are set.
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_PROJECT", "NewProj")
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_REPO", "new/repo")
+    cfg = config_from_env()
+    assert cfg.project == "NewProj"
+    assert cfg.repo == "new/repo"
 
 
 def test_manager_code_why_short_circuits_when_gated_off(monkeypatch):
+    monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS", raising=False)
     monkeypatch.delenv("KUMIHO_MEMORY_CODE", raising=False)
     # The gated-off path must not import the query engine at all.
     monkeypatch.delitem(sys.modules, "kumiho_memory.code_query", raising=False)
@@ -56,12 +112,13 @@ def test_mcp_registration_respects_gate(monkeypatch):
         mt.MEMORY_TOOLS[:] = [t for t in mt.MEMORY_TOOLS if t["name"] != "kumiho_code_why"]
         mt.MEMORY_TOOL_HANDLERS.pop("kumiho_code_why", None)
 
+        monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS", raising=False)
         monkeypatch.delenv("KUMIHO_MEMORY_CODE", raising=False)
         mt._register_code_memory_tools()
         assert all(t["name"] != "kumiho_code_why" for t in mt.MEMORY_TOOLS)
         assert "kumiho_code_why" not in mt.MEMORY_TOOL_HANDLERS
 
-        monkeypatch.setenv("KUMIHO_MEMORY_CODE", "1")
+        monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS", "1")
         mt._register_code_memory_tools()
         assert any(t["name"] == "kumiho_code_why" for t in mt.MEMORY_TOOLS)
         assert "kumiho_code_why" in mt.MEMORY_TOOL_HANDLERS
@@ -142,6 +199,8 @@ def test_consolidation_call_graph_unchanged_until_automine(monkeypatch):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # both gates off — the baseline call graph
+        monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS", raising=False)
+        monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS_AUTOMINE", raising=False)
         monkeypatch.delenv("KUMIHO_MEMORY_CODE", raising=False)
         monkeypatch.delenv("KUMIHO_MEMORY_CODE_AUTOMINE", raising=False)
         base = asyncio.run(_consolidate_once(tmpdir))
@@ -149,7 +208,7 @@ def test_consolidation_call_graph_unchanged_until_automine(monkeypatch):
         assert "kumiho_memory.code_session" not in sys.modules
 
         # master gate on, AUTOMINE off — must be indistinguishable
-        monkeypatch.setenv("KUMIHO_MEMORY_CODE", "1")
+        monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS", "1")
         gated = asyncio.run(_consolidate_once(tmpdir))
         assert not mine_calls
         assert "kumiho_memory.code_session" not in sys.modules
@@ -157,7 +216,7 @@ def test_consolidation_call_graph_unchanged_until_automine(monkeypatch):
         assert gated.get("summary") == base.get("summary")
 
         # double opt-in — the chain fires once, kref + messages in-band
-        monkeypatch.setenv("KUMIHO_MEMORY_CODE_AUTOMINE", "1")
+        monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_AUTOMINE", "1")
         asyncio.run(_consolidate_once(tmpdir))
         assert len(mine_calls) == 1
         _sid, kwargs = mine_calls[0]

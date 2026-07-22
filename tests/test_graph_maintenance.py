@@ -212,7 +212,7 @@ class FakeGraph:
         )
 
 
-def _maintainer(graph, project="Mem", code_project="Mem-code", **kw):
+def _maintainer(graph, project="Mem", code_project="Mem-decisions", **kw):
     return GraphMaintainer(graph.sdk(), project=project, code_project=code_project, **kw)
 
 
@@ -225,9 +225,9 @@ def test_evidence_regrade_lifts_unverified_to_corroborated():
     """A decision stamped 'unverified' at capture that later gained a
     measurement atom is re-graded to 'corroborated' from its CURRENT atoms."""
     g = FakeGraph()
-    dec = g.decision("Mem-code", "Use bge-m3", "switch embedding backend",
+    dec = g.decision("Mem-decisions", "Use bge-m3", "switch embedding backend",
                      evidence_level="unverified")
-    meas = g.evidence("Mem-code", "recall +6pts on LoCoMo", "measurement")
+    meas = g.evidence("Mem-decisions", "recall +6pts on LoCoMo", "measurement")
     g.link(dec, meas, "MOTIVATED_BY")
 
     stats = MaintenanceStats()
@@ -243,10 +243,10 @@ def test_evidence_regrade_idempotent_and_never_downgrades():
     """Already-corroborated stays put (idempotent); a decision whose atoms
     only justify single_source is never downgraded from corroborated."""
     g = FakeGraph()
-    dec = g.decision("Mem-code", "Keep cosine sibling", "hybrid ranking",
+    dec = g.decision("Mem-decisions", "Keep cosine sibling", "hybrid ranking",
                      evidence_level="corroborated")
     # only a constraint atom now (would grade single_source) — must NOT lower
-    g.link(dec, g.evidence("Mem-code", "official reserved for operators", "constraint"),
+    g.link(dec, g.evidence("Mem-decisions", "official reserved for operators", "constraint"),
            "MOTIVATED_BY")
 
     stats = MaintenanceStats()
@@ -258,9 +258,9 @@ def test_evidence_regrade_idempotent_and_never_downgrades():
 
 def test_evidence_regrade_never_touches_official():
     g = FakeGraph()
-    dec = g.decision("Mem-code", "Pin schema", "operator decision",
+    dec = g.decision("Mem-decisions", "Pin schema", "operator decision",
                      evidence_level="official")
-    g.link(dec, g.evidence("Mem-code", "benchmark win", "benchmark"), "MOTIVATED_BY")
+    g.link(dec, g.evidence("Mem-decisions", "benchmark win", "benchmark"), "MOTIVATED_BY")
     stats = MaintenanceStats()
     _maintainer(g).run_keyless(stats)
     assert stats.decisions_regraded == 0
@@ -277,7 +277,7 @@ def test_bridge_by_symbol_slug():
     to that conversation entity (cross-project, deterministic)."""
     g = FakeGraph()
     ent = g.entity("Mem", "config_from_env", entity_type="convention")
-    dec = g.decision("Mem-code", "Resolve toggles via env",
+    dec = g.decision("Mem-decisions", "Resolve toggles via env",
                      "feature toggles read from config_from_env",
                      symbols="config_from_env,resolve_project_name")
     stats = MaintenanceStats()
@@ -291,7 +291,7 @@ def test_bridge_by_name_mention():
     """No symbol match, but the entity's name appears in the decision text."""
     g = FakeGraph()
     ent = g.entity("Mem", "Decision Memory")
-    dec = g.decision("Mem-code", "Isolate code nodes",
+    dec = g.decision("Mem-decisions", "Isolate code nodes",
                      "Decision Memory lives in a separate project", symbols="")
     stats = MaintenanceStats()
     _maintainer(g).run_keyless(stats)
@@ -301,7 +301,7 @@ def test_bridge_by_name_mention():
 def test_bridge_skips_when_no_entity_match():
     g = FakeGraph()
     g.entity("Mem", "Postgres")
-    g.decision("Mem-code", "Add retry", "wrap RPCs in backoff", symbols="_retry")
+    g.decision("Mem-decisions", "Add retry", "wrap RPCs in backoff", symbols="_retry")
     stats = MaintenanceStats()
     _maintainer(g).run_keyless(stats)
     assert stats.bridges_created == 0
@@ -382,10 +382,10 @@ def test_fact_dedup_keeps_distinct_facts():
 
 def test_decision_dedup_sinks_twin_via_supersedes():
     g = FakeGraph()
-    keep = g.decision("Mem-code", "Adopt hybrid retrieval",
+    keep = g.decision("Mem-decisions", "Adopt hybrid retrieval",
                       "combine BM25 and dense retrieval for recall",
                       evidence_level="corroborated")
-    dupe = g.decision("Mem-code", "Adopt hybrid retrieval search",
+    dupe = g.decision("Mem-decisions", "Adopt hybrid retrieval search",
                       "combine BM25 and dense retrieval for recall",
                       evidence_level="unverified")
     stats = MaintenanceStats()
@@ -425,10 +425,10 @@ def test_dry_run_makes_no_mutations():
     g = FakeGraph()
     hub = g.entity("Mem", "PostgreSQL", aliases=["Postgres"])
     dup = g.entity("Mem", "Postgres")
-    dec = g.decision("Mem-code", "Use bge-m3", "switch backend", evidence_level="unverified")
-    g.link(dec, g.evidence("Mem-code", "measured +6", "measurement"), "MOTIVATED_BY")
+    dec = g.decision("Mem-decisions", "Use bge-m3", "switch backend", evidence_level="unverified")
+    g.link(dec, g.evidence("Mem-decisions", "measured +6", "measurement"), "MOTIVATED_BY")
     ent = g.entity("Mem", "config_from_env")
-    g.decision("Mem-code", "env toggles", "read config_from_env", symbols="config_from_env")
+    g.decision("Mem-decisions", "env toggles", "read config_from_env", symbols="config_from_env")
 
     before_edges = len(g.edges)
     stats = MaintenanceStats()
@@ -449,10 +449,10 @@ def test_idempotent_rerun():
     g = FakeGraph()
     hub = g.entity("Mem", "PostgreSQL", aliases=["Postgres"])
     g.entity("Mem", "Postgres")
-    dec = g.decision("Mem-code", "Use bge-m3", "switch backend", evidence_level="unverified")
-    g.link(dec, g.evidence("Mem-code", "measured +6", "measurement"), "MOTIVATED_BY")
+    dec = g.decision("Mem-decisions", "Use bge-m3", "switch backend", evidence_level="unverified")
+    g.link(dec, g.evidence("Mem-decisions", "measured +6", "measurement"), "MOTIVATED_BY")
     ent = g.entity("Mem", "config_from_env")
-    g.decision("Mem-code", "env toggles", "read config_from_env", symbols="config_from_env")
+    g.decision("Mem-decisions", "env toggles", "read config_from_env", symbols="config_from_env")
 
     m1 = _maintainer(g)
     s1 = MaintenanceStats()
@@ -518,7 +518,7 @@ def test_apply_entity_merges_drops_unknown_slugs():
 
 def test_no_code_project_skips_decision_passes():
     g = FakeGraph()
-    g.decision("Mem-code", "orphan decision", "x", evidence_level="unverified")
+    g.decision("Mem-decisions", "orphan decision", "x", evidence_level="unverified")
     stats = MaintenanceStats()
     GraphMaintainer(g.sdk(), project="Mem", code_project=None).run_keyless(stats)
     assert stats.decisions_scanned == 0
@@ -579,9 +579,9 @@ def test_published_orphan_never_pruned():
 
 def test_published_decision_never_sunk():
     g = FakeGraph()
-    g.decision("Mem-code", "Adopt hybrid retrieval",
+    g.decision("Mem-decisions", "Adopt hybrid retrieval",
                "combine BM25 and dense retrieval", evidence_level="corroborated")
-    loser = g.tag(g.decision("Mem-code", "Adopt hybrid retrieval search",
+    loser = g.tag(g.decision("Mem-decisions", "Adopt hybrid retrieval search",
                              "combine BM25 and dense retrieval",
                              evidence_level="unverified"), "published")
     stats = MaintenanceStats()
@@ -594,9 +594,9 @@ def test_regrade_respects_official_tag_without_metadata():
     """Grade set via the evidence:official TAG alone (metadata unset) must
     still block a lift — parse_evidence reads both carriers."""
     g = FakeGraph()
-    dec = g.decision("Mem-code", "Pin schema", "operator call", evidence_level="")
+    dec = g.decision("Mem-decisions", "Pin schema", "operator call", evidence_level="")
     g.tag(dec, "evidence:official")
-    g.link(dec, g.evidence("Mem-code", "benchmark win", "benchmark"), "MOTIVATED_BY")
+    g.link(dec, g.evidence("Mem-decisions", "benchmark win", "benchmark"), "MOTIVATED_BY")
     stats = MaintenanceStats()
     _maintainer(g).run_keyless(stats)
     assert stats.decisions_regraded == 0
@@ -607,9 +607,9 @@ def test_regrade_never_downgrades_tag_only_grade():
     """A tag-only 'corroborated' whose atoms now grade single_source must not
     be lowered."""
     g = FakeGraph()
-    dec = g.decision("Mem-code", "Keep cosine", "hybrid ranking", evidence_level="")
+    dec = g.decision("Mem-decisions", "Keep cosine", "hybrid ranking", evidence_level="")
     g.tag(dec, "evidence:corroborated")
-    g.link(dec, g.evidence("Mem-code", "a stated constraint", "constraint"), "MOTIVATED_BY")
+    g.link(dec, g.evidence("Mem-decisions", "a stated constraint", "constraint"), "MOTIVATED_BY")
     stats = MaintenanceStats()
     _maintainer(g).run_keyless(stats)
     assert stats.decisions_regraded == 0
@@ -617,10 +617,10 @@ def test_regrade_never_downgrades_tag_only_grade():
 
 def test_regrade_untags_stale_lower_grade_on_lift():
     g = FakeGraph()
-    dec = g.decision("Mem-code", "Use bge-m3", "switch backend",
+    dec = g.decision("Mem-decisions", "Use bge-m3", "switch backend",
                      evidence_level="single_source")
     g.tag(dec, "evidence:single_source")
-    g.link(dec, g.evidence("Mem-code", "measured +6", "measurement"), "MOTIVATED_BY")
+    g.link(dec, g.evidence("Mem-decisions", "measured +6", "measurement"), "MOTIVATED_BY")
     stats = MaintenanceStats()
     _maintainer(g).run_keyless(stats)
     assert stats.decisions_regraded == 1
@@ -633,10 +633,10 @@ def test_decision_dedup_idempotent_across_regrade_flip():
     """Correctness-F1: once a decision is sunk, a later evidence lift on it
     must NOT flip the keeper and create a mutual SUPERSEDES cycle."""
     g = FakeGraph()
-    a = g.decision("Mem-code", "Adopt hybrid retrieval",
+    a = g.decision("Mem-decisions", "Adopt hybrid retrieval",
                    "combine BM25 and dense retrieval for recall",
                    evidence_level="unverified")
-    b = g.decision("Mem-code", "Adopt hybrid retrieval search",
+    b = g.decision("Mem-decisions", "Adopt hybrid retrieval search",
                    "combine BM25 and dense retrieval for recall",
                    evidence_level="unverified")
     # Run 1: equal grade → slug tiebreak picks a keeper; the other is sunk.
@@ -647,7 +647,7 @@ def test_decision_dedup_idempotent_across_regrade_flip():
     loser = sunk[0]
 
     # The sunk loser now accrues a measurement atom → regrade lifts it.
-    g.link(loser, g.evidence("Mem-code", "measured +7 on LoCoMo", "measurement"),
+    g.link(loser, g.evidence("Mem-decisions", "measured +7 on LoCoMo", "measurement"),
            "MOTIVATED_BY")
     s2 = MaintenanceStats()
     _maintainer(g).run_keyless(s2)
@@ -678,7 +678,7 @@ def test_bridge_keeps_decision_referenced_orphan():
     bridge edge (prune runs last) and is NOT pruned."""
     g = FakeGraph()
     ent = g.entity("Mem", "widget_factory")   # zero conversation edges
-    dec = g.decision("Mem-code", "Build widgets", "use the widget_factory helper",
+    dec = g.decision("Mem-decisions", "Build widgets", "use the widget_factory helper",
                      symbols="widget_factory")
     stats = MaintenanceStats()
     _maintainer(g).run_keyless(stats)

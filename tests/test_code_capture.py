@@ -501,7 +501,7 @@ def test_ingest_writes_and_is_idempotent(tmp_path, monkeypatch):
 
     stats = asyncio.run(ingest_repo(
         str(repo), None,
-        project_name="p-code", config=cfg, adapter=adapter, model="stub",
+        project_name="p-decisions", config=cfg, adapter=adapter, model="stub",
     ))
     assert stats.errors == []
     assert stats.decisions >= 1
@@ -511,7 +511,7 @@ def test_ingest_writes_and_is_idempotent(tmp_path, monkeypatch):
     assert any(t.startswith("why is the executor single-worker?")
                for t in _FAKE.embedding_texts)
     # markers exist for both commits
-    project = _FAKE.projects["p-code"]
+    project = _FAKE.projects["p-decisions"]
     markers = [i for (s, k), i in project.items.items() if k == "code_commit"]
     assert len(markers) == len(commits)
 
@@ -520,7 +520,7 @@ def test_ingest_writes_and_is_idempotent(tmp_path, monkeypatch):
     decisions_before = stats.decisions
     stats2 = asyncio.run(ingest_repo(
         str(repo), None,
-        project_name="p-code", config=cfg, adapter=adapter, model="stub",
+        project_name="p-decisions", config=cfg, adapter=adapter, model="stub",
     ))
     assert adapter.calls == calls_before
     assert stats2.skipped_marker == len(commits)
@@ -544,11 +544,11 @@ def test_marker_written_last_on_crash(tmp_path, monkeypatch):
     fake.get_client = lambda: _Boom()
 
     stats = asyncio.run(ingest_repo(
-        str(repo), "HEAD~1..HEAD", project_name="p-code",
+        str(repo), "HEAD~1..HEAD", project_name="p-decisions",
         config=cfg, adapter=adapter, model="stub",
     ))
     assert stats.failed_commits  # reported, not swallowed
-    project = _FAKE.projects.get("p-code")
+    project = _FAKE.projects.get("p-decisions")
     markers = [
         i for (s, k), i in (project.items.items() if project else [])
         if k == "code_commit" and i.get_latest_revision() is not None
@@ -559,7 +559,7 @@ def test_marker_written_last_on_crash(tmp_path, monkeypatch):
 def test_ingest_without_adapter_reports_error(tmp_path):
     repo = _make_repo(tmp_path)
     stats = asyncio.run(ingest_repo(
-        str(repo), None, project_name="p-code",
+        str(repo), None, project_name="p-decisions",
         config=CodeMemoryConfig(), adapter=None, model="",
     ))
     assert stats.errors and "adapter" in stats.errors[0]
@@ -596,7 +596,7 @@ def test_prefilter_runs_after_files_loaded(tmp_path, monkeypatch):
     commits = enumerate_commits(str(repo), None, 5)
     adapter = _StubAdapter(_payload_for(commits))
     stats = asyncio.run(ingest_repo(
-        str(repo), None, project_name="p-code",
+        str(repo), None, project_name="p-decisions",
         config=CodeMemoryConfig(repo="r"), adapter=adapter, model="stub",
     ))
     assert stats.skipped_prefilter == 0
@@ -610,7 +610,7 @@ def test_supersede_pass_three_signals_and_inplace_demotion(monkeypatch):
     import kumiho_memory.code_capture as cc
 
     fake = _install_fake_kumiho(monkeypatch)
-    project = fake.create_project("p-code")
+    project = fake.create_project("p-decisions")
     for s in ("decisions", "anchors", "commits", "evidence"):
         project.create_space(s)
 
@@ -669,7 +669,7 @@ def test_supersede_requires_jaccard_confluence(monkeypatch):
     import kumiho_memory.code_capture as cc
 
     fake = _install_fake_kumiho(monkeypatch)
-    project = fake.create_project("p-code")
+    project = fake.create_project("p-decisions")
     old_item = project.create_item("old2", "code_decision")
     old_rev = old_item.create_revision(metadata={
         "title": "Completely unrelated topic",
@@ -706,10 +706,10 @@ def test_rewrite_convergence_no_duplicates(tmp_path, monkeypatch):
 
     commits = enumerate_commits(str(repo), None, 10)
     adapter = _StubAdapter(_payload_for(commits))
-    asyncio.run(ingest_repo(str(repo), None, project_name="p-code",
+    asyncio.run(ingest_repo(str(repo), None, project_name="p-decisions",
                             config=cfg, adapter=adapter, model="stub"))
     decisions_before = len([
-        i for (s, k), i in _FAKE.projects["p-code"].items.items()
+        i for (s, k), i in _FAKE.projects["p-decisions"].items.items()
         if k == "code_decision"
     ])
 
@@ -725,10 +725,10 @@ def test_rewrite_convergence_no_duplicates(tmp_path, monkeypatch):
     commits2 = enumerate_commits(str(repo), None, 10)
     assert commits2[0].hash != commits[0].hash  # sha changed
     adapter2 = _StubAdapter(_payload_for(commits2))
-    asyncio.run(ingest_repo(str(repo), None, project_name="p-code",
+    asyncio.run(ingest_repo(str(repo), None, project_name="p-decisions",
                             config=cfg, adapter=adapter2, model="stub"))
     decisions_after = len([
-        i for (s, k), i in _FAKE.projects["p-code"].items.items()
+        i for (s, k), i in _FAKE.projects["p-decisions"].items.items()
         if k == "code_decision"
     ])
     assert decisions_after == decisions_before  # converged, not duplicated
@@ -754,14 +754,14 @@ def test_force_deprecates_then_rewrites(tmp_path, monkeypatch):
         return True
     _MemRev.set_attribute = set_attribute
 
-    asyncio.run(ingest_repo(str(repo), None, project_name="p-code",
+    asyncio.run(ingest_repo(str(repo), None, project_name="p-decisions",
                             config=cfg, adapter=adapter, model="stub"))
-    project = _FAKE.projects["p-code"]
+    project = _FAKE.projects["p-decisions"]
     dec_items = [i for (s, k), i in project.items.items() if k == "code_decision"]
     revs_before = {i.slug: len(i.revisions) for i in dec_items}
     assert dec_items and all(not i.deprecated for i in dec_items)
 
-    stats = asyncio.run(ingest_repo(str(repo), None, project_name="p-code",
+    stats = asyncio.run(ingest_repo(str(repo), None, project_name="p-decisions",
                                     config=cfg, adapter=adapter, model="stub",
                                     force=True))
     assert stats.deprecated >= 1                     # pre-pass retired old gen
@@ -795,13 +795,13 @@ def test_capture_decisions_is_keyless(tmp_path, monkeypatch):
     # NOTE: no adapter, no model — the whole point
     stats = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert stats.decisions == 1 and not stats.errors
     assert stats.evidence == 1
 
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     d_item = next(i for (s, k), i in project.items.items() if k == "code_decision")
     rev = d_item.get_latest_revision()
     files = set(rev.metadata["files"].split(","))
@@ -815,11 +815,11 @@ def test_capture_decisions_empty_and_bad_ref(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path)
     _install_fake_kumiho(monkeypatch)
     cfg = CodeMemoryConfig(repo="testrepo")
-    s1 = asyncio.run(capture_decisions(str(repo), [], project_name="p-code", config=cfg))
+    s1 = asyncio.run(capture_decisions(str(repo), [], project_name="p-decisions", config=cfg))
     assert s1.errors and "no decisions" in s1.errors[0]
     s2 = asyncio.run(capture_decisions(
         str(repo), [{"title": "x", "decision": "y"}],
-        commit_ref="does-not-exist-ref", project_name="p-code", config=cfg,
+        commit_ref="does-not-exist-ref", project_name="p-decisions", config=cfg,
     ))
     assert s2.errors  # unresolvable ref -> loud error, no write
 
@@ -931,7 +931,7 @@ def test_ingest_anonymizes_packet_before_llm(tmp_path, monkeypatch):
     cfg = CodeMemoryConfig(repo="testrepo")
 
     stats = asyncio.run(ingest_repo(
-        str(repo), "HEAD~1..HEAD", project_name="p-code",
+        str(repo), "HEAD~1..HEAD", project_name="p-decisions",
         config=cfg, adapter=adapter, model="stub",
     ))
     assert adapter.calls >= 1 and adapter.prompts
@@ -963,14 +963,14 @@ def test_ingest_screens_credential_in_commit_message(tmp_path, monkeypatch):
     cfg = CodeMemoryConfig(repo="testrepo")
 
     stats = asyncio.run(ingest_repo(
-        str(repo), None, project_name="p-code",
+        str(repo), None, project_name="p-decisions",
         config=cfg, adapter=adapter, model="stub",
     ))
     assert stats.credentials_dropped >= 1
     assert stats.decisions >= 1  # the clean decision still stored (surgical)
     # the key appears nowhere that leaves for the graph
     assert all(_AWS_KEY not in t for t in _FAKE.embedding_texts)
-    project = _FAKE.projects["p-code"]
+    project = _FAKE.projects["p-decisions"]
     markers = [i for (s, k), i in project.items.items() if k == "code_commit"]
     assert markers
     for m in markers:
@@ -1000,13 +1000,13 @@ def test_ingest_drops_credential_evidence_keeps_clean(tmp_path, monkeypatch):
     cfg = CodeMemoryConfig(repo="testrepo")
 
     stats = asyncio.run(ingest_repo(
-        str(repo), "HEAD~1..HEAD", project_name="p-code",
+        str(repo), "HEAD~1..HEAD", project_name="p-decisions",
         config=cfg, adapter=adapter, model="stub",
     ))
     assert stats.credentials_dropped == 1
     assert stats.evidence == 1     # only the clean atom was written
     assert stats.decisions == 1    # the decision itself survived
-    project = _FAKE.projects["p-code"]
+    project = _FAKE.projects["p-decisions"]
     ev_items = [i for (s, k), i in project.items.items() if k == "code_evidence"]
     statements = [i.get_latest_revision().metadata.get("statement", "")
                   for i in ev_items]
@@ -1037,12 +1037,12 @@ def test_capture_screens_agent_supplied_credential(tmp_path, monkeypatch):
     }]
     stats = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert stats.credentials_dropped == 1
     assert stats.evidence == 1 and stats.decisions == 1
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     ev_items = [i for (s, k), i in project.items.items() if k == "code_evidence"]
     statements = [i.get_latest_revision().metadata.get("statement", "")
                   for i in ev_items]
@@ -1069,12 +1069,12 @@ def test_capture_redacts_pii_in_place_not_dropped(tmp_path, monkeypatch):
     }]
     stats = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert stats.credentials_dropped == 0            # PII is not a credential
     assert stats.decisions == 1 and stats.evidence == 1  # nothing dropped
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     d_item = next(i for (s, k), i in project.items.items() if k == "code_decision")
     dmeta = d_item.get_latest_revision().metadata
     assert "alice@example.com" not in dmeta["decision"]
@@ -1105,12 +1105,12 @@ def test_capture_clean_content_stored_byte_identical(tmp_path, monkeypatch):
     }]
     stats = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert stats.credentials_dropped == 0
     assert stats.decisions == 1 and stats.evidence == 1
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     d_item = next(i for (s, k), i in project.items.items() if k == "code_decision")
     dmeta = d_item.get_latest_revision().metadata
     assert dmeta["decision"] == decision_text
@@ -1139,7 +1139,7 @@ def test_all_evidence_dropped_decision_survives(tmp_path, monkeypatch):
     }]
     stats = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert stats.credentials_dropped == 1
     assert stats.evidence == 0     # the only atom dropped
@@ -1203,12 +1203,12 @@ def test_capture_credential_source_ref_replaced_not_dropped(tmp_path, monkeypatc
     }]
     stats = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert stats.credentials_dropped == 1   # the source_ref content, counted
     assert stats.evidence == 1              # the atom itself survived
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     ev_item = next(i for (s, k), i in project.items.items() if k == "code_evidence")
     emeta = ev_item.get_latest_revision().metadata
     assert emeta["statement"] == clean_text
@@ -1294,21 +1294,32 @@ async def _run_synchronously(fn, *, timeout, label="", on_timeout=None,
 
 
 def test_capture_deadline_env_parsing(monkeypatch):
-    """The overall budget comes from KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE;
-    blanks/garbage/non-positive fall back to the (sub-MCP-timeout) default."""
+    """The overall budget comes from KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE
+    (the deprecated KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE is still honored as a
+    fallback); blanks/garbage/non-positive fall back to the (sub-MCP-timeout)
+    default."""
     import kumiho_memory.code_capture as cc
 
+    monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE", raising=False)
     monkeypatch.delenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", raising=False)
     assert cc._capture_deadline() == cc._CAPTURE_DEADLINE_DEFAULT
     assert cc._CAPTURE_DEADLINE_DEFAULT < 60.0  # comfortably under the MCP timeout
 
-    monkeypatch.setenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", "30")
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE", "30")
     assert cc._capture_deadline() == 30.0
-    monkeypatch.setenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", "12.5")
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE", "12.5")
     assert cc._capture_deadline() == 12.5
     for bad in ("", "   ", "abc", "0", "-5"):
-        monkeypatch.setenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", bad)
+        monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE", bad)
         assert cc._capture_deadline() == cc._CAPTURE_DEADLINE_DEFAULT
+
+    # Legacy fallback: the deprecated CODE name is read only when the new name
+    # is unset, and the new name wins when both are present.
+    monkeypatch.delenv("KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE", raising=False)
+    monkeypatch.setenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", "22")
+    assert cc._capture_deadline() == 22.0
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE", "33")
+    assert cc._capture_deadline() == 33.0  # new name wins over legacy
 
 
 def test_capture_generous_deadline_full_success_unchanged(tmp_path, monkeypatch):
@@ -1317,11 +1328,11 @@ def test_capture_generous_deadline_full_success_unchanged(tmp_path, monkeypatch)
     repo = _make_repo(tmp_path)
     _install_fake_kumiho(monkeypatch)
     cfg = CodeMemoryConfig(repo="testrepo")
-    monkeypatch.setenv("KUMIHO_MEMORY_CODE_CAPTURE_DEADLINE", "600")
+    monkeypatch.setenv("KUMIHO_MEMORY_DECISIONS_CAPTURE_DEADLINE", "600")
 
     stats = asyncio.run(capture_decisions(
         str(repo), _two_distinct_decisions(), commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert stats.partial is False
     assert stats.decisions == 2 and stats.evidence == 2 and not stats.errors
@@ -1330,7 +1341,7 @@ def test_capture_generous_deadline_full_success_unchanged(tmp_path, monkeypatch)
         assert k not in d  # omitted on the non-partial path
 
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     assert len(_count_items(project, "code_decision")) == 2
     assert len(_count_items(project, "code_commit")) == 1  # marker written
 
@@ -1346,12 +1357,12 @@ def test_capture_idempotent_double_run_no_duplicates(tmp_path, monkeypatch):
 
     s1 = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert s1.partial is False and s1.decisions == 2 and not s1.errors
 
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     items_before = {(s, k): len(i.revisions) for (s, k), i in project.items.items()}
     edges_before = len(_FAKE.edges)
     revs_before = len(_FAKE.revs)
@@ -1359,7 +1370,7 @@ def test_capture_idempotent_double_run_no_duplicates(tmp_path, monkeypatch):
     # second run, byte-identical args → converge, add nothing
     s2 = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert s2.decisions == 0 and s2.evidence == 0  # nothing newly written
     assert not s2.errors and s2.partial is False
@@ -1401,7 +1412,7 @@ def test_capture_partial_on_deadline_mid_batch(tmp_path, monkeypatch):
 
     stats = asyncio.run(capture_decisions(
         str(repo), _two_distinct_decisions(), commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
 
     d = stats.as_dict()
@@ -1412,7 +1423,7 @@ def test_capture_partial_on_deadline_mid_batch(tmp_path, monkeypatch):
     assert stats.decisions == 1 and stats.evidence == 1
 
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     dec_items = _count_items(project, "code_decision")
     assert len(dec_items) == 1                       # only decision one landed
     ev_texts = [i.get_latest_revision().metadata["statement"]
@@ -1455,12 +1466,12 @@ def test_capture_partial_then_retry_completes_without_duplicates(tmp_path, monke
     # first pass — deadline truncates after decision one
     s1 = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert s1.partial is True and s1.pending_decisions == ["Decision TWO cache policy"]
 
     import kumiho
-    project = kumiho.get_project("p-code")
+    project = kumiho.get_project("p-decisions")
     assert len(_count_items(project, "code_decision")) == 1
 
     # retry with the SAME args, deadline no longer trips
@@ -1468,7 +1479,7 @@ def test_capture_partial_then_retry_completes_without_duplicates(tmp_path, monke
     state["jump"] = False
     s2 = asyncio.run(capture_decisions(
         str(repo), decisions, commit_ref="HEAD",
-        project_name="p-code", config=cfg,
+        project_name="p-decisions", config=cfg,
     ))
     assert s2.partial is False and not s2.errors
     # decision two written now; decision one converged (no new decision node)

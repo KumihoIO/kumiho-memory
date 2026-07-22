@@ -28,7 +28,7 @@ PII/credential boundary. Credential-bearing atoms are dropped, never stored.
 > See `RELEASE_NOTES.md` for the full version-by-version history — this
 > status block names only the latest release.
 > Earlier highlights: `0.16` Dream State graph maintenance · `0.11-0.13`
-> **Decision Memory** (git-anchored why-layer, `KUMIHO_MEMORY_CODE=1`) ·
+> **Decision Memory** (git-anchored why-layer, `KUMIHO_MEMORY_DECISIONS=1`) ·
 > `0.10.1` moved the cross-encoder rerank off the event
 > loop (pure perf; recall byte-identical) · `0.10.0` made the **write-time
 > ontology** the default — typed decomposition into facts/entities/
@@ -414,7 +414,7 @@ sha-free (`title + author-date`), so rebases and squashes converge instead
 of duplicating — the memory does not rot as history rewrites.
 
 ```bash
-export KUMIHO_MEMORY_CODE=1            # opt-in gate (default off)
+export KUMIHO_MEMORY_DECISIONS=1      # opt-in gate (default off; legacy KUMIHO_MEMORY_CODE still honored)
 kumiho-memory code-ingest . --range HEAD~30..HEAD   # idempotent; re-runs cost zero LLM calls
 ```
 
@@ -437,7 +437,7 @@ Key properties:
   receives a reversed decision as the answer without seeing its
   replacement.
 * **Physical isolation** — code nodes live in a dedicated
-  `{project}-code` kumiho project; conversation recall is untouched by
+  `{project}-decisions` kumiho project; conversation recall is untouched by
   construction (and by test).
 * Design doc: [`docs/DECISION_MEMORY_DESIGN.md`](docs/DECISION_MEMORY_DESIGN.md).
   Live-verified on this repo's own history: *"why is the executor
@@ -448,7 +448,7 @@ Key properties:
 
 ### MCP Tools
 
-13 tool wrappers (15 with `KUMIHO_MEMORY_CODE=1`), auto-discovered by the
+13 tool wrappers (15 with `KUMIHO_MEMORY_DECISIONS=1`), auto-discovered by the
 core `kumiho` MCP server:
 
 | Tool | Description |

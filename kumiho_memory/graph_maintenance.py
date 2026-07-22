@@ -7,7 +7,7 @@ Dream State never touched (issue #59):
 * the conversation **ontology** — ``entity`` / ``fact`` nodes and their
   ``ABOUT`` / ``DERIVED_FROM`` / typed-relation edges (``ontology.py``);
 * the **Decision Memory** graph — ``code_decision`` / ``code_evidence``
-  nodes in the dedicated ``{project}-code`` project (``code_decisions.py``).
+  nodes in the dedicated ``{project}-decisions`` project (``code_decisions.py``).
 
 Two passes, by the hard keyless constraint (the plugin path must NEVER use
 an external LLM key):

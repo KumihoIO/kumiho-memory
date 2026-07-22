@@ -11,7 +11,7 @@ No LLM key.
 """
 import asyncio, os, sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-os.environ["KUMIHO_MEMORY_CODE"] = "1"
+os.environ["KUMIHO_MEMORY_DECISIONS"] = "1"
 
 import kumiho
 from kumiho_memory.code_capture import capture_decisions

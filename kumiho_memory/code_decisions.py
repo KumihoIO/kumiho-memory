@@ -9,7 +9,7 @@ truth for *what*, the graph holds the *why*.
 
 Design (docs/DECISION_MEMORY_DESIGN.md, issue #43):
 
-* **Physical isolation.**  Code nodes live in a dedicated ``{project}-code``
+* **Physical isolation.**  Code nodes live in a dedicated ``{project}-decisions``
   kumiho project.  Typed embeddings sharing the conversation project's vector
   index measurably crowded out conversation recall (the ON-gate blocker
   incident); a separate project makes "conversation paths untouched" true by
@@ -23,7 +23,8 @@ Design (docs/DECISION_MEMORY_DESIGN.md, issue #43):
   and ``code_query`` (read side) both import from here — the two sides can
   never drift on identity rules.
 
-Everything is opt-in behind ``KUMIHO_MEMORY_CODE=1``; nothing here is
+Everything is opt-in behind ``KUMIHO_MEMORY_DECISIONS=1`` (the deprecated
+``KUMIHO_MEMORY_CODE`` is still read as a fallback); nothing here is
 imported by the conversation recall/consolidation paths.
 """
 
@@ -82,7 +83,7 @@ EVIDENCE_KINDS = (
 class CodeMemoryConfig:
     """Configuration for the code-decision domain.
 
-    ``project`` defaults to ``{memory_project}-code`` — derived at wiring
+    ``project`` defaults to ``{memory_project}-decisions`` — derived at wiring
     time by :func:`resolve_project_name`, kept empty here so the dataclass
     carries no hidden global state.
     """
@@ -170,59 +171,113 @@ class CodeMemoryConfig:
     session_remine_message_delta: int = 10
 
 
+#: The Decision Memory env family was renamed ``KUMIHO_MEMORY_CODE*`` ->
+#: ``KUMIHO_MEMORY_DECISIONS*`` (product-name alignment).  The legacy names are
+#: still read as a deprecated fallback because the master gate is documented in
+#: the kumiho-memory plugin's SKILL.md (a *different* repo) as
+#: ``KUMIHO_MEMORY_CODE=1`` — hard-renaming would silently stop activating the
+#: feature for anyone following that doc.  One warning per legacy name.
+_warned_legacy_envs: set = set()
+_warned_legacy_guard = threading.Lock()
+
+
+def _warn_legacy_env(legacy_name: str, new_name: str) -> None:
+    """Emit a one-time deprecation warning for a legacy env var name."""
+    with _warned_legacy_guard:
+        if legacy_name in _warned_legacy_envs:
+            return
+        _warned_legacy_envs.add(legacy_name)
+    logger.warning(
+        "%s is deprecated and will be removed; use %s instead. Reading the "
+        "legacy value for now.",
+        legacy_name, new_name,
+    )
+
+
+def _env_with_legacy(new_name: str, legacy_name: str) -> str:
+    """Read *new_name*, falling back to the deprecated *legacy_name*.
+
+    The new name always wins when set (even to an empty string); only when it
+    is entirely unset is the legacy CODE name consulted, and using it triggers
+    a one-time :func:`_warn_legacy_env`.  Returns the raw string ("" when
+    neither is set), so callers keep their own ``.strip()``/casefold contract.
+    """
+    val = os.getenv(new_name)
+    if val is not None:
+        return val
+    legacy = os.getenv(legacy_name)
+    if legacy is not None:
+        _warn_legacy_env(legacy_name, new_name)
+        return legacy
+    return ""
+
+
 def config_from_env(base: Optional[CodeMemoryConfig] = None) -> CodeMemoryConfig:
-    """Overlay ``KUMIHO_MEMORY_CODE_*`` env vars onto *base* (or defaults)."""
+    """Overlay ``KUMIHO_MEMORY_DECISIONS_*`` env vars onto *base* (or defaults).
+
+    The legacy ``KUMIHO_MEMORY_CODE_*`` names are honored as a deprecated
+    fallback (see :func:`_env_with_legacy`).
+    """
     cfg = base or CodeMemoryConfig()
-    project = os.getenv("KUMIHO_MEMORY_CODE_PROJECT", "").strip()
+    project = _env_with_legacy(
+        "KUMIHO_MEMORY_DECISIONS_PROJECT", "KUMIHO_MEMORY_CODE_PROJECT",
+    ).strip()
     if project:
         cfg.project = project
-    repo = os.getenv("KUMIHO_MEMORY_CODE_REPO", "").strip()
+    repo = _env_with_legacy(
+        "KUMIHO_MEMORY_DECISIONS_REPO", "KUMIHO_MEMORY_CODE_REPO",
+    ).strip()
     if repo:
         cfg.repo = repo
     return cfg
 
 
 def code_memory_enabled() -> bool:
-    """The opt-in gate: ``KUMIHO_MEMORY_CODE=1|true|yes|on`` (default off).
+    """The opt-in gate: ``KUMIHO_MEMORY_DECISIONS=1|true|yes|on`` (default off).
 
-    Read at call time by the manager delegation, but the MCP tool registry
-    reads it once at import — long-lived MCP servers must restart to pick up
-    a gate change (documented behavior, mirrors the other env-gated wiring).
+    The deprecated ``KUMIHO_MEMORY_CODE`` is read as a fallback when the new
+    name is unset (see :func:`_env_with_legacy`).  Read at call time by the
+    manager delegation, but the MCP tool registry reads it once at import —
+    long-lived MCP servers must restart to pick up a gate change (documented
+    behavior, mirrors the other env-gated wiring).
     """
-    return os.getenv("KUMIHO_MEMORY_CODE", "").strip().casefold() in (
+    return _env_with_legacy(
+        "KUMIHO_MEMORY_DECISIONS", "KUMIHO_MEMORY_CODE",
+    ).strip().casefold() in (
         "1", "true", "yes", "on",
     )
 
 
 def code_automine_enabled() -> bool:
     """Double opt-in for the consolidation chain (§2.2c): the master gate
-    AND ``KUMIHO_MEMORY_CODE_AUTOMINE`` must both be on.  Chaining an LLM
-    pass onto consolidation latency is an explicit consent matter."""
-    return code_memory_enabled() and os.getenv(
-        "KUMIHO_MEMORY_CODE_AUTOMINE", "",
+    AND ``KUMIHO_MEMORY_DECISIONS_AUTOMINE`` must both be on.  Chaining an LLM
+    pass onto consolidation latency is an explicit consent matter.  The
+    deprecated ``KUMIHO_MEMORY_CODE_AUTOMINE`` is read as a fallback."""
+    return code_memory_enabled() and _env_with_legacy(
+        "KUMIHO_MEMORY_DECISIONS_AUTOMINE", "KUMIHO_MEMORY_CODE_AUTOMINE",
     ).strip().casefold() in ("1", "true", "yes", "on")
 
 
 def resolve_project_name(memory_project: str, config: CodeMemoryConfig) -> str:
-    """Dedicated code project name: explicit config wins, else ``{project}-code``.
+    """Dedicated decisions project name: explicit config wins, else ``{project}-decisions``.
 
     Guard: the whole isolation story rests on code nodes living in a
     *different* project than conversation memory (the measured
     vector-crowding incident class).  An explicit override equal to the
     conversation project would silently defeat that, so it is corrected to
-    ``{project}-code`` with a warning instead of being honored.
+    ``{project}-decisions`` with a warning instead of being honored.
     """
     if config.project:
         if memory_project and config.project == memory_project:
             logger.warning(
-                "KUMIHO_MEMORY_CODE_PROJECT=%r equals the conversation "
+                "KUMIHO_MEMORY_DECISIONS_PROJECT=%r equals the conversation "
                 "memory project — physical isolation requires a separate "
                 "project; using %r instead.",
-                config.project, f"{memory_project}-code",
+                config.project, f"{memory_project}-decisions",
             )
-            return f"{memory_project}-code"
+            return f"{memory_project}-decisions"
         return config.project
-    return f"{memory_project}-code"
+    return f"{memory_project}-decisions"
 
 
 def parse_decided_at(value: Any) -> Optional[datetime]:
