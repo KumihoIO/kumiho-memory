@@ -525,7 +525,7 @@ kumiho-memory is the client-side implementation of the memory architecture
 formalized in:
 
 > **Graph-Native Cognitive Memory for AI Agents: Formal Belief Revision
-> Semantics for Versioned Memory Architectures** — Young Bin Park.
+> Semantics for Versioned Memory Architectures** — Kumiho Inc.
 > arXiv:2603.17244 (2026), cs.AI. <https://arxiv.org/abs/2603.17244>
 
 The paper proves a correspondence between the AGM belief-revision framework and
@@ -538,9 +538,9 @@ Cognitive Memory graph.
 If you use kumiho-memory in academic work, please cite:
 
 ```bibtex
-@misc{park2026kumiho,
+@misc{kumiho2026graphnative,
   title         = {Graph-Native Cognitive Memory for AI Agents: Formal Belief Revision Semantics for Versioned Memory Architectures},
-  author        = {Park, Young Bin},
+  author        = {{Kumiho Inc.}},
   year          = {2026},
   eprint        = {2603.17244},
   archivePrefix = {arXiv},
