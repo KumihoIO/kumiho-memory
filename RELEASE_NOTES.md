@@ -1,5 +1,36 @@
 # Release Notes — kumiho-memory
 
+## v1.0.0
+
+**Release Date:** 2026-07-22
+
+**First stable release.** `kumiho-memory` now lives in its own repository
+(<https://github.com/KumihoIO/kumiho-memory>) and follows semantic versioning:
+the documented public API is stable, and breaking changes will bump the major
+version. New capabilities continue to ship flag-gated and default-OFF, so
+upgrades within the 1.x line stay drop-in. It remains an optional runtime
+add-on to the `kumiho` SDK, auto-discovered when installed alongside it
+(`pip install kumiho kumiho-memory`).
+
+Changes since `0.20.0`:
+
+- **Pre-LLM privacy boundary hardened (#138, #139)** — conversation messages
+  are now PII/credential-screened *before* they reach the LLM, and credential
+  screening runs at span level across all three write legs (session mining,
+  commit mining, skill ingestion). Credential-bearing spans are dropped —
+  never sent to the model and never stored.
+- **Cross-project decompose targeting (#136)** — keyless `decompose` can now
+  target a project other than the caller's default, wiring cross-project
+  `DERIVED_FROM` / `ABOUT` provenance so a memory extracted in one project can
+  be filed against another while keeping its lineage.
+- **Fact-dedup asymmetry guard (#135)** — Dream State's embedding-assisted
+  fact dedup (G6) no longer collapses candidates that differ by negation or a
+  mismatched weekday; near-duplicates with opposite meaning stay distinct.
+- **Decision Memory surface renamed to `decisions` (#143)** — the storage and
+  config surface for the git-anchored why-layer is aligned to the `decisions`
+  name. The legacy `KUMIHO_MEMORY_CODE_*` env vars are still honored as a
+  deprecated fallback (one-time warning), so no action is required on upgrade.
+
 ## v0.20.0
 
 **Release Date:** 2026-07-19
