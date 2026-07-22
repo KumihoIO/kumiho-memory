@@ -1,0 +1,51 @@
+# CI: verify kumiho-memory builds, packages cleanly, and imports across the
+# supported Python versions. Packaging breakage is caught before you ever tag.
+#
+# This does NOT run the full pytest suite (some tests are live/provider-gated).
+# Run those locally with: pip install -e .[dev] && pytest
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build / package / import (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Check package metadata
+        run: twine check dist/*
+
+      - name: Install the built wheel
+        run: pip install dist/*.whl
+
+      - name: Import smoke test
+        run: |
+          python -c "import kumiho_memory; print('kumiho-memory', kumiho_memory.__version__)"
