@@ -165,6 +165,83 @@ class RedisMemoryBuffer:
             return f"{self.MEMORY_PREFIX}:{tenant_prefix}:session_seq:{user_canonical_id}:{date_str}"
         return f"{self.MEMORY_PREFIX}:session_seq:{user_canonical_id}:{date_str}"
 
+    def _session_generation_key(self, base_session_id: str) -> str:
+        tenant_prefix = self.tenant_id or self.tenant_hint
+        if tenant_prefix:
+            return f"{self.MEMORY_PREFIX}:{tenant_prefix}:session_gen:{base_session_id}"
+        return f"{self.MEMORY_PREFIX}:session_gen:{base_session_id}"
+
+    async def get_session_generation(self, base_session_id: str) -> int:
+        """The consolidation generation of a host-session id (0 = never).
+
+        The host env id is stable for a whole conversation, so consolidation
+        cannot rotate it the way generated ids rotate — without a generation
+        suffix the tool path resolves the consolidated, cleared bucket again
+        and a second consolidation overwrites the first conversation's
+        artifact (PR #4 review, round 5). The counter lives in Redis rather
+        than in-process so sibling server processes derive the SAME rotated
+        id and a server restart cannot silently reset the generation.
+        """
+        if self.client is None:
+            try:
+                response = await self._proxy_request(
+                    action="get_session_generation",
+                    payload={"base_session_id": base_session_id},
+                )
+            except Exception:
+                # An older proxy server does not know this action; degrade
+                # to generation 0 (the base id) — the pre-existing
+                # behaviour, same precedent as only_if/nx (round 6).
+                return 0
+            try:
+                return int(response.get("generation", 0)) if isinstance(response, dict) else 0
+            except (TypeError, ValueError):
+                return 0
+
+        key = self._session_generation_key(base_session_id)
+        value = await self.client.get(key)
+        try:
+            generation = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return 0
+        if generation:
+            # SLIDING TTL: bump-only expiry meant a conversation that stayed
+            # on one env id for >24h after its last consolidation regressed
+            # to the base '{env}' id — the consolidated, cleared bucket, and
+            # the artifact-overwrite target the generation exists to protect
+            # (round 6). Refreshing on read keeps the counter alive for as
+            # long as the conversation is.
+            await self.client.expire(key, 86400)
+        return generation
+
+    async def bump_session_generation(
+        self, base_session_id: str, *, ttl_seconds: int = 86400
+    ) -> int:
+        """Advance the consolidation generation (see get_session_generation)."""
+        if self.client is None:
+            try:
+                response = await self._proxy_request(
+                    action="bump_session_generation",
+                    payload={
+                        "base_session_id": base_session_id,
+                        "ttl_seconds": ttl_seconds,
+                    },
+                )
+            except Exception:
+                # Older proxy server: rotation silently unavailable on
+                # hosted until the server learns the action — documented
+                # degradation, same precedent as only_if/nx (round 6).
+                return 1
+            try:
+                return int(response.get("generation", 1)) if isinstance(response, dict) else 1
+            except (TypeError, ValueError):
+                return 1
+
+        key = self._session_generation_key(base_session_id)
+        value = await self.client.incr(key)
+        await self.client.expire(key, ttl_seconds)
+        return int(value)
+
     MAX_MESSAGE_SIZE = 64 * 1024  # 64 KiB per message
 
     async def add_message(
@@ -189,7 +266,7 @@ class RedisMemoryBuffer:
             )
 
         if self.client is None:
-            return await self._proxy_request(
+            result = await self._proxy_request(
                 action="add_message",
                 payload={
                     "project": project,
@@ -200,6 +277,12 @@ class RedisMemoryBuffer:
                     "default_ttl": self.default_ttl,
                 },
             )
+            # An older proxy server returns its payload without the mint
+            # flag; derive it from message_count so hosted mode carries the
+            # same drift signal as the local path (PR #4 review, round 4).
+            if isinstance(result, dict) and "created_bucket" not in result:
+                result["created_bucket"] = result.get("message_count") == 1
+            return result
 
         key = self._session_messages_key(project, session_id)
         message = {
@@ -209,14 +292,23 @@ class RedisMemoryBuffer:
             "metadata": metadata or {},
         }
 
-        await self.client.rpush(key, json.dumps(message))
+        # RPUSH atomically returns the post-push length. A separate LLEN read
+        # raced concurrent writers: two first-writers could both observe
+        # count 2 and NEITHER report created_bucket (PR #4 review, round 3).
+        count = await self.client.rpush(key, json.dumps(message))
         await self.client.expire(key, self.default_ttl)
-        count = await self.client.llen(key)
 
         return {
             "success": True,
             "message_id": f"{session_id}:{count}",
             "message_count": count,
+            # A write that MINTS a bucket is the one observable trace of a
+            # caller addressing a session that did not exist — a drifted or
+            # mistyped session_id lands here looking exactly like a first
+            # message (issue #3). Surfacing it lets the caller notice; a read
+            # of a wrong id returns a clean empty indistinguishable from a
+            # new session, so the write is where the signal has to live.
+            "created_bucket": count == 1,
         }
 
     async def get_messages(
@@ -333,11 +425,17 @@ class RedisMemoryBuffer:
 
         session_ids: List[str] = []
         for key in keys[:limit]:
+            # The session component is everything between the 'sessions'
+            # segment and the trailing ':messages'. It has to be a join, not
+            # parts[idx + 1]: the ids this system MINTS contain three colons
+            # ('{context}:user-{hash}:{date}:{seq}'), so taking one segment
+            # truncated every generated id and this listing could never
+            # round-trip the system's own sessions (issue #3).
             parts = key.split(":")
             if "sessions" in parts:
                 idx = parts.index("sessions")
-                if len(parts) > idx + 1:
-                    session_ids.append(parts[idx + 1])
+                if len(parts) > idx + 2:
+                    session_ids.append(":".join(parts[idx + 1:-1]))
 
         return {"sessions": session_ids, "total_sessions": len(keys)}
 
@@ -395,38 +493,97 @@ class RedisMemoryBuffer:
         user_canonical_id: str,
         session_id: str,
         ttl_seconds: int = 86400,
-    ) -> None:
-        """Persist the active session_id for a user/context (default TTL 24 h)."""
+        nx: bool = False,
+    ) -> Optional[bool]:
+        """Persist the active session_id for a user/context (default TTL 24 h).
+
+        With ``nx=True`` this is a compare-and-claim: the pointer is written
+        only if absent, and the return value says whether THIS caller won.
+        A blind SET was last-writer-wins — two concurrent resolutions that
+        both missed the pointer each minted an id and both registered it,
+        and everything written under the loser became unreachable to every
+        later default-resolved call (PR #4 review, round 3).
+        """
         if self.client is None:
-            await self._proxy_request(
+            response = await self._proxy_request(
                 action="set_active_session",
                 payload={
                     "context": context,
                     "user_canonical_id": user_canonical_id,
                     "session_id": session_id,
                     "ttl_seconds": ttl_seconds,
+                    # Older proxy servers ignore unknown fields and perform
+                    # the plain SET — the pre-existing behaviour.
+                    "nx": nx,
                 },
             )
-            return
+            if nx:
+                claimed = response.get("claimed") if isinstance(response, dict) else None
+                return True if claimed is None else bool(claimed)
+            return None
 
         key = self._active_session_key(context, user_canonical_id)
+        if nx:
+            result = await self.client.set(key, session_id, ex=ttl_seconds, nx=True)
+            return bool(result)
         await self.client.set(key, session_id, ex=ttl_seconds)
+        return None
 
     async def clear_active_session(
         self,
         *,
         context: str,
         user_canonical_id: str,
+        only_if: Optional[str] = None,
     ) -> None:
-        """Delete the active session pointer (called after consolidation)."""
+        """Delete the active session pointer (called after consolidation).
+
+        ``only_if`` makes the delete conditional on the pointer still holding
+        that session_id. Without it this was a plain DELETE: consolidating ANY
+        session for a (context, user) — a backfill id, a historical fragment —
+        severed the LIVE conversation's continuity pointer, so its next
+        default-resolved call minted a fresh session mid-conversation
+        (issue #3). Pass the id you consolidated; the live pointer survives
+        unless it is the one you actually closed out.
+
+        The get/compare/delete pair is not atomic; the race window (another
+        writer moving the pointer between the read and the delete) loses a
+        pointer that was being replaced anyway, which is the pre-existing
+        behaviour, never worse.
+        """
         if self.client is None:
+            if only_if is not None:
+                # The compare must happen CLIENT-side here: an older proxy
+                # server ignores unknown payload fields, so forwarding
+                # only_if alone silently restored the unconditional delete on
+                # hosted deployments while the local path was fixed (PR #4
+                # review, round 2). get_active_session is a main-era proxy
+                # action every server implements.
+                current = await self.get_active_session(
+                    context=context, user_canonical_id=user_canonical_id,
+                )
+                if current != only_if:
+                    return
             await self._proxy_request(
                 action="clear_active_session",
-                payload={"context": context, "user_canonical_id": user_canonical_id},
+                payload={
+                    "context": context,
+                    "user_canonical_id": user_canonical_id,
+                    # Newer servers may enforce this atomically as well.
+                    "only_if": only_if,
+                },
             )
             return
 
         key = self._active_session_key(context, user_canonical_id)
+        if only_if is not None:
+            current = await self.client.get(key)
+            if current != only_if:
+                # Covers BOTH a pointer holding another session AND an
+                # absent pointer (None): with nothing to clear, issuing the
+                # DELETE anyway could only destroy a pointer some concurrent
+                # resolver set between this read and the delete.
+                return
         await self.client.delete(key)
 
     async def close(self) -> None:

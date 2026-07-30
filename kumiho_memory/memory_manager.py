@@ -12,6 +12,7 @@ import mimetypes
 import os
 import re
 import shutil
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,6 +43,34 @@ RetrieveCallable = Callable[..., Any]
 # Redis flake must not silently fork a new session, so each call is retried
 # once before falling back to a fresh sequence (see _generate_session_id).
 _SESSION_REDIS_RETRY_BACKOFF = 0.05
+
+# The env var that carries the HOST's session identity into this process.
+# KUMIHO_SESSION_ID is an explicit CONTRACT: whoever sets it promises the
+# value names THIS server process's conversation for the process's lifetime
+# — which makes rotation correctness the setter's responsibility, where the
+# knowledge lives (kumiho-plugins#45).
+#
+# CLAUDE_CODE_SESSION_ID was deliberately REMOVED from this list (PR #4
+# review, round 8). It reaches server processes by env inheritance — an
+# accident, not a promise — frozen at spawn, and Claude Code rotates its
+# session on /clear WITHOUT respawning the server: trusting it silently
+# merged the post-/clear conversation into the previous one's bucket. This
+# resolver refuses exactly that class of silent merge for every other
+# population; honoring an accidental frozen var for the CLI population was
+# the one inconsistency left. The plugin launcher may still set
+# KUMIHO_SESSION_ID FROM Claude's variable — by doing so it owns the
+# staleness and can fix it with the live channel it already has (the
+# SessionStart hook receives the rotated id on /clear).
+_SESSION_ENV_VARS = ("KUMIHO_SESSION_ID",)
+
+
+def _host_session_env() -> Optional[str]:
+    """The host-supplied session id, or None. Read per call, not cached."""
+    for var in _SESSION_ENV_VARS:
+        value = os.getenv(var, "").strip()
+        if value:
+            return value
+    return None
 
 # Payload fields that identify *what* is being stored, used to key the failure
 # ledger (#118).  Volatile fields (artifact paths, session ids, timestamps) are
@@ -730,6 +759,14 @@ class UniversalMemoryManager:
         return {
             "success": True,
             "message_count": result["message_count"],
+            # True when this write MINTED the bucket. An assistant response
+            # normally lands in a session that already holds the user's turns;
+            # a fresh bucket here means the caller addressed a session that
+            # did not exist — the drifted-id case issue #3 calls silent. The
+            # flag is how it stops being silent.
+            "created_bucket": result.get(
+                "created_bucket", result.get("message_count") == 1
+            ),
         }
 
     async def _background_assess(self, session_id: str) -> None:
@@ -1476,17 +1513,98 @@ class UniversalMemoryManager:
                             "code session mining failed (non-fatal): %s", exc,
                         )
 
+        # The host-env id: the env value itself cannot rotate, so bump
+        # BEFORE the buffer clear (round 8): a sibling resolving in the
+        # window then derives the NEXT generation and its write lands in
+        # a surviving bucket, instead of the just-cleared one where it
+        # would be stranded until TTL with no future consolidation ever
+        # addressing it. The bump itself cannot rotate the wrong thing —
+        # the exact current-generation comparison below still holds.
+        # its Redis generation counter when the session just consolidated IS
+        # the CURRENT env-derived id — the next resolve then lands on
+        # "{env}:c{n+1}" on every sibling server alike (round 5). Exact
+        # comparison against the current generation, not a prefix match: a
+        # backfill consolidation of an OLD generation ("{env}:c1" while the
+        # live conversation sits on "{env}:c2") must not rotate the live
+        # session — the same protection only_if gives the pointer.
+        env_session = _host_session_env()
+        if env_session and hasattr(self.redis_buffer, "bump_session_generation"):
+            # One retry, then a WARNING — never silent (round 7): an
+            # unrotated generation after a flake means identity-less
+            # resolves keep reusing the just-consolidated bucket, and the
+            # next consolidation overwrites this one's artifact. Debug-only
+            # logging hid exactly that exposure.
+            for attempt in range(2):
+                try:
+                    generation = 0
+                    if hasattr(self.redis_buffer, "get_session_generation"):
+                        generation = await self.redis_buffer.get_session_generation(
+                            env_session
+                        ) or 0
+                    current_env_id = (
+                        env_session if not generation
+                        else f"{env_session}:c{generation}"
+                    )
+                    if session_id == current_env_id:
+                        await self.redis_buffer.bump_session_generation(env_session)
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        await asyncio.sleep(_SESSION_REDIS_RETRY_BACKOFF)
+                        continue
+                    logger.warning(
+                        "bump_session_generation failed after retry (%s); env "
+                        "session %s was NOT rotated — identity-less resolves "
+                        "will reuse the consolidated bucket until the next "
+                        "successful consolidation.",
+                        exc, env_session,
+                    )
+
         await self.redis_buffer.clear_session(self.project, session_id)
 
-        # Clear the active session pointer so the next conversation starts fresh.
-        if session_user_id and session_context and hasattr(self.redis_buffer, "clear_active_session"):
-            try:
-                await self.redis_buffer.clear_active_session(
-                    context=session_context,
-                    user_canonical_id=session_user_id,
-                )
-            except Exception as exc:
-                logger.debug("clear_active_session failed: %s", exc)
+        # Clear the active session pointer so the next conversation starts
+        # fresh — but ONLY if it still points at the session just consolidated.
+        # Unconditional, this severed the live conversation's continuity when
+        # a backfill or historical id was consolidated for the same
+        # (context, user): the pointer aimed at the CURRENT session was
+        # deleted, and the next default-resolved call minted a fresh bucket
+        # mid-conversation (issue #3).
+        #
+        # BOTH key pairs, because a session's pointer key and its metadata
+        # identity can disagree: the MCP tool path registers pointers under
+        # ("mcp", "default") while ingest stamps user_id/context metadata
+        # onto the same session — a clear keyed only off metadata targeted
+        # ('personal', alice) while the live pointer sat at the default key,
+        # so rotation silently failed for every ingest-created session
+        # (PR #4 review, round 2). only_if keeps the extra clear
+        # collateral-free: a pointer holding some other session is untouched.
+        if hasattr(self.redis_buffer, "clear_active_session"):
+            key_pairs = [(session_context or "mcp", session_user_id or "default")]
+            if key_pairs[0] != ("mcp", "default"):
+                key_pairs.append(("mcp", "default"))
+            for clear_context, clear_user in key_pairs:
+                try:
+                    await self.redis_buffer.clear_active_session(
+                        context=clear_context,
+                        user_canonical_id=clear_user,
+                        only_if=session_id,
+                    )
+                except TypeError:
+                    # An older redis_buffer implementation without only_if:
+                    # keep the pre-existing behaviour — unconditional, and
+                    # only for sessions whose identity is actually known.
+                    if session_user_id and session_context:
+                        try:
+                            await self.redis_buffer.clear_active_session(
+                                context=session_context,
+                                user_canonical_id=session_user_id,
+                            )
+                        except Exception as exc:
+                            logger.debug("clear_active_session failed: %s", exc)
+                    break
+                except Exception as exc:
+                    logger.debug("clear_active_session failed: %s", exc)
+
 
         return {
             "success": True,
@@ -2682,6 +2800,15 @@ class UniversalMemoryManager:
         ctx = self._code_memory_context()
         if ctx is None:
             return {"errors": [self._CODE_MEMORY_DISABLED]}
+        if not session_id:
+            # Before the ingest_first pre-pass, not after: an empty id used to
+            # run a full commit-ingest (LLM calls, graph writes) and then
+            # soft-fail inside mine_session — money spent on a call that was
+            # never going to mine anything (PR #4 review).
+            return {"errors": [
+                "session_id is required: pass it explicitly or set "
+                "KUMIHO_SESSION_ID",
+            ]}
         from kumiho_memory.code_session import mine_session
 
         cfg, project_name, adapter, model = ctx
@@ -3449,10 +3576,74 @@ class UniversalMemoryManager:
         await self.redis_buffer.close()
 
     async def _generate_session_id(self, user_canonical_id: str, context: str) -> str:
+        session_id, _source = await self.resolve_session_id(
+            user_id=user_canonical_id, context=context,
+        )
+        return session_id
+
+    async def resolve_session_id(
+        self,
+        user_id: Optional[str] = None,
+        context: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Resolve the session identity for a caller that did not name one.
+
+        Returns ``(session_id, source)``; source is ``host-env``,
+        ``active-pointer`` or ``generated``. ONE resolver for every
+        defaulting path on purpose (issue #3): ingest already defaulted
+        through the active-session pointer while chat/reflect required an
+        explicit id, so giving the tools a default of their own would have
+        split an id-omitting caller's conversation across two buckets by
+        construction. Identity-less callers (user_id is None) resolve to the
+        host session; user-scoped callers resolve per (context, user)
+        through the shared pointer.
+
+        Raises ``ValueError`` when NO identity exists (no user_id and no
+        host env): every silent default tried for that population was a
+        cross-conversation merge in disguise — the shared pointer merged
+        env-less conversations across processes (round 4), and a
+        process-scoped id merged every chat on hosts that keep one server
+        across conversations, which is exactly the env-less Desktop
+        topology (round 6). The error instructs the caller to pass an
+        explicit id and reuse it; host-side identity delivery is
+        kumiho-plugins#45.
+
+        Order, and why:
+
+        1. **Host env** (``KUMIHO_SESSION_ID``, the explicit contract)
+           — ONLY for identity-less callers (``user_id is None``, the MCP tool
+           default path). Claude Code leaks its session uuid into spawned MCP
+           server envs (measured live); when present it is the truest identity
+           available and it survives server restarts within one conversation.
+           Skipped for user-scoped callers, because the env names the HOST
+           conversation, not a user: applied to ``ingest(user_id=...)`` it
+           collapsed every user and context on the process into one bucket —
+           cross-user working-memory exposure, and consolidation misfiled
+           under whichever user wrote first (PR #4 review, blocker).
+           This tier never touches the active-session pointer. The write it
+           used to do assumed a sibling server without the env var serves the
+           same conversation; measured, siblings share spawn context and ALL
+           carry the env — the env-less processes belong to DIFFERENT
+           (Desktop-app) conversations, so the write was not convergence, it
+           was one conversation clobbering another's live pointer.
+        2. **Active-session pointer** (Redis, 24 h TTL, shared across
+           processes and restarts) — ingest's pre-existing continuity
+           mechanism, reused rather than reinvented.
+        3. **Generated** ``{context}:user-{hash}:{date}:{seq}`` — the
+           pre-existing format, pointer-registered so followers reuse it.
+
+        Beyond the no-identity ValueError above, never raises; Redis
+        failures degrade exactly as before (WARNING log, sequence falls
+        back to 1).
+        """
         # A single Redis flake must not silently fork a new session: each call
         # is retried once with a short backoff, and if it still fails we log at
         # WARNING (never silent) before falling back. This never raises — the
-        # no-raise guarantee callers rely on is preserved.
+        # no-raise guarantee callers rely on is preserved. Defined before the
+        # tiers so the ENV tier's generation read follows the same discipline
+        # as the user tier's pointer ops (PR #4 review, round 7: a bare
+        # swallow here resolved the base id mid-conversation on a single
+        # flake, with no log at any level).
         async def _redis_retry(op_name, coro_factory, default):
             for attempt in range(2):
                 try:
@@ -3462,14 +3653,62 @@ class UniversalMemoryManager:
                         await asyncio.sleep(_SESSION_REDIS_RETRY_BACKOFF)
                         continue
                     logger.warning(
-                        "_generate_session_id: Redis %s failed after retry (%s); "
+                        "resolve_session_id: Redis %s failed after retry (%s); "
                         "falling back — session continuity may be affected.",
                         op_name, exc,
                     )
                     return default
             return default
 
+        if user_id is None:
+            env_session = _host_session_env()
+            if env_session:
+                # The env value is stable for the whole host conversation,
+                # so consolidation rotates a Redis-persisted GENERATION of
+                # it instead (base id at generation 0, "{id}:c{n}" after).
+                # Without rotation the tool path resolved the consolidated,
+                # cleared bucket forever and a second consolidation
+                # overwrote the first conversation's artifact. The counter
+                # is shared so sibling servers derive the SAME rotated id
+                # and a restart cannot reset it — an in-process generation
+                # would split siblings and revive cleared buckets
+                # (PR #4 review, round 5).
+                generation = 0
+                if hasattr(self.redis_buffer, "get_session_generation"):
+                    generation = await _redis_retry(
+                        "get_session_generation",
+                        lambda: self.redis_buffer.get_session_generation(
+                            env_session
+                        ),
+                        0,
+                    ) or 0
+                if generation:
+                    return f"{env_session}:c{generation}", "host-env"
+                return env_session, "host-env"
+            # No host identity and no user identity: REFUSE, loudly. Every
+            # silent default tried here was a cross-conversation merge in
+            # disguise. The shared ("mcp","default") pointer merged every
+            # env-less conversation on one Redis (round 4); the process-
+            # scoped id that replaced it merged every chat on hosts that
+            # keep ONE server across conversations — Claude Desktop launches
+            # stdio servers once per app run, which is exactly the env-less
+            # population (round 6). With no per-conversation signal there is
+            # nothing correct to default to; a loud instruction beats a
+            # silent bleed, and the created_bucket flag makes an explicit
+            # id's drift visible. Host-side identity delivery is
+            # kumiho-plugins#45.
+            raise ValueError(
+                "no session identity available: no session_id argument, no "
+                "user_id, and no KUMIHO_SESSION_ID "
+                "in the environment. Pass session_id explicitly and REUSE "
+                "the same value for this conversation."
+            )
+
+        user_canonical_id = user_id
+        context = context or "mcp"
+
         # Reuse the active session when one exists (persists across restarts within a day).
+        active = None
         if hasattr(self.redis_buffer, "get_active_session"):
             active = await _redis_retry(
                 "get_active_session",
@@ -3479,8 +3718,8 @@ class UniversalMemoryManager:
                 ),
                 None,
             )
-            if active:
-                return active
+        if active:
+            return active, "active-pointer"
 
         user_hash = hashlib.sha256(user_canonical_id.encode()).hexdigest()[:10]
         date = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -3498,19 +3737,62 @@ class UniversalMemoryManager:
 
         new_session_id = f"{context}:user-{user_hash}:{date}:{sequence:03d}"
 
-        # Persist as the active session so follow-up restarts reuse it until consolidated.
+        # Persist as the active session so follow-up restarts reuse it until
+        # consolidated — as a compare-and-CLAIM, adopting the winner on loss.
+        # A blind SET was last-writer-wins: two concurrent resolutions that
+        # both missed the pointer each minted an id and each registered it,
+        # forking the conversation and orphaning everything written under the
+        # losing id (PR #4 review, round 3). The loser's burned sequence
+        # number is harmless — ids stay unique.
         if hasattr(self.redis_buffer, "set_active_session"):
+            async def _claim():
+                try:
+                    return await self.redis_buffer.set_active_session(
+                        context=context,
+                        user_canonical_id=user_canonical_id,
+                        session_id=new_session_id,
+                        nx=True,
+                    )
+                except TypeError:
+                    # Older buffer without nx: the pre-existing blind write.
+                    await self.redis_buffer.set_active_session(
+                        context=context,
+                        user_canonical_id=user_canonical_id,
+                        session_id=new_session_id,
+                    )
+                    return True
+
+            claimed = await _redis_retry("set_active_session", _claim, None)
+            if claimed is False:
+                winner = await _redis_retry(
+                    "get_active_session",
+                    lambda: self.redis_buffer.get_active_session(
+                        context=context,
+                        user_canonical_id=user_canonical_id,
+                    ),
+                    None,
+                )
+                if winner:
+                    return winner, "active-pointer"
+
+        # Stamp identity metadata AT THE MINT: consolidation derives the
+        # storage space from it, and only ingest's first-message path used
+        # to write it — a session minted by any other identity-scoped call
+        # (add_response with user_id, etc.) consolidated into a topic-hint
+        # space instead of the user's own (PR #4 review, round 5). Ingest's
+        # own later write is a harmless redundant merge.
+        if hasattr(self.redis_buffer, "set_session_metadata"):
             await _redis_retry(
-                "set_active_session",
-                lambda: self.redis_buffer.set_active_session(
-                    context=context,
-                    user_canonical_id=user_canonical_id,
-                    session_id=new_session_id,
+                "set_session_metadata",
+                lambda: self.redis_buffer.set_session_metadata(
+                    self.project,
+                    new_session_id,
+                    {"user_id": user_canonical_id, "context": context},
                 ),
                 None,
             )
 
-        return new_session_id
+        return new_session_id, "generated"
 
 
 def get_memory_space(

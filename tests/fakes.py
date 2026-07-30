@@ -7,7 +7,12 @@ class FakeRedis:
         self.ttl_store = {}
 
     async def rpush(self, key, value):
-        self.storage.setdefault(key, []).append(value)
+        # Real RPUSH returns the post-push list length. The fake used to
+        # return None, which hid that add_message's created_bucket must come
+        # from this atomic return rather than a racy follow-up LLEN.
+        items = self.storage.setdefault(key, [])
+        items.append(value)
+        return len(items)
 
     async def expire(self, key, ttl):
         self.ttl_store[key] = int(ttl)
