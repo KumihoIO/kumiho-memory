@@ -217,6 +217,13 @@ class RedisMemoryBuffer:
             "success": True,
             "message_id": f"{session_id}:{count}",
             "message_count": count,
+            # A write that MINTS a bucket is the one observable trace of a
+            # caller addressing a session that did not exist — a drifted or
+            # mistyped session_id lands here looking exactly like a first
+            # message (issue #3). Surfacing it lets the caller notice; a read
+            # of a wrong id returns a clean empty indistinguishable from a
+            # new session, so the write is where the signal has to live.
+            "created_bucket": count == 1,
         }
 
     async def get_messages(
@@ -333,11 +340,17 @@ class RedisMemoryBuffer:
 
         session_ids: List[str] = []
         for key in keys[:limit]:
+            # The session component is everything between the 'sessions'
+            # segment and the trailing ':messages'. It has to be a join, not
+            # parts[idx + 1]: the ids this system MINTS contain three colons
+            # ('{context}:user-{hash}:{date}:{seq}'), so taking one segment
+            # truncated every generated id and this listing could never
+            # round-trip the system's own sessions (issue #3).
             parts = key.split(":")
             if "sessions" in parts:
                 idx = parts.index("sessions")
-                if len(parts) > idx + 1:
-                    session_ids.append(parts[idx + 1])
+                if len(parts) > idx + 2:
+                    session_ids.append(":".join(parts[idx + 1:-1]))
 
         return {"sessions": session_ids, "total_sessions": len(keys)}
 
@@ -417,16 +430,41 @@ class RedisMemoryBuffer:
         *,
         context: str,
         user_canonical_id: str,
+        only_if: Optional[str] = None,
     ) -> None:
-        """Delete the active session pointer (called after consolidation)."""
+        """Delete the active session pointer (called after consolidation).
+
+        ``only_if`` makes the delete conditional on the pointer still holding
+        that session_id. Without it this was a plain DELETE: consolidating ANY
+        session for a (context, user) — a backfill id, a historical fragment —
+        severed the LIVE conversation's continuity pointer, so its next
+        default-resolved call minted a fresh session mid-conversation
+        (issue #3). Pass the id you consolidated; the live pointer survives
+        unless it is the one you actually closed out.
+
+        The get/compare/delete pair is not atomic; the race window (another
+        writer moving the pointer between the read and the delete) loses a
+        pointer that was being replaced anyway, which is the pre-existing
+        behaviour, never worse.
+        """
         if self.client is None:
             await self._proxy_request(
                 action="clear_active_session",
-                payload={"context": context, "user_canonical_id": user_canonical_id},
+                payload={
+                    "context": context,
+                    "user_canonical_id": user_canonical_id,
+                    # Older proxies ignore unknown fields, so hosted mode
+                    # degrades to the unconditional delete it already had.
+                    "only_if": only_if,
+                },
             )
             return
 
         key = self._active_session_key(context, user_canonical_id)
+        if only_if is not None:
+            current = await self.client.get(key)
+            if current is not None and current != only_if:
+                return
         await self.client.delete(key)
 
     async def close(self) -> None:

@@ -43,6 +43,23 @@ RetrieveCallable = Callable[..., Any]
 # once before falling back to a fresh sequence (see _generate_session_id).
 _SESSION_REDIS_RETRY_BACKOFF = 0.05
 
+# Env vars that can carry the HOST's session identity into this process, in
+# precedence order. KUMIHO_SESSION_ID is the explicit contract (a host or
+# launcher that wants to name the session sets it); CLAUDE_CODE_SESSION_ID is
+# Claude Code's own variable, observed inherited by MCP server processes on
+# the CLI launch path (and absent on the Desktop local-agent path — callers
+# must not assume it). See MemoryManager.resolve_session_id.
+_SESSION_ENV_VARS = ("KUMIHO_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
+
+
+def _host_session_env() -> Optional[str]:
+    """The host-supplied session id, or None. Read per call, not cached."""
+    for var in _SESSION_ENV_VARS:
+        value = os.getenv(var, "").strip()
+        if value:
+            return value
+    return None
+
 # Payload fields that identify *what* is being stored, used to key the failure
 # ledger (#118).  Volatile fields (artifact paths, session ids, timestamps) are
 # excluded so the same content maps to the same key across runs.
@@ -730,6 +747,14 @@ class UniversalMemoryManager:
         return {
             "success": True,
             "message_count": result["message_count"],
+            # True when this write MINTED the bucket. An assistant response
+            # normally lands in a session that already holds the user's turns;
+            # a fresh bucket here means the caller addressed a session that
+            # did not exist — the drifted-id case issue #3 calls silent. The
+            # flag is how it stops being silent.
+            "created_bucket": result.get(
+                "created_bucket", result.get("message_count") == 1
+            ),
         }
 
     async def _background_assess(self, session_id: str) -> None:
@@ -1478,13 +1503,30 @@ class UniversalMemoryManager:
 
         await self.redis_buffer.clear_session(self.project, session_id)
 
-        # Clear the active session pointer so the next conversation starts fresh.
+        # Clear the active session pointer so the next conversation starts
+        # fresh — but ONLY if it still points at the session just consolidated.
+        # Unconditional, this severed the live conversation's continuity when
+        # a backfill or historical id was consolidated for the same
+        # (context, user): the pointer aimed at the CURRENT session was
+        # deleted, and the next default-resolved call minted a fresh bucket
+        # mid-conversation (issue #3).
         if session_user_id and session_context and hasattr(self.redis_buffer, "clear_active_session"):
             try:
                 await self.redis_buffer.clear_active_session(
                     context=session_context,
                     user_canonical_id=session_user_id,
+                    only_if=session_id,
                 )
+            except TypeError:
+                # An older redis_buffer implementation without only_if:
+                # keep the pre-existing (unconditional) behaviour.
+                try:
+                    await self.redis_buffer.clear_active_session(
+                        context=session_context,
+                        user_canonical_id=session_user_id,
+                    )
+                except Exception as exc:
+                    logger.debug("clear_active_session failed: %s", exc)
             except Exception as exc:
                 logger.debug("clear_active_session failed: %s", exc)
 
@@ -3449,6 +3491,49 @@ class UniversalMemoryManager:
         await self.redis_buffer.close()
 
     async def _generate_session_id(self, user_canonical_id: str, context: str) -> str:
+        session_id, _source = await self.resolve_session_id(
+            user_id=user_canonical_id, context=context,
+        )
+        return session_id
+
+    async def resolve_session_id(
+        self,
+        user_id: Optional[str] = None,
+        context: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Resolve the session identity for a caller that did not name one.
+
+        Returns ``(session_id, source)``; source is ``host-env``,
+        ``active-pointer`` or ``generated``. ONE resolver for every defaulting
+        path on purpose (issue #3): ingest already defaulted through the
+        active-session pointer while chat/reflect required an explicit id, so
+        giving the tools a default of their own would have split an
+        id-omitting caller's conversation across two buckets by construction.
+
+        Order, and why:
+
+        1. **Host env** (``KUMIHO_SESSION_ID``, else ``CLAUDE_CODE_SESSION_ID``).
+           Claude Code's CLI path leaks its session uuid into spawned MCP
+           server envs (measured live); when present it is the truest identity
+           available — it survives server restarts within one conversation,
+           where a process-scoped id would mint a fresh bucket per restart
+           against a 1-hour buffer TTL. The resolved id is also WRITTEN to the
+           active-session pointer: two server processes can serve one
+           conversation on the same Redis and only one inherits the env var,
+           so the pointer is how the env-less sibling converges on the same
+           bucket instead of defaulting differently.
+        2. **Active-session pointer** (Redis, 24 h TTL, shared across
+           processes and restarts) — ingest's pre-existing continuity
+           mechanism, reused rather than reinvented.
+        3. **Generated** ``{context}:user-{hash}:{date}:{seq}`` — the
+           pre-existing format, pointer-registered so followers reuse it.
+
+        Never raises; Redis failures degrade exactly as before (WARNING log,
+        sequence falls back to 1).
+        """
+        user_canonical_id = user_id or "default"
+        context = context or "mcp"
+
         # A single Redis flake must not silently fork a new session: each call
         # is retried once with a short backoff, and if it still fails we log at
         # WARNING (never silent) before falling back. This never raises — the
@@ -3462,14 +3547,14 @@ class UniversalMemoryManager:
                         await asyncio.sleep(_SESSION_REDIS_RETRY_BACKOFF)
                         continue
                     logger.warning(
-                        "_generate_session_id: Redis %s failed after retry (%s); "
+                        "resolve_session_id: Redis %s failed after retry (%s); "
                         "falling back — session continuity may be affected.",
                         op_name, exc,
                     )
                     return default
             return default
 
-        # Reuse the active session when one exists (persists across restarts within a day).
+        active = None
         if hasattr(self.redis_buffer, "get_active_session"):
             active = await _redis_retry(
                 "get_active_session",
@@ -3479,8 +3564,24 @@ class UniversalMemoryManager:
                 ),
                 None,
             )
-            if active:
-                return active
+
+        env_session = _host_session_env()
+        if env_session:
+            if active != env_session and hasattr(self.redis_buffer, "set_active_session"):
+                await _redis_retry(
+                    "set_active_session",
+                    lambda: self.redis_buffer.set_active_session(
+                        context=context,
+                        user_canonical_id=user_canonical_id,
+                        session_id=env_session,
+                    ),
+                    None,
+                )
+            return env_session, "host-env"
+
+        # Reuse the active session when one exists (persists across restarts within a day).
+        if active:
+            return active, "active-pointer"
 
         user_hash = hashlib.sha256(user_canonical_id.encode()).hexdigest()[:10]
         date = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -3510,7 +3611,7 @@ class UniversalMemoryManager:
                 None,
             )
 
-        return new_session_id
+        return new_session_id, "generated"
 
 
 def get_memory_space(

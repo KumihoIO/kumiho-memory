@@ -1691,10 +1691,11 @@ def test_generate_session_id_retries_then_warns_on_redis_flake(caplog):
     assert buffer.calls["next_session_sequence"] == 2
     assert buffer.calls["set_active_session"] == 2
 
-    # The fallback is logged loudly, not silent.
+    # The fallback is logged loudly, not silent. (_generate_session_id now
+    # delegates to resolve_session_id, which is the name the warning carries.)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     messages = [r.getMessage() for r in warnings]
-    assert any("_generate_session_id" in m for m in messages)
+    assert any("resolve_session_id" in m for m in messages)
     assert any("get_active_session" in m for m in messages)
 
 

@@ -25,7 +25,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,20 @@ def earns_edge_discovery(capture_type: Optional[str]) -> bool:
     nothing — could not be caught by anything.
     """
     return capture_type in EDGE_DISCOVERY_TYPES
+
+
+# One sentence, shared by every session-scoped tool description, because the
+# TOOL description is the only prose channel that reliably reaches a caller
+# (see the transport notes above MEMORY_TYPES). The caller is an LLM: asking
+# it to originate and hold a stable opaque id across turns is exactly what it
+# gets wrong, and a drifted id used to fragment the conversation buffer
+# silently (issue #3). Omission is now the RECOMMENDED calling convention.
+_SESSION_DEFAULT_NOTE = (
+    " session_id is OPTIONAL and best omitted: it defaults to the host "
+    "session (KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID) or the shared "
+    "active-session pointer, and the result reports the session_id used "
+    "plus its session_id_source."
+)
 
 # ---------------------------------------------------------------------------
 # Lazy singleton manager
@@ -358,41 +372,74 @@ def _filter_by_min_score(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_session(args: Dict[str, Any], manager) -> "Tuple[str, str]":
+    """The session identity for this call, and where it came from.
+
+    An explicit argument always wins (backfill and bulk ingest genuinely
+    address historical sessions). Omitted, the id resolves server-side —
+    host env, then the shared active-session pointer, then generated (see
+    MemoryManager.resolve_session_id). The caller is an LLM; requiring it to
+    originate and hold a stable opaque id across turns is what fragmented
+    conversation buffers silently (issue #3), so omission is the recommended
+    path and every result reports which id was actually used.
+    """
+    explicit = str(args.get("session_id") or "").strip()
+    if explicit:
+        return explicit, "argument"
+    return asyncio.run(manager.resolve_session_id())
+
+
+def _annotate_session(
+    result: Dict[str, Any], session_id: str, source: str
+) -> Dict[str, Any]:
+    """Stamp the resolved identity onto a tool result, never silently."""
+    if isinstance(result, dict):
+        result["session_id"] = session_id
+        result["session_id_source"] = source
+    return result
+
+
 def tool_chat_add(args: Dict[str, Any]) -> Dict[str, Any]:
     """Add a message to Redis working memory."""
     manager = _get_manager()
-    return asyncio.run(
+    session_id, source = _resolve_session(args, manager)
+    result = asyncio.run(
         manager.redis_buffer.add_message(
             project=args.get("project", manager.project),
-            session_id=args["session_id"],
+            session_id=session_id,
             role=args.get("role", "user"),
             content=args["message"],
             metadata=args.get("metadata"),
         )
     )
+    return _annotate_session(result, session_id, source)
 
 
 def tool_chat_get(args: Dict[str, Any]) -> Dict[str, Any]:
     """Get messages from Redis working memory."""
     manager = _get_manager()
-    return asyncio.run(
+    session_id, source = _resolve_session(args, manager)
+    result = asyncio.run(
         manager.redis_buffer.get_messages(
             project=args.get("project", manager.project),
-            session_id=args["session_id"],
+            session_id=session_id,
             limit=args.get("limit", 50),
         )
     )
+    return _annotate_session(result, session_id, source)
 
 
 def tool_chat_clear(args: Dict[str, Any]) -> Dict[str, Any]:
     """Clear a session's working memory."""
     manager = _get_manager()
-    return asyncio.run(
+    session_id, source = _resolve_session(args, manager)
+    result = asyncio.run(
         manager.redis_buffer.clear_session(
             args.get("project", manager.project),
-            args["session_id"],
+            session_id,
         )
     )
+    return _annotate_session(result, session_id, source)
 
 
 def tool_memory_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -415,24 +462,28 @@ def tool_memory_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
 def tool_memory_add_response(args: Dict[str, Any]) -> Dict[str, Any]:
     """Add an assistant response to the session buffer."""
     manager = _get_manager()
-    return asyncio.run(
+    session_id, source = _resolve_session(args, manager)
+    result = asyncio.run(
         manager.add_assistant_response(
-            session_id=args["session_id"],
+            session_id=session_id,
             response=args["response"],
         )
     )
+    return _annotate_session(result, session_id, source)
 
 
 def tool_memory_consolidate(args: Dict[str, Any]) -> Dict[str, Any]:
     """Consolidate a session — summarize, redact PII, store to graph."""
     manager = _get_manager()
-    return asyncio.run(
+    session_id, source = _resolve_session(args, manager)
+    result = asyncio.run(
         manager.consolidate_session(
-            session_id=args["session_id"],
+            session_id=session_id,
             evidence_level=args.get("evidence_level"),
             source=args.get("source"),
         )
     )
+    return _annotate_session(result, session_id, source)
 
 
 # ---------------------------------------------------------------------------
@@ -696,7 +747,7 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
     LLM is needed for fact extraction.
     """
     manager = _get_manager()
-    session_id = args["session_id"]
+    session_id, session_source = _resolve_session(args, manager)
     response = args["response"]
 
     # 1. Buffer response
@@ -828,12 +879,17 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
         "captures_stored": len(stored_krefs),
         "edges_discovered": edges_total,
         "stored_krefs": stored_krefs,
+        # A response buffered into a bucket this write MINTED means the id
+        # did not match any live conversation — the silent-drift signature
+        # (issue #3). Surfaced so the caller can react instead of trusting
+        # a success that filed the turn somewhere nobody will read.
+        "created_bucket": buf_result.get("created_bucket", False),
     }
     if capture_results is not None:
         result["capture_results"] = capture_results
     if dropped_event_dates:
         result["dropped_event_dates"] = dropped_event_dates
-    return result
+    return _annotate_session(result, session_id, session_source)
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +903,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Add a user or assistant message to Redis working memory for a "
             "conversation session. Returns the current message count."
+            + _SESSION_DEFAULT_NOTE
         ),
         "inputSchema": {
             "type": "object",
@@ -870,7 +927,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "description": "Message role.",
                 },
             },
-            "required": ["session_id", "message"],
+            "required": ["message"],
         },
     },
     {
@@ -878,6 +935,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Retrieve recent messages from Redis working memory for a "
             "session. Returns messages, count, and TTL."
+            + _SESSION_DEFAULT_NOTE
         ),
         "inputSchema": {
             "type": "object",
@@ -896,12 +954,14 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "description": "Max messages to return.",
                 },
             },
-            "required": ["session_id"],
         },
     },
     {
         "name": "kumiho_chat_clear",
-        "description": "Clear all working memory for a conversation session.",
+        "description": (
+            "Clear all working memory for a conversation session."
+            + _SESSION_DEFAULT_NOTE
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -914,7 +974,6 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "description": "Session identifier.",
                 },
             },
-            "required": ["session_id"],
         },
     },
     # ── Memory lifecycle (orchestrated) ───────────────────────
@@ -986,6 +1045,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Add an assistant response to the session buffer in Redis "
             "working memory. Call this after generating your response."
+            + _SESSION_DEFAULT_NOTE
         ),
         "inputSchema": {
             "type": "object",
@@ -999,7 +1059,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "description": "Assistant response text.",
                 },
             },
-            "required": ["session_id", "response"],
+            "required": ["response"],
         },
     },
     {
@@ -1009,6 +1069,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
             "Summarizes the conversation with an LLM, redacts PII, writes "
             "a local artifact, and stores the summary to the Kumiho graph. "
             "The session's working memory is cleared after consolidation."
+            + _SESSION_DEFAULT_NOTE
         ),
         "inputSchema": {
             "type": "object",
@@ -1035,7 +1096,6 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     ),
                 },
             },
-            "required": ["session_id"],
         },
     },
     {
@@ -1313,8 +1373,9 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
             # top-level properties, so a caller reading the schema alone sees
             # `captures` completely undocumented. The tool description does
             # survive, so the non-negotiable parts live here too.
-            "REQUIRES session_id and response. Each capture in `captures` "
+            "REQUIRES response. Each capture in `captures` "
             "requires type, title and content."
+            + _SESSION_DEFAULT_NOTE
         ),
         "inputSchema": {
             "type": "object",
@@ -1422,7 +1483,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     ),
                 },
             },
-            "required": ["session_id", "response"],
+            "required": ["response"],
         },
     },
     # ── Maintenance ───────────────────────────────────────────
@@ -1633,9 +1694,14 @@ def tool_code_capture(args: Dict[str, Any]) -> Dict[str, Any]:
 def tool_code_mine_session(args: Dict[str, Any]) -> Dict[str, Any]:
     """Mine an agent session's conversation into the code-decision graph."""
     manager = _get_manager()
+    # This session_id names a HOST transcript, not a working-memory bucket:
+    # default from the host env only. The active-session pointer holds bucket
+    # ids from a different namespace and would always be wrong here.
+    from kumiho_memory.memory_manager import _host_session_env
+
     return asyncio.run(
         manager.code_mine_session(
-            args.get("session_id", ""),
+            args.get("session_id") or _host_session_env() or "",
             conversation_kref=args.get("conversation_kref", ""),
             repo_path=args.get("repo_path", "."),
             ingest_first=args.get("ingest_first", True),
@@ -1793,7 +1859,9 @@ _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
             "enrich commit-mined decisions with conversation-only "
             "alternatives/measurements, capture decisions that never "
             "reached a commit, and bridge decisions to the consolidated "
-            "conversation."
+            "conversation. session_id (a HOST transcript id) is optional — "
+            "omitted, it defaults to the current host session "
+            "(KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID)."
         ),
         "inputSchema": {
             "type": "object",
@@ -1829,7 +1897,9 @@ _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "description": "Re-mine a session that already carries a marker.",
                 },
             },
-            "required": ["session_id"],
+            # session_id here names a HOST transcript to mine, so it defaults
+            # from the host env only (never the active-session pointer, which
+            # holds a working-memory bucket id, a different namespace).
         },
     },
 ]
