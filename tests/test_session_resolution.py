@@ -237,22 +237,50 @@ def test_env_matching_pointer_does_not_rewrite_it(monkeypatch):
     assert buffer.set_calls == []
 
 
-def test_the_pointer_is_reused_when_no_env_is_present():
-    """This is ingest's pre-existing continuity mechanism — the redesign
-    routes the tools through it rather than inventing a second default that
-    would split the conversation by construction."""
-    buffer = _PointerBuffer(active="mcp:user-abcdef1234:20260730:003")
-    session_id, source = asyncio.run(_manager(buffer).resolve_session_id())
-    assert session_id == "mcp:user-abcdef1234:20260730:003"
+def test_identity_less_env_less_resolution_is_process_scoped():
+    """No host identity and no user identity: the id is process-scoped and
+    the shared pointer is never touched. Routing this path through the
+    single ('mcp','default') pointer merged every env-less conversation on
+    one Redis into one bucket and let a fresh conversation silently resume
+    the previous one for the pointer's 24 h TTL (round 4). One stdio server
+    serves one conversation, so the process is the truest identity here."""
+    buffer = _PointerBuffer(active="somebody-elses-live-session")
+    manager = _manager(buffer)
+    first, source = asyncio.run(manager.resolve_session_id())
+    second, _ = asyncio.run(manager.resolve_session_id())
+
+    assert source == "process"
+    assert first.startswith("mcp:proc-")
+    assert second == first                     # stable within the process
+    assert buffer.set_calls == []              # the pointer was never written
+    assert buffer.active == "somebody-elses-live-session"
+
+    # A second manager (modelling another server process on the same Redis)
+    # gets its OWN conversation id — no cross-conversation merge.
+    other, _ = asyncio.run(_manager(_PointerBuffer()).resolve_session_id())
+    assert other != first
+
+
+def test_user_scoped_resolution_reuses_the_pointer():
+    """The (context, user) pointer is ingest's pre-existing continuity
+    mechanism, and it stays: user identity is a real cross-process key,
+    unlike the identity-less default (round 4)."""
+    buffer = _PointerBuffer(active="personal:user-abcdef1234:20260730:003")
+    session_id, source = asyncio.run(
+        _manager(buffer).resolve_session_id(user_id="alice", context="personal")
+    )
+    assert session_id == "personal:user-abcdef1234:20260730:003"
     assert source == "active-pointer"
     assert buffer.set_calls == []
 
 
-def test_generated_as_the_last_resort_and_registered_on_the_pointer():
+def test_user_scoped_generation_registers_the_pointer():
     buffer = _PointerBuffer(active=None)
-    session_id, source = asyncio.run(_manager(buffer).resolve_session_id())
+    session_id, source = asyncio.run(
+        _manager(buffer).resolve_session_id(user_id="alice", context="personal")
+    )
     assert source == "generated"
-    assert session_id.startswith("mcp:user-")
+    assert session_id.startswith("personal:user-")
     assert session_id.endswith(":007")  # the fake sequence
     assert buffer.set_calls == [session_id]
 
@@ -285,8 +313,12 @@ def test_losing_a_concurrent_pointer_claim_adopts_the_winner():
 
     buffer = _RacyBuffer()
     manager = _manager(buffer)
-    first, first_source = asyncio.run(manager.resolve_session_id())
-    second, second_source = asyncio.run(manager.resolve_session_id())
+    first, first_source = asyncio.run(
+        manager.resolve_session_id(user_id="alice", context="personal")
+    )
+    second, second_source = asyncio.run(
+        manager.resolve_session_id(user_id="alice", context="personal")
+    )
 
     assert first_source == "generated"
     assert (second, second_source) == (first, "active-pointer")
@@ -353,9 +385,59 @@ def test_the_ingest_description_tells_the_truth_about_its_default():
     assert "per-user" in prop
     assert "KUMIHO_SESSION_ID" not in prop
 
-    # And the identity-less tools now state the convergence exception.
+    # And the identity-less tools state the STRUCTURAL convergence rule —
+    # repeat the semantic user_id, not an opaque uuid — and advertise the
+    # identity properties that make it work.
     for name in SESSION_SCOPED_TOOLS:
-        assert "kumiho_memory_ingest was called" in by_name[name]["description"], name
+        assert "same user_id" in by_name[name]["description"], name
+        props = by_name[name]["inputSchema"]["properties"]
+        assert "user_id" in props and "context" in props, name
+
+
+def test_repeating_the_ingest_user_id_converges_on_the_same_bucket(monkeypatch):
+    """The round-4 gap: convergence between ingest and the identity-less
+    tools relied on prose asking the LLM to echo an opaque session uuid —
+    the exact burden issue #3 says LLM callers get wrong. The identity
+    properties make it structural: the caller repeats the same user_id it
+    gave ingest, and resolution lands on the identical (context, user)
+    session — even with a host env present."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "host-uuid-1")
+    buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+    with patch.object(mcp_tools_module, "_manager", manager):
+        ingest = mcp_tools_module.tool_memory_ingest(
+            {"user_id": "alice", "message": "hello"}
+        )
+        response = mcp_tools_module.tool_memory_add_response(
+            {"response": "hi there", "user_id": "alice"}
+        )
+
+    assert response["session_id"] == ingest["session_id"]
+    assert response["created_bucket"] is False  # same bucket, not a fork
+
+
+def test_proxy_mode_derives_the_mint_flag_when_the_server_omits_it():
+    """An older proxy server returns its payload without created_bucket;
+    hosted mode must still carry the drift signal (round 4)."""
+    buf = RedisMemoryBuffer.__new__(RedisMemoryBuffer)
+    buf.client = None
+    buf.tenant_id = "tenant-t"
+    buf.tenant_hint = ""
+    buf.default_ttl = 3600
+
+    async def fake_proxy(*, action, payload):
+        return {"success": True, "message_count": 1}
+
+    buf._proxy_request = fake_proxy
+    result = asyncio.run(buf.add_message(
+        project="P", session_id="s1", role="user", content="hi",
+    ))
+    assert result["created_bucket"] is True
 
 
 def test_generate_session_id_keeps_its_contract():
@@ -560,13 +642,11 @@ def test_every_session_scoped_handler_resolves_and_reports_when_omitted(
     assert result["session_id_source"] == "host-env", handler_name
 
 
-def test_consolidating_an_identity_less_session_rotates_the_default_pointer():
-    """A default-path session has no user metadata. Skipping the pointer
-    clear for it (the old identity gate) left the ('mcp','default') pointer
-    aimed at a session whose buffer consolidation just cleared — the tool
-    path could never rotate to a fresh session. The compare-and-delete makes
-    clearing under the default keys safe: a pointer holding some OTHER
-    session stays."""
+def test_consolidating_the_process_session_rotates_it():
+    """Identity-less resolution caches its id on the manager. Consolidation
+    must invalidate that cache, or the tool path keeps resolving the
+    consolidated, now-empty session forever — and a second consolidation
+    under the same id would overwrite the first conversation's artifact."""
     buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
     manager = UniversalMemoryManager(
         redis_buffer=buffer,
@@ -576,19 +656,18 @@ def test_consolidating_an_identity_less_session_rotates_the_default_pointer():
     )
 
     async def scenario():
-        # The default-path session: buffered turns, no identity metadata.
         session_id, source = await manager.resolve_session_id()
-        assert source == "generated"
+        assert source == "process"
         await buffer.add_message(
             project=manager.project, session_id=session_id,
             role="user", content="hello",
         )
         await manager.consolidate_session(session_id=session_id)
-        return await buffer.get_active_session(
-            context="mcp", user_canonical_id="default",
-        )
+        fresh, _ = await manager.resolve_session_id()
+        return session_id, fresh
 
-    assert asyncio.run(scenario()) is None
+    consolidated, fresh = asyncio.run(scenario())
+    assert fresh != consolidated
 
     async def backfill_scenario():
         live, _ = await manager.resolve_session_id()
@@ -597,12 +676,11 @@ def test_consolidating_an_identity_less_session_rotates_the_default_pointer():
             role="user", content="old",
         )
         await manager.consolidate_session(session_id="historical-backfill")
-        return await buffer.get_active_session(
-            context="mcp", user_canonical_id="default",
-        ), live
+        after, _ = await manager.resolve_session_id()
+        return live, after
 
-    pointer_after, live = asyncio.run(backfill_scenario())
-    assert pointer_after == live  # the live session's pointer survived
+    live, after = asyncio.run(backfill_scenario())
+    assert after == live  # consolidating a backfill id never rotates the live one
 
 
 def test_mcp_ingest_keeps_users_apart_even_under_a_host_env(monkeypatch):
@@ -638,12 +716,13 @@ def test_mcp_ingest_keeps_users_apart_even_under_a_host_env(monkeypatch):
     assert all("alice" not in t for t in bob_texts)
 
 
-def test_consolidating_an_ingest_created_session_rotates_the_default_pointer():
-    """A session's pointer key and its metadata identity can disagree: the
-    identity-less tools register the pointer under ('mcp','default') while a
-    later ingest stamps user metadata onto the same session. A clear keyed
-    only off metadata missed the live pointer, so the tool path kept
-    resolving the consolidated, now-empty session forever (round 2)."""
+def test_consolidating_an_ingest_stamped_process_session_still_rotates_it():
+    """A session's cached process id and its metadata identity can disagree:
+    identity-less resolution mints the id, and a later ingest stamps user
+    metadata onto the SAME session. Consolidation derives its pointer-clear
+    keys from that metadata — the process cache must be invalidated
+    regardless, or the tool path keeps resolving the cleared session
+    (rounds 2 and 4)."""
     buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
     manager = UniversalMemoryManager(
         redis_buffer=buffer,
@@ -653,19 +732,17 @@ def test_consolidating_an_ingest_created_session_rotates_the_default_pointer():
     )
 
     async def scenario():
-        # Identity-less resolution registers the default pointer...
         session_id, _ = await manager.resolve_session_id()
-        # ...and ingest later stamps user identity onto the SAME session.
         await manager.ingest_message(
             user_id="alice", message="hello", context="personal",
             session_id=session_id,
         )
         await manager.consolidate_session(session_id=session_id)
-        return await buffer.get_active_session(
-            context="mcp", user_canonical_id="default",
-        )
+        fresh, _ = await manager.resolve_session_id()
+        return session_id, fresh
 
-    assert asyncio.run(scenario()) is None
+    consolidated, fresh = asyncio.run(scenario())
+    assert fresh != consolidated
 
 
 def test_a_blank_session_id_is_rejected_not_reinterpreted():

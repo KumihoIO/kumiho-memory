@@ -113,12 +113,37 @@ def earns_edge_discovery(capture_type: Optional[str]) -> bool:
 # accurate text.
 _SESSION_DEFAULT_NOTE = (
     " session_id is OPTIONAL and usually best omitted: it defaults to the "
-    "host session (KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID) or the shared "
-    "active-session pointer, and the result reports the session_id used "
-    "plus its session_id_source. EXCEPTION: if kumiho_memory_ingest was "
-    "called in this conversation, pass the session_id its result reported — "
-    "ingest resolves per-user and does not share this default."
+    "host session (KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID) or, absent "
+    "those, a stable per-process conversation id; the result reports the "
+    "session_id used plus its session_id_source. EXCEPTION: in the "
+    "kumiho_memory_ingest workflow, pass the same user_id (and context) you "
+    "gave ingest — the call then resolves into that user's session, which "
+    "does not share the conversation default."
 )
+
+# Optional identity properties advertised on every identity-less
+# session-scoped tool. They make convergence with ingest STRUCTURAL: the
+# caller repeats the same user_id — a stable semantic value — and resolution
+# lands on the identical (context, user) pointer, instead of prose asking the
+# LLM to hold an opaque session uuid across turns (the failure mode issue #3
+# exists to eliminate; PR #4 review, round 4).
+_SESSION_IDENTITY_PROPS: Dict[str, Any] = {
+    "user_id": {
+        "type": "string",
+        "description": (
+            "Optional. In the kumiho_memory_ingest workflow, pass the same "
+            "user_id you gave ingest; resolution then lands on that user's "
+            "session instead of the conversation default."
+        ),
+    },
+    "context": {
+        "type": "string",
+        "description": (
+            "Optional, used with user_id: the ingest context "
+            "(defaults to 'personal', matching ingest)."
+        ),
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Lazy singleton manager
@@ -416,6 +441,19 @@ async def _resolve_session(
     """
     raw = args.get("session_id")
     if raw is None:
+        # Generic identity pickup: any session-scoped tool may carry
+        # user_id/context (advertised via _SESSION_IDENTITY_PROPS), so a
+        # caller in the ingest workflow converges on ingest's per-user
+        # session STRUCTURALLY by repeating the same user_id — a stable
+        # semantic value — instead of being asked to echo an opaque session
+        # uuid across turns, which is what LLM callers get wrong (PR #4
+        # review, round 4).
+        if user_id is None:
+            user_id = args.get("user_id")
+        if user_id is not None and context is None:
+            # Match ingest's context default so "same user_id" lands on the
+            # same (context, user) pointer.
+            context = args.get("context", "personal")
         return await manager.resolve_session_id(user_id=user_id, context=context)
     explicit = str(raw)
     if not explicit.strip():
@@ -1011,6 +1049,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "default": "user",
                     "description": "Message role.",
                 },
+                **_SESSION_IDENTITY_PROPS,
             },
             "required": ["message"],
         },
@@ -1038,6 +1077,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "default": 50,
                     "description": "Max messages to return.",
                 },
+                **_SESSION_IDENTITY_PROPS,
             },
         },
     },
@@ -1058,6 +1098,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": "Session identifier.",
                 },
+                **_SESSION_IDENTITY_PROPS,
             },
         },
     },
@@ -1158,6 +1199,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": "Assistant response text.",
                 },
+                **_SESSION_IDENTITY_PROPS,
             },
             "required": ["response"],
         },
@@ -1195,6 +1237,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                         "'press-release:acme', 'news:reuters', 'chat:user'."
                     ),
                 },
+                **_SESSION_IDENTITY_PROPS,
             },
         },
     },
@@ -1582,6 +1625,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                         "resumable bulk ingest."
                     ),
                 },
+                **_SESSION_IDENTITY_PROPS,
             },
             "required": ["response"],
         },

@@ -189,7 +189,7 @@ class RedisMemoryBuffer:
             )
 
         if self.client is None:
-            return await self._proxy_request(
+            result = await self._proxy_request(
                 action="add_message",
                 payload={
                     "project": project,
@@ -200,6 +200,12 @@ class RedisMemoryBuffer:
                     "default_ttl": self.default_ttl,
                 },
             )
+            # An older proxy server returns its payload without the mint
+            # flag; derive it from message_count so hosted mode carries the
+            # same drift signal as the local path (PR #4 review, round 4).
+            if isinstance(result, dict) and "created_bucket" not in result:
+                result["created_bucket"] = result.get("message_count") == 1
+            return result
 
         key = self._session_messages_key(project, session_id)
         message = {

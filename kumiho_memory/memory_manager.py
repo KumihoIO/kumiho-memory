@@ -12,6 +12,7 @@ import mimetypes
 import os
 import re
 import shutil
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1545,6 +1546,14 @@ class UniversalMemoryManager:
                     break
                 except Exception as exc:
                     logger.debug("clear_active_session failed: %s", exc)
+
+        # Rotate the process-scoped default too: identity-less resolution
+        # caches its id on the manager, and without this the tool path kept
+        # resolving the consolidated, now-empty session forever — and a
+        # second consolidation under the same id would overwrite the first
+        # conversation's artifact (PR #4 review, round 4).
+        if getattr(self, "_identityless_session_id", None) == session_id:
+            self._identityless_session_id = None
 
         return {
             "success": True,
@@ -3529,11 +3538,14 @@ class UniversalMemoryManager:
         """Resolve the session identity for a caller that did not name one.
 
         Returns ``(session_id, source)``; source is ``host-env``,
-        ``active-pointer`` or ``generated``. ONE resolver for every defaulting
-        path on purpose (issue #3): ingest already defaulted through the
-        active-session pointer while chat/reflect required an explicit id, so
-        giving the tools a default of their own would have split an
-        id-omitting caller's conversation across two buckets by construction.
+        ``process``, ``active-pointer`` or ``generated``. ONE resolver for
+        every defaulting path on purpose (issue #3): ingest already defaulted
+        through the active-session pointer while chat/reflect required an
+        explicit id, so giving the tools a default of their own would have
+        split an id-omitting caller's conversation across two buckets by
+        construction. Identity-less callers (user_id is None) resolve to the
+        host session, else a process-scoped id; user-scoped callers resolve
+        per (context, user) through the shared pointer.
 
         Order, and why:
 
@@ -3566,8 +3578,26 @@ class UniversalMemoryManager:
             env_session = _host_session_env()
             if env_session:
                 return env_session, "host-env"
+            # No host identity and no user identity: a PROCESS-scoped id,
+            # minted once per server process and never registered on the
+            # shared pointer. The pointer cannot distinguish conversations —
+            # routing identity-less callers through the single
+            # ("mcp", "default") key merged every env-less conversation on
+            # one Redis into one bucket, and let a fresh conversation
+            # silently resume the previous one for the pointer's 24 h TTL
+            # (PR #4 review, round 4). One stdio server serves one
+            # conversation (measured), so the process is the truest
+            # conversation identity available here; a mid-conversation
+            # server restart minting a fresh bucket is the accepted cost —
+            # cross-conversation working-memory bleed was not.
+            cached = getattr(self, "_identityless_session_id", None)
+            if cached:
+                return cached, "process"
+            new_id = f"mcp:proc-{uuid.uuid4().hex[:12]}"
+            self._identityless_session_id = new_id
+            return new_id, "process"
 
-        user_canonical_id = user_id or "default"
+        user_canonical_id = user_id
         context = context or "mcp"
 
         # A single Redis flake must not silently fork a new session: each call
