@@ -1511,36 +1511,40 @@ class UniversalMemoryManager:
         # deleted, and the next default-resolved call minted a fresh bucket
         # mid-conversation (issue #3).
         #
-        # Identity-less sessions clear under the DEFAULT key pair — the same
-        # ("mcp", "default") that resolve_session_id uses. Skipping them (the
-        # old `if session_user_id and session_context` gate) left the default
-        # pointer aimed at a session whose buffer this call just cleared, so
-        # the tool path could never rotate to a fresh session after
-        # consolidating (PR #4 review). The compare-and-delete keeps the skip
-        # safe to remove: a pointer holding some other session is untouched.
+        # BOTH key pairs, because a session's pointer key and its metadata
+        # identity can disagree: the MCP tool path registers pointers under
+        # ("mcp", "default") while ingest stamps user_id/context metadata
+        # onto the same session — a clear keyed only off metadata targeted
+        # ('personal', alice) while the live pointer sat at the default key,
+        # so rotation silently failed for every ingest-created session
+        # (PR #4 review, round 2). only_if keeps the extra clear
+        # collateral-free: a pointer holding some other session is untouched.
         if hasattr(self.redis_buffer, "clear_active_session"):
-            clear_context = session_context or "mcp"
-            clear_user = session_user_id or "default"
-            try:
-                await self.redis_buffer.clear_active_session(
-                    context=clear_context,
-                    user_canonical_id=clear_user,
-                    only_if=session_id,
-                )
-            except TypeError:
-                # An older redis_buffer implementation without only_if: keep
-                # the pre-existing behaviour — unconditional, and only for
-                # sessions whose identity is actually known.
-                if session_user_id and session_context:
-                    try:
-                        await self.redis_buffer.clear_active_session(
-                            context=session_context,
-                            user_canonical_id=session_user_id,
-                        )
-                    except Exception as exc:
-                        logger.debug("clear_active_session failed: %s", exc)
-            except Exception as exc:
-                logger.debug("clear_active_session failed: %s", exc)
+            key_pairs = [(session_context or "mcp", session_user_id or "default")]
+            if key_pairs[0] != ("mcp", "default"):
+                key_pairs.append(("mcp", "default"))
+            for clear_context, clear_user in key_pairs:
+                try:
+                    await self.redis_buffer.clear_active_session(
+                        context=clear_context,
+                        user_canonical_id=clear_user,
+                        only_if=session_id,
+                    )
+                except TypeError:
+                    # An older redis_buffer implementation without only_if:
+                    # keep the pre-existing behaviour — unconditional, and
+                    # only for sessions whose identity is actually known.
+                    if session_user_id and session_context:
+                        try:
+                            await self.redis_buffer.clear_active_session(
+                                context=session_context,
+                                user_canonical_id=session_user_id,
+                            )
+                        except Exception as exc:
+                            logger.debug("clear_active_session failed: %s", exc)
+                    break
+                except Exception as exc:
+                    logger.debug("clear_active_session failed: %s", exc)
 
         return {
             "success": True,

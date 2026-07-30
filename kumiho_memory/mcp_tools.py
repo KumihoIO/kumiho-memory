@@ -372,7 +372,12 @@ def _filter_by_min_score(
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_session(args: Dict[str, Any], manager) -> "Tuple[str, str]":
+async def _resolve_session(
+    args: Dict[str, Any],
+    manager,
+    user_id: Optional[str] = None,
+    context: Optional[str] = None,
+) -> "Tuple[str, str]":
     """The session identity for this call, and where it came from.
 
     An explicit argument always wins (backfill and bulk ingest genuinely
@@ -383,15 +388,33 @@ async def _resolve_session(args: Dict[str, Any], manager) -> "Tuple[str, str]":
     conversation buffers silently (issue #3), so omission is the recommended
     path and every result reports which id was actually used.
 
+    ``user_id``/``context`` MUST be threaded through by identity-bearing
+    tools (ingest). Resolving identity-less on their behalf bypassed the
+    resolver's user-scoping guard from the MCP side and collapsed every user
+    and context served by one process into one bucket — the exact blocker
+    the guard exists to prevent (PR #4 review, round 2). Identity-less tools
+    pass nothing and share the conversation-scoped default.
+
+    A provided-but-blank session_id is rejected loudly, not silently
+    reinterpreted as omission: on main a blank reached the buffer and raised
+    there, and "" quietly resolving to some other live session would move
+    data between buckets on a typo.
+
     A coroutine on purpose: each handler awaits it inside the SAME
     ``asyncio.run`` as the operation it precedes. As its own ``asyncio.run``
     it created a second event loop per tool call, and the redis client — one
     per loop — was abandoned unclosed every time (PR #4 review).
     """
-    explicit = str(args.get("session_id") or "").strip()
-    if explicit:
-        return explicit, "argument"
-    return await manager.resolve_session_id()
+    raw = args.get("session_id")
+    if raw is None:
+        return await manager.resolve_session_id(user_id=user_id, context=context)
+    explicit = str(raw)
+    if not explicit.strip():
+        raise ValueError(
+            "session_id, when provided, must be a non-empty string; "
+            "omit it entirely for server-side resolution"
+        )
+    return explicit, "argument"
 
 
 def _annotate_session(
@@ -462,17 +485,23 @@ def tool_chat_clear(args: Dict[str, Any]) -> Dict[str, Any]:
 def tool_memory_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
     """Ingest a user message — buffers in Redis and returns context.
 
-    Resolves through the SAME resolver as the other session-scoped tools.
-    Left to ingest_message's own defaulting it would key the per-(user,
-    context) pointer while chat/reflect key the default one, so an
-    id-omitting MCP conversation split its user turns and assistant turns
-    into two buckets by construction (PR #4 review). Library callers of
-    ingest_message keep the pre-existing per-user defaulting.
+    Resolves through the shared resolver WITH its identity threaded through:
+    ingest is the one identity-bearing tool, and resolving on its behalf
+    without user_id/context bypassed the resolver's user-scoping guard —
+    every user and context served by one process collapsed into one bucket
+    (PR #4 review, round 2). Per-(user, context) resolution matches main's
+    ingest semantics exactly; the ingest result reports the resolved
+    session_id, and a caller that mixes ingest with the identity-less tools
+    should echo that id explicitly.
     """
     manager = _get_manager()
 
     async def _run():
-        session_id, source = await _resolve_session(args, manager)
+        session_id, source = await _resolve_session(
+            args, manager,
+            user_id=args["user_id"],
+            context=args.get("context", "personal"),
+        )
         result = await manager.handle_user_message(
             user_id=args["user_id"],
             message=args["message"],

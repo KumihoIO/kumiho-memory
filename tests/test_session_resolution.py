@@ -7,10 +7,12 @@ and drift (silent — the conversation buffer fragments into per-typo buckets
 that a 1-hour TTL then erases). These tests pin the redesign:
 
 - ONE resolver for every defaulting path: explicit argument, else host env
-  (``KUMIHO_SESSION_ID`` / ``CLAUDE_CODE_SESSION_ID``), else the shared
-  active-session pointer, else generated — and the env tier WRITES the
-  pointer so a sibling server process without the env var converges on the
-  same bucket instead of defaulting differently.
+  (``KUMIHO_SESSION_ID`` / ``CLAUDE_CODE_SESSION_ID``, identity-less callers
+  only), else the shared active-session pointer, else generated — and the
+  env tier never touches the shared pointer: the write it once did let an
+  env-bearing CLI process repoint a concurrent env-less (Desktop-app)
+  conversation's continuity to its own bucket (see
+  test_host_env_wins_and_never_touches_the_pointer).
 - Consolidation clears the active pointer only if it still points at the
   session being consolidated: unconditional, a backfill consolidation
   severed the LIVE conversation's continuity.
@@ -94,6 +96,14 @@ class _FakeRedis:
 
     async def expire(self, key, ttl):
         return True
+
+    async def hset(self, key, mapping=None):
+        self.kv.setdefault(key, {})
+        self.kv[key].update(mapping or {})
+
+    async def hgetall(self, key):
+        value = self.kv.get(key)
+        return dict(value) if isinstance(value, dict) else {}
 
     async def lrange(self, key, start, end):
         items = self.lists.get(key, [])
@@ -485,6 +495,132 @@ def test_consolidating_an_identity_less_session_rotates_the_default_pointer():
 
     pointer_after, live = asyncio.run(backfill_scenario())
     assert pointer_after == live  # the live session's pointer survived
+
+
+def test_mcp_ingest_keeps_users_apart_even_under_a_host_env(monkeypatch):
+    """The round-2 blocker: routing ingest through the shared resolver
+    WITHOUT its identity bypassed the env-tier guard from the MCP side —
+    alice's and bob's turns collapsed into the host-env bucket, bob's
+    working memory contained alice's messages, and consolidation filed bob
+    under alice's space. The handler must thread user_id/context so the
+    resolver's user-scoped path applies exactly as it does for library
+    callers."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "host-uuid-1")
+    buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+    with patch.object(mcp_tools_module, "_manager", manager):
+        alice = mcp_tools_module.tool_memory_ingest(
+            {"user_id": "alice", "message": "alice secret plan"}
+        )
+        bob = mcp_tools_module.tool_memory_ingest(
+            {"user_id": "bob", "message": "bob question", "context": "work"}
+        )
+
+    assert alice["session_id"] != "host-uuid-1"
+    assert bob["session_id"] != "host-uuid-1"
+    assert alice["session_id"] != bob["session_id"]
+    assert alice["session_id"].startswith("personal:user-")
+    assert bob["session_id"].startswith("work:user-")
+    bob_texts = [m.get("content", "") for m in bob.get("working_memory", [])]
+    assert all("alice" not in t for t in bob_texts)
+
+
+def test_consolidating_an_ingest_created_session_rotates_the_default_pointer():
+    """A session's pointer key and its metadata identity can disagree: the
+    identity-less tools register the pointer under ('mcp','default') while a
+    later ingest stamps user metadata onto the same session. A clear keyed
+    only off metadata missed the live pointer, so the tool path kept
+    resolving the consolidated, now-empty session forever (round 2)."""
+    buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+
+    async def scenario():
+        # Identity-less resolution registers the default pointer...
+        session_id, _ = await manager.resolve_session_id()
+        # ...and ingest later stamps user identity onto the SAME session.
+        await manager.ingest_message(
+            user_id="alice", message="hello", context="personal",
+            session_id=session_id,
+        )
+        await manager.consolidate_session(session_id=session_id)
+        return await buffer.get_active_session(
+            context="mcp", user_canonical_id="default",
+        )
+
+    assert asyncio.run(scenario()) is None
+
+
+def test_a_blank_session_id_is_rejected_not_reinterpreted():
+    """"" and "   " are provided values, not omissions. Main pushed them to
+    the buffer and raised there; silently resolving them to some other live
+    session would move data between buckets on a typo."""
+    for blank in ("", "   "):
+        with pytest.raises(ValueError):
+            asyncio.run(_resolve_session({"session_id": blank}, manager=None))
+
+
+def test_clear_with_only_if_issues_no_delete_when_the_pointer_is_absent():
+    """An absent pointer means there is nothing to clear; issuing the DELETE
+    anyway could only destroy a pointer some concurrent resolver sets between
+    the read and the delete (round 2)."""
+    buf = _buffer_with_fake_client()
+    deletes = []
+    inner_delete = buf.client.delete
+
+    async def counting_delete(*keys):
+        deletes.append(keys)
+        return await inner_delete(*keys)
+
+    buf.client.delete = counting_delete
+    asyncio.run(buf.clear_active_session(
+        context="mcp", user_canonical_id="default", only_if="anything",
+    ))
+    assert deletes == []
+
+
+def test_proxy_mode_enforces_only_if_client_side():
+    """An older proxy server ignores unknown payload fields, so forwarding
+    only_if alone silently restored the unconditional delete on hosted
+    deployments while the local path was fixed (round 2). The compare must
+    happen before the delete is forwarded, using the main-era
+    get_active_session action every server implements."""
+    buf = RedisMemoryBuffer.__new__(RedisMemoryBuffer)
+    buf.client = None
+    buf.tenant_id = "tenant-t"
+    buf.tenant_hint = ""
+    buf.default_ttl = 3600
+    requests = []
+
+    async def fake_proxy(*, action, payload):
+        requests.append(action)
+        if action == "get_active_session":
+            return {"session_id": "live-session"}
+        return {}
+
+    buf._proxy_request = fake_proxy
+
+    # Mismatch: the delete must never be forwarded.
+    asyncio.run(buf.clear_active_session(
+        context="c", user_canonical_id="u", only_if="old-backfill-id",
+    ))
+    assert "clear_active_session" not in requests
+
+    # Match: the delete goes through.
+    requests.clear()
+    asyncio.run(buf.clear_active_session(
+        context="c", user_canonical_id="u", only_if="live-session",
+    ))
+    assert "clear_active_session" in requests
 
 
 def test_code_mine_session_fails_fast_when_no_id_can_be_resolved():

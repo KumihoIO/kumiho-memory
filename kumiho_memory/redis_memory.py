@@ -448,13 +448,24 @@ class RedisMemoryBuffer:
         behaviour, never worse.
         """
         if self.client is None:
+            if only_if is not None:
+                # The compare must happen CLIENT-side here: an older proxy
+                # server ignores unknown payload fields, so forwarding
+                # only_if alone silently restored the unconditional delete on
+                # hosted deployments while the local path was fixed (PR #4
+                # review, round 2). get_active_session is a main-era proxy
+                # action every server implements.
+                current = await self.get_active_session(
+                    context=context, user_canonical_id=user_canonical_id,
+                )
+                if current != only_if:
+                    return
             await self._proxy_request(
                 action="clear_active_session",
                 payload={
                     "context": context,
                     "user_canonical_id": user_canonical_id,
-                    # Older proxies ignore unknown fields, so hosted mode
-                    # degrades to the unconditional delete it already had.
+                    # Newer servers may enforce this atomically as well.
                     "only_if": only_if,
                 },
             )
@@ -463,7 +474,11 @@ class RedisMemoryBuffer:
         key = self._active_session_key(context, user_canonical_id)
         if only_if is not None:
             current = await self.client.get(key)
-            if current is not None and current != only_if:
+            if current != only_if:
+                # Covers BOTH a pointer holding another session AND an
+                # absent pointer (None): with nothing to clear, issuing the
+                # DELETE anyway could only destroy a pointer some concurrent
+                # resolver set between this read and the delete.
                 return
         await self.client.delete(key)
 
