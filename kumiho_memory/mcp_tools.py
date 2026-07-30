@@ -30,6 +30,74 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Capture vocabulary
+# ---------------------------------------------------------------------------
+# The memory types a `reflect` capture may carry. One list, because it was
+# three: this module's prose advertised ten, `_discover` hardcoded five inline
+# as its edge gate, and assessors.py names four in its LLM prompts. Nothing
+# validates the field (`cap.get("type", "summary")` accepts anything), so a
+# divergence is silent — it just produces memories filed under a type no
+# reader branches on.
+#
+# It has to be a constant rather than only prose because of what a client
+# actually receives. Measured against a live host, forwarding this server:
+#
+#   - property-level `description` is forwarded only for properties that are
+#     REQUIRED in the source. Every optional one arrives undocumented, at every
+#     nesting depth.
+#   - `enum` survives, and survives on OPTIONAL and NESTED properties too:
+#     recall's `recall_mode` and store_execution's `status` both arrive with
+#     their enum and no description; so does the nested
+#     code_capture.decisions[].evidence[].kind.
+#   - the tool-level `description` survives intact.
+#   - `required` is NOT reliably forwarded. Deliberately vague, because the
+#     evidence does not support a rule: reflect, engage, recall, create_item
+#     and decompose (five nested arrays) all lose theirs entirely, while
+#     create_edge/delete_edge declare
+#     `required: [source_kref, target_kref, edge_type]` and arrive with
+#     `required: ["edge_type"]`. Do not assume either behaviour.
+#
+# So `captures`, being optional, arrives with no descriptions anywhere in its
+# sub-schema and a caller has to guess the type — which is exactly what
+# happened. Anything a caller MUST know therefore belongs in the tool-level
+# description or in a structural keyword like `enum`, never in the description
+# of an optional property.
+MEMORY_TYPES = (
+    "decision",
+    "preference",
+    "fact",
+    "correction",
+    "architecture",
+    "implementation",
+    "synthesis",
+    "reflection",
+    "summary",
+    "skill",
+)
+
+#: The subset whose captures are worth spending an edge-discovery LLM call on:
+#: types that assert a relationship to prior work. A `fact` or `preference`
+#: stands alone, so discovery would burn a call to find nothing.
+EDGE_DISCOVERY_TYPES = (
+    "decision",
+    "architecture",
+    "implementation",
+    "synthesis",
+    "reflection",
+)
+
+
+def earns_edge_discovery(capture_type: Optional[str]) -> bool:
+    """Whether a capture of this type is worth an edge-discovery LLM call.
+
+    A one-line predicate so the gate is reachable from a test. Inlined in
+    `_discover` it was a condition inside a closure inside a handler, which
+    meant widening it to every type — spending a call per `fact` to find
+    nothing — could not be caught by anything.
+    """
+    return capture_type in EDGE_DISCOVERY_TYPES
+
+# ---------------------------------------------------------------------------
 # Lazy singleton manager
 # ---------------------------------------------------------------------------
 
@@ -677,10 +745,8 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
 
         def _discover(rev_kref: str, cap: Dict[str, Any]) -> None:
             # Edge discovery (best-effort, skipped if no server-side LLM).
-            if not (do_edges and rev_kref and cap.get("type") in (
-                "decision", "architecture", "implementation",
-                "synthesis", "reflection",
-            )):
+            if not (do_edges and rev_kref
+                    and earns_edge_discovery(cap.get("type"))):
                 return
             nonlocal edges_total
             try:
@@ -1241,7 +1307,14 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
             "response and stores structured captures (decisions, preferences, "
             "facts) with provenance links — all in one call. The agent's own "
             "LLM identifies what to remember; no external API key needed. "
-            "Pass source_krefs from engage to create DERIVED_FROM edges."
+            "Pass source_krefs from engage to create DERIVED_FROM edges. "
+            # Restated here on purpose: hosts have been observed to forward
+            # property descriptions and `required` arrays only for REQUIRED
+            # top-level properties, so a caller reading the schema alone sees
+            # `captures` completely undocumented. The tool description does
+            # survive, so the non-negotiable parts live here too.
+            "REQUIRES session_id and response. Each capture in `captures` "
+            "requires type, title and content."
         ),
         "inputSchema": {
             "type": "object",
@@ -1261,11 +1334,12 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                         "properties": {
                             "type": {
                                 "type": "string",
-                                "description": (
-                                    "Memory type: decision, preference, fact, "
-                                    "correction, architecture, implementation, "
-                                    "synthesis, reflection, summary, skill."
-                                ),
+                                # `enum`, not prose: a host that strips the
+                                # description off this optional sub-schema
+                                # still forwards the allowed values, so the
+                                # caller stops guessing (see MEMORY_TYPES).
+                                "enum": list(MEMORY_TYPES),
+                                "description": "Memory type.",
                             },
                             "title": {
                                 "type": "string",

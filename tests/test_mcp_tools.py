@@ -1,14 +1,18 @@
 """Tests for kumiho_memory.mcp_tools — MCP tool wrappers for memory operations."""
 
 import asyncio
+import copy
 import json
 import os
 import tempfile
 from unittest.mock import patch
 
 from kumiho_memory.mcp_tools import (
+    EDGE_DISCOVERY_TYPES,
+    MEMORY_TYPES,
     MEMORY_TOOLS,
     MEMORY_TOOL_HANDLERS,
+    earns_edge_discovery,
     tool_chat_add,
     tool_chat_get,
     tool_chat_clear,
@@ -146,6 +150,151 @@ def test_tool_names_are_prefixed():
     """All tool names should start with kumiho_ prefix."""
     for tool in MEMORY_TOOLS:
         assert tool["name"].startswith("kumiho_"), f"Bad prefix: {tool['name']}"
+
+
+# ---------------------------------------------------------------------------
+# Tests — the schema has to survive the transport
+# ---------------------------------------------------------------------------
+
+
+def _as_a_lossy_host_forwards_it(tool):
+    """Reduce a tool the way a real MCP host was measured to reduce it.
+
+    Measured, not assumed:
+
+    - ``description`` reaches the caller only for properties REQUIRED in the
+      source. ``reflect`` arrived carrying descriptions on exactly
+      ``session_id`` and ``response``; ``engage`` and ``recall`` on exactly
+      ``query`` — each precisely that tool's required set, while the source
+      documents every property of all three.
+    - ``enum`` survives, including on optional and nested properties
+      (``recall_mode``, ``store_execution.status``,
+      ``code_capture.decisions[].evidence[].kind`` all arrive with their enum
+      and no description). This is why the fix under test uses ``enum``.
+    - the tool-level ``description`` survives intact.
+
+    This model drops ``required`` everywhere, which is the CONSERVATIVE
+    reading rather than a measured rule. Real forwarding is inconsistent:
+    reflect, engage, recall, create_item and decompose (five nested arrays)
+    lose theirs entirely, but create_edge/delete_edge declare
+    ``required: [source_kref, target_kref, edge_type]`` and arrive with
+    ``required: ["edge_type"]``. No mechanism explains both, so the model
+    assumes the worst and the assertions below are chosen to hold under either
+    reading.
+    """
+    schema = copy.deepcopy(tool["inputSchema"])
+    required = set(schema.pop("required", []))
+
+    def strip(node, keep):
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            for name, spec in properties.items():
+                if isinstance(spec, dict):
+                    if name not in keep:
+                        spec.pop("description", None)
+                    strip(spec, set())  # nothing nested is ever top-level
+        items = node.get("items")
+        if isinstance(items, dict):
+            items.pop("required", None)
+            strip(items, set())
+
+    strip(schema, required)
+    return schema
+
+
+def test_reflect_still_tells_a_caller_the_capture_types_after_stripping():
+    """A caller must not have to guess ``captures[].type``.
+
+    It had to. The ten valid types lived only in that sub-property's prose,
+    ``captures`` is optional, so the whole sub-schema arrived undocumented and
+    the type got picked by guesswork — a wrong guess is not rejected either
+    (``cap.get("type", "summary")`` takes anything), it just files the memory
+    under a type no reader branches on.
+
+    ``enum`` is structural, so it survives where the prose did not.
+    """
+    tool = next(t for t in MEMORY_TOOLS if t["name"] == "kumiho_memory_reflect")
+    reduced = _as_a_lossy_host_forwards_it(tool)
+    capture = reduced["properties"]["captures"]["items"]["properties"]
+
+    # The prose channel really is gone for this optional sub-property, and the
+    # live forwarded reflect really does arrive with no top-level `required`.
+    assert "required" not in reduced
+    assert "description" not in capture["type"]
+
+    # The one assertion that carries the fix: the vocabulary arrives anyway.
+    assert capture["type"]["enum"] == list(MEMORY_TYPES)
+
+
+def test_reflect_documents_every_required_field_it_declares():
+    """Every required field must be named in the TOOL description.
+
+    ``required`` is not reliably forwarded, so a caller can be left unable to
+    see which arguments are mandatory — calling reflect without ``session_id``
+    fails with a bare validation error and the turn's memory is lost. The
+    tool-level description survives intact, so it is the channel that has to
+    carry this.
+
+    Derived from the schema rather than hardcoded on purpose: adding a required
+    property without documenting it is exactly the drift this must catch, and
+    an assertion against literal substrings the same commit wrote could not.
+    """
+    tool = next(t for t in MEMORY_TOOLS if t["name"] == "kumiho_memory_reflect")
+    schema = tool["inputSchema"]
+    text = tool["description"]
+
+    required = schema.get("required") or []
+    assert required, "reflect must declare which properties are required"
+    for name in required:
+        assert name in text, (
+            f"reflect requires `{name}` but its tool description does not say "
+            f"so, and the required array may not reach the caller"
+        )
+
+    capture_required = schema["properties"]["captures"]["items"].get("required") or []
+    assert capture_required, "a capture must declare its mandatory fields"
+    for name in capture_required:
+        assert name in text, (
+            f"a capture requires `{name}` but the tool description does not "
+            f"say so, and nested required arrays are dropped in transit"
+        )
+
+
+def test_the_capture_vocabulary_is_pinned_not_merely_self_consistent():
+    """Pin the vocabulary against an independent list, not against itself.
+
+    A subset assertion between two constants declared fifteen lines apart
+    cannot fail for any edit that changes both, and cannot notice a value
+    quietly leaving ``MEMORY_TYPES``. These spell the expectation out.
+    """
+    assert MEMORY_TYPES == (
+        "decision", "preference", "fact", "correction", "architecture",
+        "implementation", "synthesis", "reflection", "summary", "skill",
+    )
+    # Edge discovery is for types that assert a relationship to prior work.
+    # Widening it to the standalone types would spend an LLM call per `fact`
+    # to find nothing — the gate exists to not do that.
+    assert set(EDGE_DISCOVERY_TYPES) <= set(MEMORY_TYPES)
+    standalone = {"fact", "preference", "summary", "correction", "skill"}
+    assert standalone.isdisjoint(EDGE_DISCOVERY_TYPES)
+    assert set(MEMORY_TYPES) - standalone == set(EDGE_DISCOVERY_TYPES)
+
+
+def test_the_edge_gate_itself_refuses_the_standalone_types():
+    """Exercise the GATE, not just the constant beside it.
+
+    Pinning the tuples cannot see which tuple the call site actually consults:
+    pointing the gate at ``MEMORY_TYPES`` would spend an edge-discovery LLM
+    call on every ``fact`` and ``preference`` and leave every tuple assertion
+    green. This calls the predicate the gate calls.
+    """
+    for kind in EDGE_DISCOVERY_TYPES:
+        assert earns_edge_discovery(kind), f"{kind} should earn discovery"
+    for kind in ("fact", "preference", "summary", "correction", "skill"):
+        assert not earns_edge_discovery(kind), f"{kind} must not spend a call"
+    # A capture with no type at all reaches the gate as None.
+    assert not earns_edge_discovery(None)
+    assert not earns_edge_discovery("not-a-memory-type")
 
 
 # ---------------------------------------------------------------------------
