@@ -1510,23 +1510,35 @@ class UniversalMemoryManager:
         # (context, user): the pointer aimed at the CURRENT session was
         # deleted, and the next default-resolved call minted a fresh bucket
         # mid-conversation (issue #3).
-        if session_user_id and session_context and hasattr(self.redis_buffer, "clear_active_session"):
+        #
+        # Identity-less sessions clear under the DEFAULT key pair — the same
+        # ("mcp", "default") that resolve_session_id uses. Skipping them (the
+        # old `if session_user_id and session_context` gate) left the default
+        # pointer aimed at a session whose buffer this call just cleared, so
+        # the tool path could never rotate to a fresh session after
+        # consolidating (PR #4 review). The compare-and-delete keeps the skip
+        # safe to remove: a pointer holding some other session is untouched.
+        if hasattr(self.redis_buffer, "clear_active_session"):
+            clear_context = session_context or "mcp"
+            clear_user = session_user_id or "default"
             try:
                 await self.redis_buffer.clear_active_session(
-                    context=session_context,
-                    user_canonical_id=session_user_id,
+                    context=clear_context,
+                    user_canonical_id=clear_user,
                     only_if=session_id,
                 )
             except TypeError:
-                # An older redis_buffer implementation without only_if:
-                # keep the pre-existing (unconditional) behaviour.
-                try:
-                    await self.redis_buffer.clear_active_session(
-                        context=session_context,
-                        user_canonical_id=session_user_id,
-                    )
-                except Exception as exc:
-                    logger.debug("clear_active_session failed: %s", exc)
+                # An older redis_buffer implementation without only_if: keep
+                # the pre-existing behaviour — unconditional, and only for
+                # sessions whose identity is actually known.
+                if session_user_id and session_context:
+                    try:
+                        await self.redis_buffer.clear_active_session(
+                            context=session_context,
+                            user_canonical_id=session_user_id,
+                        )
+                    except Exception as exc:
+                        logger.debug("clear_active_session failed: %s", exc)
             except Exception as exc:
                 logger.debug("clear_active_session failed: %s", exc)
 
@@ -2724,6 +2736,15 @@ class UniversalMemoryManager:
         ctx = self._code_memory_context()
         if ctx is None:
             return {"errors": [self._CODE_MEMORY_DISABLED]}
+        if not session_id:
+            # Before the ingest_first pre-pass, not after: an empty id used to
+            # run a full commit-ingest (LLM calls, graph writes) and then
+            # soft-fail inside mine_session — money spent on a call that was
+            # never going to mine anything (PR #4 review).
+            return {"errors": [
+                "session_id is required: pass it explicitly or set "
+                "KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID",
+            ]}
         from kumiho_memory.code_session import mine_session
 
         cfg, project_name, adapter, model = ctx
@@ -3512,16 +3533,22 @@ class UniversalMemoryManager:
 
         Order, and why:
 
-        1. **Host env** (``KUMIHO_SESSION_ID``, else ``CLAUDE_CODE_SESSION_ID``).
-           Claude Code's CLI path leaks its session uuid into spawned MCP
+        1. **Host env** (``KUMIHO_SESSION_ID``, else ``CLAUDE_CODE_SESSION_ID``)
+           — ONLY for identity-less callers (``user_id is None``, the MCP tool
+           default path). Claude Code leaks its session uuid into spawned MCP
            server envs (measured live); when present it is the truest identity
-           available — it survives server restarts within one conversation,
-           where a process-scoped id would mint a fresh bucket per restart
-           against a 1-hour buffer TTL. The resolved id is also WRITTEN to the
-           active-session pointer: two server processes can serve one
-           conversation on the same Redis and only one inherits the env var,
-           so the pointer is how the env-less sibling converges on the same
-           bucket instead of defaulting differently.
+           available and it survives server restarts within one conversation.
+           Skipped for user-scoped callers, because the env names the HOST
+           conversation, not a user: applied to ``ingest(user_id=...)`` it
+           collapsed every user and context on the process into one bucket —
+           cross-user working-memory exposure, and consolidation misfiled
+           under whichever user wrote first (PR #4 review, blocker).
+           This tier never touches the active-session pointer. The write it
+           used to do assumed a sibling server without the env var serves the
+           same conversation; measured, siblings share spawn context and ALL
+           carry the env — the env-less processes belong to DIFFERENT
+           (Desktop-app) conversations, so the write was not convergence, it
+           was one conversation clobbering another's live pointer.
         2. **Active-session pointer** (Redis, 24 h TTL, shared across
            processes and restarts) — ingest's pre-existing continuity
            mechanism, reused rather than reinvented.
@@ -3531,6 +3558,11 @@ class UniversalMemoryManager:
         Never raises; Redis failures degrade exactly as before (WARNING log,
         sequence falls back to 1).
         """
+        if user_id is None:
+            env_session = _host_session_env()
+            if env_session:
+                return env_session, "host-env"
+
         user_canonical_id = user_id or "default"
         context = context or "mcp"
 
@@ -3554,6 +3586,7 @@ class UniversalMemoryManager:
                     return default
             return default
 
+        # Reuse the active session when one exists (persists across restarts within a day).
         active = None
         if hasattr(self.redis_buffer, "get_active_session"):
             active = await _redis_retry(
@@ -3564,22 +3597,6 @@ class UniversalMemoryManager:
                 ),
                 None,
             )
-
-        env_session = _host_session_env()
-        if env_session:
-            if active != env_session and hasattr(self.redis_buffer, "set_active_session"):
-                await _redis_retry(
-                    "set_active_session",
-                    lambda: self.redis_buffer.set_active_session(
-                        context=context,
-                        user_canonical_id=user_canonical_id,
-                        session_id=env_session,
-                    ),
-                    None,
-                )
-            return env_session, "host-env"
-
-        # Reuse the active session when one exists (persists across restarts within a day).
         if active:
             return active, "active-pointer"
 

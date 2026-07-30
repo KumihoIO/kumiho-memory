@@ -372,7 +372,7 @@ def _filter_by_min_score(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_session(args: Dict[str, Any], manager) -> "Tuple[str, str]":
+async def _resolve_session(args: Dict[str, Any], manager) -> "Tuple[str, str]":
     """The session identity for this call, and where it came from.
 
     An explicit argument always wins (backfill and bulk ingest genuinely
@@ -382,11 +382,16 @@ def _resolve_session(args: Dict[str, Any], manager) -> "Tuple[str, str]":
     originate and hold a stable opaque id across turns is what fragmented
     conversation buffers silently (issue #3), so omission is the recommended
     path and every result reports which id was actually used.
+
+    A coroutine on purpose: each handler awaits it inside the SAME
+    ``asyncio.run`` as the operation it precedes. As its own ``asyncio.run``
+    it created a second event loop per tool call, and the redis client — one
+    per loop — was abandoned unclosed every time (PR #4 review).
     """
     explicit = str(args.get("session_id") or "").strip()
     if explicit:
         return explicit, "argument"
-    return asyncio.run(manager.resolve_session_id())
+    return await manager.resolve_session_id()
 
 
 def _annotate_session(
@@ -399,91 +404,119 @@ def _annotate_session(
     return result
 
 
+# Each handler runs resolution and its operation inside ONE asyncio.run.
+# _resolve_session as its own asyncio.run created a second event loop per
+# tool call, and the redis client — one per loop — was abandoned unclosed
+# every time (PR #4 review, measured: 2 clients per call, 0 closed).
+
+
 def tool_chat_add(args: Dict[str, Any]) -> Dict[str, Any]:
     """Add a message to Redis working memory."""
     manager = _get_manager()
-    session_id, source = _resolve_session(args, manager)
-    result = asyncio.run(
-        manager.redis_buffer.add_message(
+
+    async def _run():
+        session_id, source = await _resolve_session(args, manager)
+        result = await manager.redis_buffer.add_message(
             project=args.get("project", manager.project),
             session_id=session_id,
             role=args.get("role", "user"),
             content=args["message"],
             metadata=args.get("metadata"),
         )
-    )
-    return _annotate_session(result, session_id, source)
+        return _annotate_session(result, session_id, source)
+
+    return asyncio.run(_run())
 
 
 def tool_chat_get(args: Dict[str, Any]) -> Dict[str, Any]:
     """Get messages from Redis working memory."""
     manager = _get_manager()
-    session_id, source = _resolve_session(args, manager)
-    result = asyncio.run(
-        manager.redis_buffer.get_messages(
+
+    async def _run():
+        session_id, source = await _resolve_session(args, manager)
+        result = await manager.redis_buffer.get_messages(
             project=args.get("project", manager.project),
             session_id=session_id,
             limit=args.get("limit", 50),
         )
-    )
-    return _annotate_session(result, session_id, source)
+        return _annotate_session(result, session_id, source)
+
+    return asyncio.run(_run())
 
 
 def tool_chat_clear(args: Dict[str, Any]) -> Dict[str, Any]:
     """Clear a session's working memory."""
     manager = _get_manager()
-    session_id, source = _resolve_session(args, manager)
-    result = asyncio.run(
-        manager.redis_buffer.clear_session(
+
+    async def _run():
+        session_id, source = await _resolve_session(args, manager)
+        result = await manager.redis_buffer.clear_session(
             args.get("project", manager.project),
             session_id,
         )
-    )
-    return _annotate_session(result, session_id, source)
+        return _annotate_session(result, session_id, source)
+
+    return asyncio.run(_run())
 
 
 def tool_memory_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Ingest a user message — buffers in Redis and returns context."""
+    """Ingest a user message — buffers in Redis and returns context.
+
+    Resolves through the SAME resolver as the other session-scoped tools.
+    Left to ingest_message's own defaulting it would key the per-(user,
+    context) pointer while chat/reflect key the default one, so an
+    id-omitting MCP conversation split its user turns and assistant turns
+    into two buckets by construction (PR #4 review). Library callers of
+    ingest_message keep the pre-existing per-user defaulting.
+    """
     manager = _get_manager()
-    return asyncio.run(
-        manager.handle_user_message(
+
+    async def _run():
+        session_id, source = await _resolve_session(args, manager)
+        result = await manager.handle_user_message(
             user_id=args["user_id"],
             message=args["message"],
             context=args.get("context", "personal"),
-            session_id=args.get("session_id"),
+            session_id=session_id,
             working_memory_limit=args.get("working_memory_limit", 10),
             recall_limit=args.get("recall_limit", 5),
             evidence_level=args.get("evidence_level"),
             source=args.get("source"),
         )
-    )
+        return _annotate_session(result, session_id, source)
+
+    return asyncio.run(_run())
 
 
 def tool_memory_add_response(args: Dict[str, Any]) -> Dict[str, Any]:
     """Add an assistant response to the session buffer."""
     manager = _get_manager()
-    session_id, source = _resolve_session(args, manager)
-    result = asyncio.run(
-        manager.add_assistant_response(
+
+    async def _run():
+        session_id, source = await _resolve_session(args, manager)
+        result = await manager.add_assistant_response(
             session_id=session_id,
             response=args["response"],
         )
-    )
-    return _annotate_session(result, session_id, source)
+        return _annotate_session(result, session_id, source)
+
+    return asyncio.run(_run())
 
 
 def tool_memory_consolidate(args: Dict[str, Any]) -> Dict[str, Any]:
     """Consolidate a session — summarize, redact PII, store to graph."""
     manager = _get_manager()
-    session_id, source = _resolve_session(args, manager)
-    result = asyncio.run(
-        manager.consolidate_session(
+
+    async def _run():
+        session_id, source = await _resolve_session(args, manager)
+        result = await manager.consolidate_session(
             session_id=session_id,
             evidence_level=args.get("evidence_level"),
             source=args.get("source"),
         )
-    )
-    return _annotate_session(result, session_id, source)
+        return _annotate_session(result, session_id, source)
+
+    return asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -747,13 +780,17 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
     LLM is needed for fact extraction.
     """
     manager = _get_manager()
-    session_id, session_source = _resolve_session(args, manager)
     response = args["response"]
 
-    # 1. Buffer response
-    buf_result = asyncio.run(
-        manager.add_assistant_response(session_id=session_id, response=response)
-    )
+    # 1. Resolve identity + buffer response — one event loop for both.
+    async def _resolve_and_buffer():
+        session_id, session_source = await _resolve_session(args, manager)
+        buf = await manager.add_assistant_response(
+            session_id=session_id, response=response,
+        )
+        return session_id, session_source, buf
+
+    session_id, session_source, buf_result = asyncio.run(_resolve_and_buffer())
     buffered = buf_result.get("success", True)
 
     # 2. Store captures
@@ -984,6 +1021,7 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
             "message in Redis, recalls relevant long-term memories, and "
             "returns working memory + long-term context. This is the main "
             "entry point for AI agents handling user messages."
+            + _SESSION_DEFAULT_NOTE
         ),
         "inputSchema": {
             "type": "object",
@@ -1006,7 +1044,11 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                 "session_id": {
                     "type": "string",
                     "description": (
-                        "Existing session ID. Auto-generated if omitted."
+                        "Existing session ID. If omitted, defaults to the "
+                        "host session (KUMIHO_SESSION_ID / "
+                        "CLAUDE_CODE_SESSION_ID) or the shared active-session "
+                        "pointer; a new id is generated only when neither "
+                        "exists."
                     ),
                 },
                 "working_memory_limit": {
@@ -1699,9 +1741,20 @@ def tool_code_mine_session(args: Dict[str, Any]) -> Dict[str, Any]:
     # ids from a different namespace and would always be wrong here.
     from kumiho_memory.memory_manager import _host_session_env
 
+    session_id = str(args.get("session_id") or _host_session_env() or "").strip()
+    if not session_id:
+        # Fail BEFORE the manager call: with ingest_first=True an empty id
+        # used to run a full commit-ingest pre-pass (LLM calls, graph writes)
+        # and then soft-fail inside mine_session — money spent on a call that
+        # could never mine anything (PR #4 review).
+        return {"errors": [
+            "session_id is required: pass it explicitly or set "
+            "KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID",
+        ]}
+
     return asyncio.run(
         manager.code_mine_session(
-            args.get("session_id") or _host_session_env() or "",
+            session_id,
             conversation_kref=args.get("conversation_kref", ""),
             repo_path=args.get("repo_path", "."),
             ingest_first=args.get("ingest_first", True),
