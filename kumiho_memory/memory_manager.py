@@ -3620,17 +3620,43 @@ class UniversalMemoryManager:
 
         new_session_id = f"{context}:user-{user_hash}:{date}:{sequence:03d}"
 
-        # Persist as the active session so follow-up restarts reuse it until consolidated.
+        # Persist as the active session so follow-up restarts reuse it until
+        # consolidated — as a compare-and-CLAIM, adopting the winner on loss.
+        # A blind SET was last-writer-wins: two concurrent resolutions that
+        # both missed the pointer each minted an id and each registered it,
+        # forking the conversation and orphaning everything written under the
+        # losing id (PR #4 review, round 3). The loser's burned sequence
+        # number is harmless — ids stay unique.
         if hasattr(self.redis_buffer, "set_active_session"):
-            await _redis_retry(
-                "set_active_session",
-                lambda: self.redis_buffer.set_active_session(
-                    context=context,
-                    user_canonical_id=user_canonical_id,
-                    session_id=new_session_id,
-                ),
-                None,
-            )
+            async def _claim():
+                try:
+                    return await self.redis_buffer.set_active_session(
+                        context=context,
+                        user_canonical_id=user_canonical_id,
+                        session_id=new_session_id,
+                        nx=True,
+                    )
+                except TypeError:
+                    # Older buffer without nx: the pre-existing blind write.
+                    await self.redis_buffer.set_active_session(
+                        context=context,
+                        user_canonical_id=user_canonical_id,
+                        session_id=new_session_id,
+                    )
+                    return True
+
+            claimed = await _redis_retry("set_active_session", _claim, None)
+            if claimed is False:
+                winner = await _redis_retry(
+                    "get_active_session",
+                    lambda: self.redis_buffer.get_active_session(
+                        context=context,
+                        user_canonical_id=user_canonical_id,
+                    ),
+                    None,
+                )
+                if winner:
+                    return winner, "active-pointer"
 
         return new_session_id, "generated"
 

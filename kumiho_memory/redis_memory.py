@@ -209,9 +209,11 @@ class RedisMemoryBuffer:
             "metadata": metadata or {},
         }
 
-        await self.client.rpush(key, json.dumps(message))
+        # RPUSH atomically returns the post-push length. A separate LLEN read
+        # raced concurrent writers: two first-writers could both observe
+        # count 2 and NEITHER report created_bucket (PR #4 review, round 3).
+        count = await self.client.rpush(key, json.dumps(message))
         await self.client.expire(key, self.default_ttl)
-        count = await self.client.llen(key)
 
         return {
             "success": True,
@@ -408,22 +410,41 @@ class RedisMemoryBuffer:
         user_canonical_id: str,
         session_id: str,
         ttl_seconds: int = 86400,
-    ) -> None:
-        """Persist the active session_id for a user/context (default TTL 24 h)."""
+        nx: bool = False,
+    ) -> Optional[bool]:
+        """Persist the active session_id for a user/context (default TTL 24 h).
+
+        With ``nx=True`` this is a compare-and-claim: the pointer is written
+        only if absent, and the return value says whether THIS caller won.
+        A blind SET was last-writer-wins — two concurrent resolutions that
+        both missed the pointer each minted an id and both registered it,
+        and everything written under the loser became unreachable to every
+        later default-resolved call (PR #4 review, round 3).
+        """
         if self.client is None:
-            await self._proxy_request(
+            response = await self._proxy_request(
                 action="set_active_session",
                 payload={
                     "context": context,
                     "user_canonical_id": user_canonical_id,
                     "session_id": session_id,
                     "ttl_seconds": ttl_seconds,
+                    # Older proxy servers ignore unknown fields and perform
+                    # the plain SET — the pre-existing behaviour.
+                    "nx": nx,
                 },
             )
-            return
+            if nx:
+                claimed = response.get("claimed") if isinstance(response, dict) else None
+                return True if claimed is None else bool(claimed)
+            return None
 
         key = self._active_session_key(context, user_canonical_id)
+        if nx:
+            result = await self.client.set(key, session_id, ex=ttl_seconds, nx=True)
+            return bool(result)
         await self.client.set(key, session_id, ex=ttl_seconds)
+        return None
 
     async def clear_active_session(
         self,

@@ -57,10 +57,14 @@ class _PointerBuffer:
         return self.active
 
     async def set_active_session(
-        self, *, context, user_canonical_id, session_id, ttl_seconds=86400
+        self, *, context, user_canonical_id, session_id, ttl_seconds=86400,
+        nx=False,
     ):
+        if nx and self.active is not None:
+            return False
         self.active = session_id
         self.set_calls.append(session_id)
+        return True if nx else None
 
     async def next_session_sequence(self, *, user_canonical_id, date_str):
         return 7
@@ -79,8 +83,11 @@ class _FakeRedis:
     async def get(self, key):
         return self.kv.get(key)
 
-    async def set(self, key, value, ex=None):
+    async def set(self, key, value, ex=None, nx=None):
+        if nx and key in self.kv:
+            return None
         self.kv[key] = value
+        return True
 
     async def delete(self, *keys):
         for key in keys:
@@ -248,6 +255,107 @@ def test_generated_as_the_last_resort_and_registered_on_the_pointer():
     assert session_id.startswith("mcp:user-")
     assert session_id.endswith(":007")  # the fake sequence
     assert buffer.set_calls == [session_id]
+
+
+def test_losing_a_concurrent_pointer_claim_adopts_the_winner():
+    """Two concurrent identity-less resolutions that both miss the pointer
+    each mint an id; a blind SET kept only the last writer, and everything
+    written under the loser became unreachable to every later
+    default-resolved call — a silent conversation fork (round 3). The
+    registration is a compare-and-claim: the loser adopts the winner."""
+
+    class _RacyBuffer(_PointerBuffer):
+        """get_active_session misses for the first two callers (modelling
+        two resolvers racing past the read), then serves the claimed value."""
+
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+            self.seq = 0
+
+        async def get_active_session(self, *, context, user_canonical_id):
+            self.reads += 1
+            if self.reads <= 2:
+                return None
+            return self.active
+
+        async def next_session_sequence(self, *, user_canonical_id, date_str):
+            self.seq += 1
+            return self.seq
+
+    buffer = _RacyBuffer()
+    manager = _manager(buffer)
+    first, first_source = asyncio.run(manager.resolve_session_id())
+    second, second_source = asyncio.run(manager.resolve_session_id())
+
+    assert first_source == "generated"
+    assert (second, second_source) == (first, "active-pointer")
+    assert buffer.set_calls == [first]  # the loser never overwrote the claim
+
+
+def test_created_bucket_comes_from_the_atomic_push_not_a_second_read():
+    """RPUSH returns the post-push length atomically; a separate LLEN read
+    raced concurrent writers, and two first-writers could both observe
+    count 2 — neither reporting created_bucket (round 3)."""
+
+    class _LyingLlenRedis(_FakeRedis):
+        async def llen(self, key):
+            return 99  # any handler still consulting LLEN gets nonsense
+
+    buf = RedisMemoryBuffer.__new__(RedisMemoryBuffer)
+    buf.client = _LyingLlenRedis()
+    buf.tenant_id = "tenant-t"
+    buf.tenant_hint = ""
+    buf.default_ttl = 3600
+
+    result = asyncio.run(buf.add_message(
+        project="P", session_id="s1", role="user", content="hi",
+    ))
+    assert result["message_count"] == 1
+    assert result["created_bucket"] is True
+
+
+def test_ingest_treats_a_blank_session_id_as_generate_for_this_user():
+    """Main's ingest resolved `session_id or generate(...)` — "" meant
+    "make one for this user", and callers pass it deliberately. The loud
+    blank rejection belongs to the identity-less tools only (round 3)."""
+    buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+    with patch.object(mcp_tools_module, "_manager", manager):
+        result = mcp_tools_module.tool_memory_ingest(
+            {"user_id": "alice", "message": "hi", "session_id": ""}
+        )
+    assert result["session_id"].startswith("personal:user-")
+    assert result["session_id_source"] == "generated"
+
+
+def test_the_ingest_description_tells_the_truth_about_its_default():
+    """Ingest resolves per-user (env tier deliberately skipped), so the
+    generic note's "defaults to the host session" claim was FALSE on ingest
+    and told the caller the tools converge when they structurally cannot —
+    user turns and assistant turns of one conversation landed in two buckets
+    under the documented convention (round 3, blocker)."""
+    by_name = {t["name"]: t for t in MEMORY_TOOLS}
+    ingest = by_name["kumiho_memory_ingest"]
+
+    # The tool description carries ingest-accurate text and the echo rule.
+    assert "NOT consulted" in ingest["description"]
+    assert "pass that id to the other memory tools" in ingest["description"]
+    assert "usually best omitted" not in ingest["description"]
+
+    # The schema property agrees.
+    prop = ingest["inputSchema"]["properties"]["session_id"]["description"]
+    assert "per-user" in prop
+    assert "KUMIHO_SESSION_ID" not in prop
+
+    # And the identity-less tools now state the convergence exception.
+    for name in SESSION_SCOPED_TOOLS:
+        assert "kumiho_memory_ingest was called" in by_name[name]["description"], name
 
 
 def test_generate_session_id_keeps_its_contract():

@@ -98,17 +98,26 @@ def earns_edge_discovery(capture_type: Optional[str]) -> bool:
     return capture_type in EDGE_DISCOVERY_TYPES
 
 
-# One sentence, shared by every session-scoped tool description, because the
-# TOOL description is the only prose channel that reliably reaches a caller
-# (see the transport notes above MEMORY_TYPES). The caller is an LLM: asking
-# it to originate and hold a stable opaque id across turns is exactly what it
-# gets wrong, and a drifted id used to fragment the conversation buffer
-# silently (issue #3). Omission is now the RECOMMENDED calling convention.
+# One block, shared by the IDENTITY-LESS session-scoped tool descriptions,
+# because the TOOL description is the only prose channel that reliably reaches
+# a caller (see the transport notes above MEMORY_TYPES). The caller is an LLM:
+# asking it to originate and hold a stable opaque id across turns is exactly
+# what it gets wrong, and a drifted id used to fragment the conversation
+# buffer silently (issue #3). Omission is the recommended convention — with
+# the ingest exception spelled out, because ingest resolves PER-USER (its env
+# tier is deliberately skipped: the cross-user collapse blocker) and can never
+# land on the same default as these tools. Without that sentence, a caller
+# following the descriptions filed the user turns (ingest) and assistant
+# turns (add_response) of ONE conversation into two buckets by construction
+# (PR #4 review, round 3). Not appended to ingest, which carries its own
+# accurate text.
 _SESSION_DEFAULT_NOTE = (
-    " session_id is OPTIONAL and best omitted: it defaults to the host "
-    "session (KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID) or the shared "
+    " session_id is OPTIONAL and usually best omitted: it defaults to the "
+    "host session (KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID) or the shared "
     "active-session pointer, and the result reports the session_id used "
-    "plus its session_id_source."
+    "plus its session_id_source. EXCEPTION: if kumiho_memory_ingest was "
+    "called in this conversation, pass the session_id its result reported — "
+    "ingest resolves per-user and does not share this default."
 )
 
 # ---------------------------------------------------------------------------
@@ -495,6 +504,16 @@ def tool_memory_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
     should echo that id explicitly.
     """
     manager = _get_manager()
+
+    # Main's ingest treated a blank session_id as "generate for this user"
+    # (`session_id or _generate_session_id(...)`), and callers exist that
+    # pass "" deliberately. Normalize blank to omission for THIS
+    # identity-bearing tool instead of raising — the loud rejection is for
+    # the identity-less tools, where "" silently resolving to some other
+    # live session would move data between buckets (PR #4 review, round 3).
+    raw_session = args.get("session_id")
+    if raw_session is not None and not str(raw_session).strip():
+        args = {k: v for k, v in args.items() if k != "session_id"}
 
     async def _run():
         session_id, source = await _resolve_session(
@@ -1049,8 +1068,18 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
             "Ingest a user message into AI cognitive memory. Buffers the "
             "message in Redis, recalls relevant long-term memories, and "
             "returns working memory + long-term context. This is the main "
-            "entry point for AI agents handling user messages."
-            + _SESSION_DEFAULT_NOTE
+            "entry point for AI agents handling user messages. "
+            # Ingest-accurate text, NOT the shared note: ingest resolves
+            # per-user, so the generic "defaults to the host session" claim
+            # was false here and told the caller the tools converge when they
+            # structurally cannot (PR #4 review, round 3).
+            "session_id is OPTIONAL: omitted, it defaults to this user's "
+            "active-session pointer for (context, user_id), or a new "
+            "per-user id is generated — the host session env vars are NOT "
+            "consulted for user-scoped ingest. The result reports the "
+            "session_id used; pass that id to the other memory tools "
+            "(add_response, consolidate, reflect) to keep the conversation "
+            "in one bucket."
         ),
         "inputSchema": {
             "type": "object",
@@ -1074,10 +1103,10 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "Existing session ID. If omitted, defaults to the "
-                        "host session (KUMIHO_SESSION_ID / "
-                        "CLAUDE_CODE_SESSION_ID) or the shared active-session "
-                        "pointer; a new id is generated only when neither "
-                        "exists."
+                        "per-user active-session pointer for (context, "
+                        "user_id); a new per-user id is generated when none "
+                        "exists. The host session env vars are NOT consulted "
+                        "for user-scoped ingest."
                     ),
                 },
                 "working_memory_limit": {
