@@ -104,6 +104,11 @@ class _FakeRedis:
     async def expire(self, key, ttl):
         return True
 
+    async def incr(self, key):
+        value = int(self.kv.get(key, 0)) + 1
+        self.kv[key] = value
+        return value
+
     async def hset(self, key, mapping=None):
         self.kv.setdefault(key, {})
         self.kv[key].update(mapping or {})
@@ -743,6 +748,107 @@ def test_consolidating_an_ingest_stamped_process_session_still_rotates_it():
 
     consolidated, fresh = asyncio.run(scenario())
     assert fresh != consolidated
+
+
+def test_consolidating_the_env_session_rotates_its_generation(monkeypatch):
+    """The env value is stable for the whole host conversation, so it cannot
+    rotate itself — without a generation, consolidation left the tool path
+    resolving the cleared bucket forever, and a second consolidation
+    overwrote the first conversation's artifact (round 5). The counter lives
+    in Redis so SIBLING servers derive the same rotated id."""
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-9")
+    client = _FakeRedis()
+    buffer = RedisMemoryBuffer(client=client, redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+
+    async def scenario():
+        first, source = await manager.resolve_session_id()
+        assert (first, source) == ("host-uuid-9", "host-env")
+        await buffer.add_message(
+            project=manager.project, session_id=first,
+            role="user", content="hello",
+        )
+        await manager.consolidate_session(session_id=first)
+        rotated, rotated_source = await manager.resolve_session_id()
+        return rotated, rotated_source
+
+    rotated, source = asyncio.run(scenario())
+    assert (rotated, source) == ("host-uuid-9:c1", "host-env")
+
+    # A sibling server (second manager, same Redis) derives the SAME
+    # rotated id — the counter is shared, not in-process.
+    sibling = UniversalMemoryManager(
+        redis_buffer=RedisMemoryBuffer(client=client, redis_url="redis://test"),
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+    sib_id, _ = asyncio.run(sibling.resolve_session_id())
+    assert sib_id == "host-uuid-9:c1"
+
+
+def test_consolidating_an_old_env_generation_does_not_rotate_the_live_one(
+    monkeypatch,
+):
+    """Exact-generation comparison, not a prefix match: a backfill
+    consolidation of '{env}:c1' while the live conversation sits on
+    '{env}:c2' must not rotate the live session — the same protection
+    only_if gives the pointer (round 5)."""
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-9")
+    client = _FakeRedis()
+    buffer = RedisMemoryBuffer(client=client, redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+
+    async def scenario():
+        # Live conversation is on generation 2.
+        await buffer.bump_session_generation("host-uuid-9")
+        await buffer.bump_session_generation("host-uuid-9")
+        live, _ = await manager.resolve_session_id()
+        assert live == "host-uuid-9:c2"
+        # Backfill-consolidate the OLD generation.
+        await buffer.add_message(
+            project=manager.project, session_id="host-uuid-9:c1",
+            role="user", content="old",
+        )
+        await manager.consolidate_session(session_id="host-uuid-9:c1")
+        after, _ = await manager.resolve_session_id()
+        return after
+
+    assert asyncio.run(scenario()) == "host-uuid-9:c2"
+
+
+def test_a_user_scoped_mint_stamps_identity_metadata(monkeypatch):
+    """Consolidation derives the storage space from session metadata, and
+    only ingest's first-message path wrote it — a session minted by any
+    other identity-scoped call (add_response with user_id, etc.)
+    consolidated into a topic-hint space instead of the user's own
+    (round 5). The mint itself now stamps user_id/context."""
+    buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+    session_id, source = asyncio.run(
+        manager.resolve_session_id(user_id="alice", context="personal")
+    )
+    assert source == "generated"
+    metadata = asyncio.run(
+        buffer.get_session_metadata(manager.project, session_id)
+    )
+    assert metadata.get("user_id") == "alice"
+    assert metadata.get("context") == "personal"
 
 
 def test_a_blank_session_id_is_rejected_not_reinterpreted():

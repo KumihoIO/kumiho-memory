@@ -54,7 +54,18 @@ _SESSION_ENV_VARS = ("KUMIHO_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
 
 
 def _host_session_env() -> Optional[str]:
-    """The host-supplied session id, or None. Read per call, not cached."""
+    """The host-supplied session id, or None. Read per call, not cached.
+
+    KNOWN LIMITATION (PR #4 review, round 5): a process's environment is
+    frozen at spawn, so this value names the conversation the server was
+    STARTED for. A host that rotates its session without respawning the
+    server (Claude Code ``/clear``) leaves it stale, and identity-less
+    defaults keep resolving into the previous conversation's bucket until
+    the server restarts or the buffer TTL expires. The package has no
+    channel to observe the rotation; delivering the live id is
+    host-integration work (kumiho-plugins#45 — the SessionStart hook DOES
+    receive the new session id on /clear and currently discards it).
+    """
     for var in _SESSION_ENV_VARS:
         value = os.getenv(var, "").strip()
         if value:
@@ -1554,6 +1565,31 @@ class UniversalMemoryManager:
         # conversation's artifact (PR #4 review, round 4).
         if getattr(self, "_identityless_session_id", None) == session_id:
             self._identityless_session_id = None
+
+        # And the host-env id: the env value itself cannot rotate, so bump
+        # its Redis generation counter when the session just consolidated IS
+        # the CURRENT env-derived id — the next resolve then lands on
+        # "{env}:c{n+1}" on every sibling server alike (round 5). Exact
+        # comparison against the current generation, not a prefix match: a
+        # backfill consolidation of an OLD generation ("{env}:c1" while the
+        # live conversation sits on "{env}:c2") must not rotate the live
+        # session — the same protection only_if gives the pointer.
+        env_session = _host_session_env()
+        if env_session and hasattr(self.redis_buffer, "bump_session_generation"):
+            try:
+                generation = 0
+                if hasattr(self.redis_buffer, "get_session_generation"):
+                    generation = await self.redis_buffer.get_session_generation(
+                        env_session
+                    ) or 0
+                current_env_id = (
+                    env_session if not generation
+                    else f"{env_session}:c{generation}"
+                )
+                if session_id == current_env_id:
+                    await self.redis_buffer.bump_session_generation(env_session)
+            except Exception as exc:
+                logger.debug("bump_session_generation failed: %s", exc)
 
         return {
             "success": True,
@@ -3577,6 +3613,26 @@ class UniversalMemoryManager:
         if user_id is None:
             env_session = _host_session_env()
             if env_session:
+                # The env value is stable for the whole host conversation,
+                # so consolidation rotates a Redis-persisted GENERATION of
+                # it instead (base id at generation 0, "{id}:c{n}" after).
+                # Without rotation the tool path resolved the consolidated,
+                # cleared bucket forever and a second consolidation
+                # overwrote the first conversation's artifact. The counter
+                # is shared so sibling servers derive the SAME rotated id
+                # and a restart cannot reset it — an in-process generation
+                # would split siblings and revive cleared buckets
+                # (PR #4 review, round 5).
+                generation = 0
+                if hasattr(self.redis_buffer, "get_session_generation"):
+                    try:
+                        generation = await self.redis_buffer.get_session_generation(
+                            env_session
+                        ) or 0
+                    except Exception:
+                        generation = 0  # best-effort: degrade to the base id
+                if generation:
+                    return f"{env_session}:c{generation}", "host-env"
                 return env_session, "host-env"
             # No host identity and no user identity: a PROCESS-scoped id,
             # minted once per server process and never registered on the
@@ -3687,6 +3743,23 @@ class UniversalMemoryManager:
                 )
                 if winner:
                     return winner, "active-pointer"
+
+        # Stamp identity metadata AT THE MINT: consolidation derives the
+        # storage space from it, and only ingest's first-message path used
+        # to write it — a session minted by any other identity-scoped call
+        # (add_response with user_id, etc.) consolidated into a topic-hint
+        # space instead of the user's own (PR #4 review, round 5). Ingest's
+        # own later write is a harmless redundant merge.
+        if hasattr(self.redis_buffer, "set_session_metadata"):
+            await _redis_retry(
+                "set_session_metadata",
+                lambda: self.redis_buffer.set_session_metadata(
+                    self.project,
+                    new_session_id,
+                    {"user_id": user_canonical_id, "context": context},
+                ),
+                None,
+            )
 
         return new_session_id, "generated"
 

@@ -165,6 +165,61 @@ class RedisMemoryBuffer:
             return f"{self.MEMORY_PREFIX}:{tenant_prefix}:session_seq:{user_canonical_id}:{date_str}"
         return f"{self.MEMORY_PREFIX}:session_seq:{user_canonical_id}:{date_str}"
 
+    def _session_generation_key(self, base_session_id: str) -> str:
+        tenant_prefix = self.tenant_id or self.tenant_hint
+        if tenant_prefix:
+            return f"{self.MEMORY_PREFIX}:{tenant_prefix}:session_gen:{base_session_id}"
+        return f"{self.MEMORY_PREFIX}:session_gen:{base_session_id}"
+
+    async def get_session_generation(self, base_session_id: str) -> int:
+        """The consolidation generation of a host-session id (0 = never).
+
+        The host env id is stable for a whole conversation, so consolidation
+        cannot rotate it the way generated ids rotate — without a generation
+        suffix the tool path resolves the consolidated, cleared bucket again
+        and a second consolidation overwrites the first conversation's
+        artifact (PR #4 review, round 5). The counter lives in Redis rather
+        than in-process so sibling server processes derive the SAME rotated
+        id and a server restart cannot silently reset the generation.
+        """
+        if self.client is None:
+            response = await self._proxy_request(
+                action="get_session_generation",
+                payload={"base_session_id": base_session_id},
+            )
+            try:
+                return int(response.get("generation", 0)) if isinstance(response, dict) else 0
+            except (TypeError, ValueError):
+                return 0
+
+        value = await self.client.get(self._session_generation_key(base_session_id))
+        try:
+            return int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    async def bump_session_generation(
+        self, base_session_id: str, *, ttl_seconds: int = 86400
+    ) -> int:
+        """Advance the consolidation generation (see get_session_generation)."""
+        if self.client is None:
+            response = await self._proxy_request(
+                action="bump_session_generation",
+                payload={
+                    "base_session_id": base_session_id,
+                    "ttl_seconds": ttl_seconds,
+                },
+            )
+            try:
+                return int(response.get("generation", 1)) if isinstance(response, dict) else 1
+            except (TypeError, ValueError):
+                return 1
+
+        key = self._session_generation_key(base_session_id)
+        value = await self.client.incr(key)
+        await self.client.expire(key, ttl_seconds)
+        return int(value)
+
     MAX_MESSAGE_SIZE = 64 * 1024  # 64 KiB per message
 
     async def add_message(
