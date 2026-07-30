@@ -113,7 +113,7 @@ def earns_edge_discovery(capture_type: Optional[str]) -> bool:
 # accurate text.
 _SESSION_DEFAULT_NOTE = (
     " session_id is OPTIONAL when the host provides identity: it defaults "
-    "to the host session (KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID), and "
+    "to the host session (KUMIHO_SESSION_ID), and "
     "the result reports the session_id used plus its session_id_source. "
     "With no host identity the call fails with instructions — pass "
     "session_id explicitly and REUSE the same value for the conversation. "
@@ -550,8 +550,12 @@ def tool_memory_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
     # identity-bearing tool instead of raising — the loud rejection is for
     # the identity-less tools, where "" silently resolving to some other
     # live session would move data between buckets (PR #4 review, round 3).
-    raw_session = args.get("session_id")
-    if raw_session is not None and not str(raw_session).strip():
+    # Exactly "" and nothing wider (round 8): main's `session_id or
+    # generate` auto-generated only for the empty string, while a
+    # whitespace-only value reached the buffer and raised there. Normalizing
+    # any blank silently CHANGED "  " from a loud error into a successful
+    # write — _resolve_session's rejection handles it loudly instead.
+    if args.get("session_id") == "":
         args = {k: v for k, v in args.items() if k != "session_id"}
 
     async def _run():
@@ -1839,31 +1843,46 @@ def tool_code_capture(args: Dict[str, Any]) -> Dict[str, Any]:
 def tool_code_mine_session(args: Dict[str, Any]) -> Dict[str, Any]:
     """Mine an agent session's conversation into the code-decision graph."""
     manager = _get_manager()
-    # This session_id names a HOST transcript, not a working-memory bucket:
-    # default from the host env only. The active-session pointer holds bucket
-    # ids from a different namespace and would always be wrong here.
     from kumiho_memory.memory_manager import _host_session_env
 
-    session_id = str(args.get("session_id") or _host_session_env() or "").strip()
-    if not session_id:
-        # Fail BEFORE the manager call: with ingest_first=True an empty id
-        # used to run a full commit-ingest pre-pass (LLM calls, graph writes)
-        # and then soft-fail inside mine_session — money spent on a call that
-        # could never mine anything (PR #4 review).
-        return {"errors": [
-            "session_id is required: pass it explicitly or set "
-            "KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID",
-        ]}
-
-    return asyncio.run(
-        manager.code_mine_session(
+    async def _run():
+        raw = args.get("session_id")
+        if raw is not None:
+            session_id = str(raw).strip()
+            if not session_id:
+                # Provided-but-blank is an ERROR, not an omission — main
+                # guaranteed a loud failure for it, and reinterpreting it
+                # would mine some other session on a typo (round 8).
+                return {"errors": [
+                    "session_id, when provided, must be a non-empty string; "
+                    "omit it to default to the current host session",
+                ]}
+        else:
+            if not _host_session_env():
+                # Fail BEFORE the manager call: with ingest_first=True an
+                # empty id used to run a full commit-ingest pre-pass (LLM
+                # calls, graph writes) and then soft-fail inside
+                # mine_session (PR #4 review).
+                return {"errors": [
+                    "session_id is required: pass it explicitly or set "
+                    "KUMIHO_SESSION_ID",
+                ]}
+            # Through the GENERATION-AWARE resolver, not the raw env value:
+            # mine_session loads its transcript from the same Redis
+            # working-memory bucket the identity-less tools write, so after
+            # any consolidation the raw env id named the consolidated,
+            # cleared base bucket while the live segment sat in the rotated
+            # one — a guaranteed spend-then-soft-fail (round 8).
+            session_id, _source = await manager.resolve_session_id()
+        return await manager.code_mine_session(
             session_id,
             conversation_kref=args.get("conversation_kref", ""),
             repo_path=args.get("repo_path", "."),
             ingest_first=args.get("ingest_first", True),
             force=args.get("force", False),
         )
-    )
+
+    return asyncio.run(_run())
 
 
 def tool_memory_decompose(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2017,7 +2036,7 @@ _CODE_MEMORY_TOOLS: List[Dict[str, Any]] = [
             "reached a commit, and bridge decisions to the consolidated "
             "conversation. session_id (a HOST transcript id) is optional — "
             "omitted, it defaults to the current host session "
-            "(KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID)."
+            "(KUMIHO_SESSION_ID)."
         ),
         "inputSchema": {
             "type": "object",

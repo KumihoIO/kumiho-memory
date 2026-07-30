@@ -44,28 +44,28 @@ RetrieveCallable = Callable[..., Any]
 # once before falling back to a fresh sequence (see _generate_session_id).
 _SESSION_REDIS_RETRY_BACKOFF = 0.05
 
-# Env vars that can carry the HOST's session identity into this process, in
-# precedence order. KUMIHO_SESSION_ID is the explicit contract (a host or
-# launcher that wants to name the session sets it); CLAUDE_CODE_SESSION_ID is
-# Claude Code's own variable, observed inherited by MCP server processes on
-# the CLI launch path (and absent on the Desktop local-agent path — callers
-# must not assume it). See MemoryManager.resolve_session_id.
-_SESSION_ENV_VARS = ("KUMIHO_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
+# The env var that carries the HOST's session identity into this process.
+# KUMIHO_SESSION_ID is an explicit CONTRACT: whoever sets it promises the
+# value names THIS server process's conversation for the process's lifetime
+# — which makes rotation correctness the setter's responsibility, where the
+# knowledge lives (kumiho-plugins#45).
+#
+# CLAUDE_CODE_SESSION_ID was deliberately REMOVED from this list (PR #4
+# review, round 8). It reaches server processes by env inheritance — an
+# accident, not a promise — frozen at spawn, and Claude Code rotates its
+# session on /clear WITHOUT respawning the server: trusting it silently
+# merged the post-/clear conversation into the previous one's bucket. This
+# resolver refuses exactly that class of silent merge for every other
+# population; honoring an accidental frozen var for the CLI population was
+# the one inconsistency left. The plugin launcher may still set
+# KUMIHO_SESSION_ID FROM Claude's variable — by doing so it owns the
+# staleness and can fix it with the live channel it already has (the
+# SessionStart hook receives the rotated id on /clear).
+_SESSION_ENV_VARS = ("KUMIHO_SESSION_ID",)
 
 
 def _host_session_env() -> Optional[str]:
-    """The host-supplied session id, or None. Read per call, not cached.
-
-    KNOWN LIMITATION (PR #4 review, round 5): a process's environment is
-    frozen at spawn, so this value names the conversation the server was
-    STARTED for. A host that rotates its session without respawning the
-    server (Claude Code ``/clear``) leaves it stale, and identity-less
-    defaults keep resolving into the previous conversation's bucket until
-    the server restarts or the buffer TTL expires. The package has no
-    channel to observe the rotation; delivering the live id is
-    host-integration work (kumiho-plugins#45 — the SessionStart hook DOES
-    receive the new session id on /clear and currently discards it).
-    """
+    """The host-supplied session id, or None. Read per call, not cached."""
     for var in _SESSION_ENV_VARS:
         value = os.getenv(var, "").strip()
         if value:
@@ -1513,6 +1513,53 @@ class UniversalMemoryManager:
                             "code session mining failed (non-fatal): %s", exc,
                         )
 
+        # The host-env id: the env value itself cannot rotate, so bump
+        # BEFORE the buffer clear (round 8): a sibling resolving in the
+        # window then derives the NEXT generation and its write lands in
+        # a surviving bucket, instead of the just-cleared one where it
+        # would be stranded until TTL with no future consolidation ever
+        # addressing it. The bump itself cannot rotate the wrong thing —
+        # the exact current-generation comparison below still holds.
+        # its Redis generation counter when the session just consolidated IS
+        # the CURRENT env-derived id — the next resolve then lands on
+        # "{env}:c{n+1}" on every sibling server alike (round 5). Exact
+        # comparison against the current generation, not a prefix match: a
+        # backfill consolidation of an OLD generation ("{env}:c1" while the
+        # live conversation sits on "{env}:c2") must not rotate the live
+        # session — the same protection only_if gives the pointer.
+        env_session = _host_session_env()
+        if env_session and hasattr(self.redis_buffer, "bump_session_generation"):
+            # One retry, then a WARNING — never silent (round 7): an
+            # unrotated generation after a flake means identity-less
+            # resolves keep reusing the just-consolidated bucket, and the
+            # next consolidation overwrites this one's artifact. Debug-only
+            # logging hid exactly that exposure.
+            for attempt in range(2):
+                try:
+                    generation = 0
+                    if hasattr(self.redis_buffer, "get_session_generation"):
+                        generation = await self.redis_buffer.get_session_generation(
+                            env_session
+                        ) or 0
+                    current_env_id = (
+                        env_session if not generation
+                        else f"{env_session}:c{generation}"
+                    )
+                    if session_id == current_env_id:
+                        await self.redis_buffer.bump_session_generation(env_session)
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        await asyncio.sleep(_SESSION_REDIS_RETRY_BACKOFF)
+                        continue
+                    logger.warning(
+                        "bump_session_generation failed after retry (%s); env "
+                        "session %s was NOT rotated — identity-less resolves "
+                        "will reuse the consolidated bucket until the next "
+                        "successful consolidation.",
+                        exc, env_session,
+                    )
+
         await self.redis_buffer.clear_session(self.project, session_id)
 
         # Clear the active session pointer so the next conversation starts
@@ -1558,46 +1605,6 @@ class UniversalMemoryManager:
                 except Exception as exc:
                     logger.debug("clear_active_session failed: %s", exc)
 
-        # The host-env id: the env value itself cannot rotate, so bump
-        # its Redis generation counter when the session just consolidated IS
-        # the CURRENT env-derived id — the next resolve then lands on
-        # "{env}:c{n+1}" on every sibling server alike (round 5). Exact
-        # comparison against the current generation, not a prefix match: a
-        # backfill consolidation of an OLD generation ("{env}:c1" while the
-        # live conversation sits on "{env}:c2") must not rotate the live
-        # session — the same protection only_if gives the pointer.
-        env_session = _host_session_env()
-        if env_session and hasattr(self.redis_buffer, "bump_session_generation"):
-            # One retry, then a WARNING — never silent (round 7): an
-            # unrotated generation after a flake means identity-less
-            # resolves keep reusing the just-consolidated bucket, and the
-            # next consolidation overwrites this one's artifact. Debug-only
-            # logging hid exactly that exposure.
-            for attempt in range(2):
-                try:
-                    generation = 0
-                    if hasattr(self.redis_buffer, "get_session_generation"):
-                        generation = await self.redis_buffer.get_session_generation(
-                            env_session
-                        ) or 0
-                    current_env_id = (
-                        env_session if not generation
-                        else f"{env_session}:c{generation}"
-                    )
-                    if session_id == current_env_id:
-                        await self.redis_buffer.bump_session_generation(env_session)
-                    break
-                except Exception as exc:
-                    if attempt == 0:
-                        await asyncio.sleep(_SESSION_REDIS_RETRY_BACKOFF)
-                        continue
-                    logger.warning(
-                        "bump_session_generation failed after retry (%s); env "
-                        "session %s was NOT rotated — identity-less resolves "
-                        "will reuse the consolidated bucket until the next "
-                        "successful consolidation.",
-                        exc, env_session,
-                    )
 
         return {
             "success": True,
@@ -2800,7 +2807,7 @@ class UniversalMemoryManager:
             # never going to mine anything (PR #4 review).
             return {"errors": [
                 "session_id is required: pass it explicitly or set "
-                "KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID",
+                "KUMIHO_SESSION_ID",
             ]}
         from kumiho_memory.code_session import mine_session
 
@@ -3603,7 +3610,7 @@ class UniversalMemoryManager:
 
         Order, and why:
 
-        1. **Host env** (``KUMIHO_SESSION_ID``, else ``CLAUDE_CODE_SESSION_ID``)
+        1. **Host env** (``KUMIHO_SESSION_ID``, the explicit contract)
            — ONLY for identity-less callers (``user_id is None``, the MCP tool
            default path). Claude Code leaks its session uuid into spawned MCP
            server envs (measured live); when present it is the truest identity
@@ -3692,7 +3699,7 @@ class UniversalMemoryManager:
             # kumiho-plugins#45.
             raise ValueError(
                 "no session identity available: no session_id argument, no "
-                "user_id, and no KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID "
+                "user_id, and no KUMIHO_SESSION_ID "
                 "in the environment. Pass session_id explicitly and REUSE "
                 "the same value for this conversation."
             )

@@ -202,7 +202,7 @@ def test_the_env_tier_is_skipped_for_user_scoped_callers(monkeypatch):
     memory, and consolidation filed bob's turns under alice's space — the
     blocker from the PR #4 review. A user-scoped caller must resolve
     per-(context, user) exactly as on main, env or no env."""
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "host-uuid-1")
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-1")
     alice_buf = _PointerBuffer()
     alice, source_a = asyncio.run(
         _manager(alice_buf).resolve_session_id(user_id="alice", context="personal")
@@ -217,21 +217,17 @@ def test_the_env_tier_is_skipped_for_user_scoped_callers(monkeypatch):
     assert (source_a, source_b) == ("generated", "generated")
 
 
-def test_claude_code_session_id_is_the_fallback_env(monkeypatch):
+def test_claude_code_session_id_is_no_longer_honored(monkeypatch):
+    """CLAUDE_CODE_SESSION_ID reaches the server by env inheritance — an
+    accident frozen at spawn, and Claude Code rotates its session on /clear
+    WITHOUT respawning the server: trusting it silently merged the
+    post-/clear conversation into the previous one's bucket (round 8). Only
+    the explicit KUMIHO_SESSION_ID contract resolves; the launcher that sets
+    it owns rotation correctness (kumiho-plugins#45)."""
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-uuid-9")
     buffer = _PointerBuffer()
-    session_id, source = asyncio.run(_manager(buffer).resolve_session_id())
-    assert (session_id, source) == ("cc-uuid-9", "host-env")
-
-
-def test_kumiho_session_id_outranks_claude_code(monkeypatch):
-    """KUMIHO_SESSION_ID is the explicit contract; the Claude variable is an
-    observed inheritance. Explicit beats observed."""
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-uuid-9")
-    monkeypatch.setenv("KUMIHO_SESSION_ID", "kumiho-uuid-1")
-    buffer = _PointerBuffer()
-    session_id, _ = asyncio.run(_manager(buffer).resolve_session_id())
-    assert session_id == "kumiho-uuid-1"
+    with pytest.raises(ValueError):
+        asyncio.run(_manager(buffer).resolve_session_id())
 
 
 def test_env_matching_pointer_does_not_rewrite_it(monkeypatch):
@@ -367,6 +363,96 @@ def test_ingest_treats_a_blank_session_id_as_generate_for_this_user():
     assert result["session_id_source"] == "generated"
 
 
+def test_ingest_rejects_a_whitespace_only_session_id():
+    """Main auto-generated only for exactly "" — a whitespace-only value
+    reached the buffer and raised there, with zero writes. Normalizing any
+    blank silently converted that loud error into a successful write to a
+    resolved session (round 8)."""
+    stub = _StubManager()
+    with patch.object(mcp_tools_module, "_manager", stub):
+        with pytest.raises(ValueError):
+            mcp_tools_module.tool_memory_ingest(
+                {"user_id": "alice", "message": "hi", "session_id": "   "}
+            )
+    assert "op_session" not in stub.seen  # nothing was written
+
+
+def test_code_mine_omission_defaults_through_the_rotated_generation(monkeypatch):
+    """mine_session loads its transcript from the SAME Redis working-memory
+    bucket the identity-less tools write, so the raw env value named the
+    consolidated, cleared BASE bucket after any rotation — a guaranteed
+    spend-then-soft-fail for the tool's zero-argument usage (round 8). The
+    omission default must go through the generation-aware resolver."""
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-9")
+    mined = []
+
+    class _Spy:
+        async def resolve_session_id(self, user_id=None, context=None):
+            return "host-uuid-9:c1", "host-env"
+
+        async def code_mine_session(self, session_id, **kwargs):
+            mined.append(session_id)
+            return {"mined": session_id}
+
+    with patch.object(mcp_tools_module, "_manager", _Spy()):
+        result = mcp_tools_module.tool_code_mine_session({})
+    assert mined == ["host-uuid-9:c1"]
+    assert result == {"mined": "host-uuid-9:c1"}
+
+    # Provided-but-blank is an error, never reinterpreted — even with env.
+    mined.clear()
+    with patch.object(mcp_tools_module, "_manager", _Spy()):
+        for blank in ("", "   "):
+            result = mcp_tools_module.tool_code_mine_session({"session_id": blank})
+            assert "errors" in result
+    assert mined == []
+
+
+def test_the_generation_bump_happens_before_the_buffer_clear(monkeypatch):
+    """Ordering (round 8): bump BEFORE clear, so a sibling resolving in the
+    window derives the next generation and writes into a bucket that
+    survives — after-clear bumping stranded such writes in the cleared
+    bucket until TTL, unrecoverable by any future consolidation."""
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-9")
+
+    class _OpOrderRedis(_FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.ops = []
+
+        async def incr(self, key):
+            self.ops.append(("incr", key))
+            return await super().incr(key)
+
+        async def delete(self, *keys):
+            for key in keys:
+                self.ops.append(("delete", key))
+            return await super().delete(*keys)
+
+    client = _OpOrderRedis()
+    buffer = RedisMemoryBuffer(client=client, redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+
+    async def scenario():
+        await buffer.add_message(
+            project=manager.project, session_id="host-uuid-9",
+            role="user", content="hello",
+        )
+        await manager.consolidate_session(session_id="host-uuid-9")
+
+    asyncio.run(scenario())
+    incr_at = next(i for i, (op, k) in enumerate(client.ops)
+                   if op == "incr" and "session_gen" in k)
+    clear_at = next(i for i, (op, k) in enumerate(client.ops)
+                    if op == "delete" and ":messages" in k)
+    assert incr_at < clear_at
+
+
 def test_the_ingest_description_tells_the_truth_about_its_default():
     """Ingest resolves per-user (env tier deliberately skipped), so the
     generic note's "defaults to the host session" claim was FALSE on ingest
@@ -402,7 +488,7 @@ def test_repeating_the_ingest_user_id_converges_on_the_same_bucket(monkeypatch):
     properties make it structural: the caller repeats the same user_id it
     gave ingest, and resolution lands on the identical (context, user)
     session — even with a host env present."""
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "host-uuid-1")
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-1")
     buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
     manager = UniversalMemoryManager(
         redis_buffer=buffer,
@@ -651,7 +737,7 @@ def test_mcp_ingest_keeps_users_apart_even_under_a_host_env(monkeypatch):
     under alice's space. The handler must thread user_id/context so the
     resolver's user-scoped path applies exactly as it does for library
     callers."""
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "host-uuid-1")
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-1")
     buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
     manager = UniversalMemoryManager(
         redis_buffer=buffer,
