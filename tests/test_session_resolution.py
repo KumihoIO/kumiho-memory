@@ -242,28 +242,24 @@ def test_env_matching_pointer_does_not_rewrite_it(monkeypatch):
     assert buffer.set_calls == []
 
 
-def test_identity_less_env_less_resolution_is_process_scoped():
-    """No host identity and no user identity: the id is process-scoped and
-    the shared pointer is never touched. Routing this path through the
-    single ('mcp','default') pointer merged every env-less conversation on
-    one Redis into one bucket and let a fresh conversation silently resume
-    the previous one for the pointer's 24 h TTL (round 4). One stdio server
-    serves one conversation, so the process is the truest identity here."""
+def test_identity_less_env_less_resolution_refuses_loudly():
+    """No host identity and no user identity: REFUSE with instructions.
+
+    Every silent default tried here was a cross-conversation merge in
+    disguise — the shared ('mcp','default') pointer merged env-less
+    conversations across processes (round 4), and the process-scoped id
+    that replaced it merged every chat on hosts that keep ONE server
+    across conversations, which is exactly the env-less Claude Desktop
+    topology (round 6). With no per-conversation signal there is nothing
+    correct to default to; the pointer must also stay untouched."""
     buffer = _PointerBuffer(active="somebody-elses-live-session")
     manager = _manager(buffer)
-    first, source = asyncio.run(manager.resolve_session_id())
-    second, _ = asyncio.run(manager.resolve_session_id())
-
-    assert source == "process"
-    assert first.startswith("mcp:proc-")
-    assert second == first                     # stable within the process
-    assert buffer.set_calls == []              # the pointer was never written
+    with pytest.raises(ValueError) as excinfo:
+        asyncio.run(manager.resolve_session_id())
+    assert "no session identity available" in str(excinfo.value)
+    assert "REUSE" in str(excinfo.value)
+    assert buffer.set_calls == []
     assert buffer.active == "somebody-elses-live-session"
-
-    # A second manager (modelling another server process on the same Redis)
-    # gets its OWN conversation id — no cross-conversation merge.
-    other, _ = asyncio.run(_manager(_PointerBuffer()).resolve_session_id())
-    assert other != first
 
 
 def test_user_scoped_resolution_reuses_the_pointer():
@@ -647,47 +643,6 @@ def test_every_session_scoped_handler_resolves_and_reports_when_omitted(
     assert result["session_id_source"] == "host-env", handler_name
 
 
-def test_consolidating_the_process_session_rotates_it():
-    """Identity-less resolution caches its id on the manager. Consolidation
-    must invalidate that cache, or the tool path keeps resolving the
-    consolidated, now-empty session forever — and a second consolidation
-    under the same id would overwrite the first conversation's artifact."""
-    buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
-    manager = UniversalMemoryManager(
-        redis_buffer=buffer,
-        summarizer=StubSummarizer(),
-        pii_redactor=StubRedactor(),
-        memory_store=None,
-    )
-
-    async def scenario():
-        session_id, source = await manager.resolve_session_id()
-        assert source == "process"
-        await buffer.add_message(
-            project=manager.project, session_id=session_id,
-            role="user", content="hello",
-        )
-        await manager.consolidate_session(session_id=session_id)
-        fresh, _ = await manager.resolve_session_id()
-        return session_id, fresh
-
-    consolidated, fresh = asyncio.run(scenario())
-    assert fresh != consolidated
-
-    async def backfill_scenario():
-        live, _ = await manager.resolve_session_id()
-        await buffer.add_message(
-            project=manager.project, session_id="historical-backfill",
-            role="user", content="old",
-        )
-        await manager.consolidate_session(session_id="historical-backfill")
-        after, _ = await manager.resolve_session_id()
-        return live, after
-
-    live, after = asyncio.run(backfill_scenario())
-    assert after == live  # consolidating a backfill id never rotates the live one
-
-
 def test_mcp_ingest_keeps_users_apart_even_under_a_host_env(monkeypatch):
     """The round-2 blocker: routing ingest through the shared resolver
     WITHOUT its identity bypassed the env-tier guard from the MCP side —
@@ -719,35 +674,6 @@ def test_mcp_ingest_keeps_users_apart_even_under_a_host_env(monkeypatch):
     assert bob["session_id"].startswith("work:user-")
     bob_texts = [m.get("content", "") for m in bob.get("working_memory", [])]
     assert all("alice" not in t for t in bob_texts)
-
-
-def test_consolidating_an_ingest_stamped_process_session_still_rotates_it():
-    """A session's cached process id and its metadata identity can disagree:
-    identity-less resolution mints the id, and a later ingest stamps user
-    metadata onto the SAME session. Consolidation derives its pointer-clear
-    keys from that metadata — the process cache must be invalidated
-    regardless, or the tool path keeps resolving the cleared session
-    (rounds 2 and 4)."""
-    buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
-    manager = UniversalMemoryManager(
-        redis_buffer=buffer,
-        summarizer=StubSummarizer(),
-        pii_redactor=StubRedactor(),
-        memory_store=None,
-    )
-
-    async def scenario():
-        session_id, _ = await manager.resolve_session_id()
-        await manager.ingest_message(
-            user_id="alice", message="hello", context="personal",
-            session_id=session_id,
-        )
-        await manager.consolidate_session(session_id=session_id)
-        fresh, _ = await manager.resolve_session_id()
-        return session_id, fresh
-
-    consolidated, fresh = asyncio.run(scenario())
-    assert fresh != consolidated
 
 
 def test_consolidating_the_env_session_rotates_its_generation(monkeypatch):
@@ -825,6 +751,59 @@ def test_consolidating_an_old_env_generation_does_not_rotate_the_live_one(
         return after
 
     assert asyncio.run(scenario()) == "host-uuid-9:c2"
+
+
+def test_reading_the_generation_slides_its_ttl():
+    """Bump-only expiry meant a conversation that stayed on one env id for
+    more than 24 h after its last consolidation regressed to the base
+    '{env}' id — the consolidated, cleared bucket, and the artifact-
+    overwrite target the generation exists to protect (round 6). Reading
+    must refresh the TTL so the counter lives as long as the conversation."""
+
+    class _ExpireTrackingRedis(_FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.expired_keys = []
+
+        async def expire(self, key, ttl):
+            self.expired_keys.append((key, ttl))
+            return True
+
+    buf = RedisMemoryBuffer.__new__(RedisMemoryBuffer)
+    buf.client = _ExpireTrackingRedis()
+    buf.tenant_id = "tenant-t"
+    buf.tenant_hint = ""
+    buf.default_ttl = 3600
+
+    # Generation 0: nothing to keep alive, no refresh.
+    assert asyncio.run(buf.get_session_generation("host-uuid-9")) == 0
+    assert buf.client.expired_keys == []
+
+    asyncio.run(buf.bump_session_generation("host-uuid-9"))
+    buf.client.expired_keys.clear()
+
+    # A live generation is refreshed on every read.
+    assert asyncio.run(buf.get_session_generation("host-uuid-9")) == 1
+    assert len(buf.client.expired_keys) == 1
+    assert buf.client.expired_keys[0][1] == 86400
+
+
+def test_generation_helpers_degrade_when_the_proxy_is_older():
+    """An older proxy server does not know the generation actions; the
+    helpers must degrade (generation 0, no rotation) instead of raising —
+    the same precedent as only_if/nx (round 6)."""
+    buf = RedisMemoryBuffer.__new__(RedisMemoryBuffer)
+    buf.client = None
+    buf.tenant_id = "tenant-t"
+    buf.tenant_hint = ""
+    buf.default_ttl = 3600
+
+    async def failing_proxy(*, action, payload):
+        raise RuntimeError(f"unknown action: {action}")
+
+    buf._proxy_request = failing_proxy
+    assert asyncio.run(buf.get_session_generation("host-uuid-9")) == 0
+    assert asyncio.run(buf.bump_session_generation("host-uuid-9")) == 1
 
 
 def test_a_user_scoped_mint_stamps_identity_metadata(monkeypatch):

@@ -1558,15 +1558,7 @@ class UniversalMemoryManager:
                 except Exception as exc:
                     logger.debug("clear_active_session failed: %s", exc)
 
-        # Rotate the process-scoped default too: identity-less resolution
-        # caches its id on the manager, and without this the tool path kept
-        # resolving the consolidated, now-empty session forever — and a
-        # second consolidation under the same id would overwrite the first
-        # conversation's artifact (PR #4 review, round 4).
-        if getattr(self, "_identityless_session_id", None) == session_id:
-            self._identityless_session_id = None
-
-        # And the host-env id: the env value itself cannot rotate, so bump
+        # The host-env id: the env value itself cannot rotate, so bump
         # its Redis generation counter when the session just consolidated IS
         # the CURRENT env-derived id — the next resolve then lands on
         # "{env}:c{n+1}" on every sibling server alike (round 5). Exact
@@ -3574,14 +3566,24 @@ class UniversalMemoryManager:
         """Resolve the session identity for a caller that did not name one.
 
         Returns ``(session_id, source)``; source is ``host-env``,
-        ``process``, ``active-pointer`` or ``generated``. ONE resolver for
-        every defaulting path on purpose (issue #3): ingest already defaulted
+        ``active-pointer`` or ``generated``. ONE resolver for every
+        defaulting path on purpose (issue #3): ingest already defaulted
         through the active-session pointer while chat/reflect required an
         explicit id, so giving the tools a default of their own would have
         split an id-omitting caller's conversation across two buckets by
         construction. Identity-less callers (user_id is None) resolve to the
-        host session, else a process-scoped id; user-scoped callers resolve
-        per (context, user) through the shared pointer.
+        host session; user-scoped callers resolve per (context, user)
+        through the shared pointer.
+
+        Raises ``ValueError`` when NO identity exists (no user_id and no
+        host env): every silent default tried for that population was a
+        cross-conversation merge in disguise — the shared pointer merged
+        env-less conversations across processes (round 4), and a
+        process-scoped id merged every chat on hosts that keep one server
+        across conversations, which is exactly the env-less Desktop
+        topology (round 6). The error instructs the caller to pass an
+        explicit id and reuse it; host-side identity delivery is
+        kumiho-plugins#45.
 
         Order, and why:
 
@@ -3607,8 +3609,9 @@ class UniversalMemoryManager:
         3. **Generated** ``{context}:user-{hash}:{date}:{seq}`` — the
            pre-existing format, pointer-registered so followers reuse it.
 
-        Never raises; Redis failures degrade exactly as before (WARNING log,
-        sequence falls back to 1).
+        Beyond the no-identity ValueError above, never raises; Redis
+        failures degrade exactly as before (WARNING log, sequence falls
+        back to 1).
         """
         if user_id is None:
             env_session = _host_session_env()
@@ -3634,24 +3637,24 @@ class UniversalMemoryManager:
                 if generation:
                     return f"{env_session}:c{generation}", "host-env"
                 return env_session, "host-env"
-            # No host identity and no user identity: a PROCESS-scoped id,
-            # minted once per server process and never registered on the
-            # shared pointer. The pointer cannot distinguish conversations —
-            # routing identity-less callers through the single
-            # ("mcp", "default") key merged every env-less conversation on
-            # one Redis into one bucket, and let a fresh conversation
-            # silently resume the previous one for the pointer's 24 h TTL
-            # (PR #4 review, round 4). One stdio server serves one
-            # conversation (measured), so the process is the truest
-            # conversation identity available here; a mid-conversation
-            # server restart minting a fresh bucket is the accepted cost —
-            # cross-conversation working-memory bleed was not.
-            cached = getattr(self, "_identityless_session_id", None)
-            if cached:
-                return cached, "process"
-            new_id = f"mcp:proc-{uuid.uuid4().hex[:12]}"
-            self._identityless_session_id = new_id
-            return new_id, "process"
+            # No host identity and no user identity: REFUSE, loudly. Every
+            # silent default tried here was a cross-conversation merge in
+            # disguise. The shared ("mcp","default") pointer merged every
+            # env-less conversation on one Redis (round 4); the process-
+            # scoped id that replaced it merged every chat on hosts that
+            # keep ONE server across conversations — Claude Desktop launches
+            # stdio servers once per app run, which is exactly the env-less
+            # population (round 6). With no per-conversation signal there is
+            # nothing correct to default to; a loud instruction beats a
+            # silent bleed, and the created_bucket flag makes an explicit
+            # id's drift visible. Host-side identity delivery is
+            # kumiho-plugins#45.
+            raise ValueError(
+                "no session identity available: no session_id argument, no "
+                "user_id, and no KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID "
+                "in the environment. Pass session_id explicitly and REUSE "
+                "the same value for this conversation."
+            )
 
         user_canonical_id = user_id
         context = context or "mcp"

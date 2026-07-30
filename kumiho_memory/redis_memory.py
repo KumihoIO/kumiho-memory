@@ -183,33 +183,55 @@ class RedisMemoryBuffer:
         id and a server restart cannot silently reset the generation.
         """
         if self.client is None:
-            response = await self._proxy_request(
-                action="get_session_generation",
-                payload={"base_session_id": base_session_id},
-            )
+            try:
+                response = await self._proxy_request(
+                    action="get_session_generation",
+                    payload={"base_session_id": base_session_id},
+                )
+            except Exception:
+                # An older proxy server does not know this action; degrade
+                # to generation 0 (the base id) — the pre-existing
+                # behaviour, same precedent as only_if/nx (round 6).
+                return 0
             try:
                 return int(response.get("generation", 0)) if isinstance(response, dict) else 0
             except (TypeError, ValueError):
                 return 0
 
-        value = await self.client.get(self._session_generation_key(base_session_id))
+        key = self._session_generation_key(base_session_id)
+        value = await self.client.get(key)
         try:
-            return int(value) if value is not None else 0
+            generation = int(value) if value is not None else 0
         except (TypeError, ValueError):
             return 0
+        if generation:
+            # SLIDING TTL: bump-only expiry meant a conversation that stayed
+            # on one env id for >24h after its last consolidation regressed
+            # to the base '{env}' id — the consolidated, cleared bucket, and
+            # the artifact-overwrite target the generation exists to protect
+            # (round 6). Refreshing on read keeps the counter alive for as
+            # long as the conversation is.
+            await self.client.expire(key, 86400)
+        return generation
 
     async def bump_session_generation(
         self, base_session_id: str, *, ttl_seconds: int = 86400
     ) -> int:
         """Advance the consolidation generation (see get_session_generation)."""
         if self.client is None:
-            response = await self._proxy_request(
-                action="bump_session_generation",
-                payload={
-                    "base_session_id": base_session_id,
-                    "ttl_seconds": ttl_seconds,
-                },
-            )
+            try:
+                response = await self._proxy_request(
+                    action="bump_session_generation",
+                    payload={
+                        "base_session_id": base_session_id,
+                        "ttl_seconds": ttl_seconds,
+                    },
+                )
+            except Exception:
+                # Older proxy server: rotation silently unavailable on
+                # hosted until the server learns the action — documented
+                # degradation, same precedent as only_if/nx (round 6).
+                return 1
             try:
                 return int(response.get("generation", 1)) if isinstance(response, dict) else 1
             except (TypeError, ValueError):

@@ -112,13 +112,14 @@ def earns_edge_discovery(capture_type: Optional[str]) -> bool:
 # (PR #4 review, round 3). Not appended to ingest, which carries its own
 # accurate text.
 _SESSION_DEFAULT_NOTE = (
-    " session_id is OPTIONAL and usually best omitted: it defaults to the "
-    "host session (KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID) or, absent "
-    "those, a stable per-process conversation id; the result reports the "
-    "session_id used plus its session_id_source. EXCEPTION: in the "
-    "kumiho_memory_ingest workflow, pass the same user_id (and context) you "
-    "gave ingest — the call then resolves into that user's session, which "
-    "does not share the conversation default."
+    " session_id is OPTIONAL when the host provides identity: it defaults "
+    "to the host session (KUMIHO_SESSION_ID / CLAUDE_CODE_SESSION_ID), and "
+    "the result reports the session_id used plus its session_id_source. "
+    "With no host identity the call fails with instructions — pass "
+    "session_id explicitly and REUSE the same value for the conversation. "
+    "EXCEPTION: in the kumiho_memory_ingest workflow, pass the same "
+    "user_id (and context) you gave ingest — the call then resolves into "
+    "that user's session."
 )
 
 # Optional identity properties advertised on every identity-less
