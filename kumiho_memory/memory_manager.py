@@ -1568,20 +1568,36 @@ class UniversalMemoryManager:
         # session — the same protection only_if gives the pointer.
         env_session = _host_session_env()
         if env_session and hasattr(self.redis_buffer, "bump_session_generation"):
-            try:
-                generation = 0
-                if hasattr(self.redis_buffer, "get_session_generation"):
-                    generation = await self.redis_buffer.get_session_generation(
-                        env_session
-                    ) or 0
-                current_env_id = (
-                    env_session if not generation
-                    else f"{env_session}:c{generation}"
-                )
-                if session_id == current_env_id:
-                    await self.redis_buffer.bump_session_generation(env_session)
-            except Exception as exc:
-                logger.debug("bump_session_generation failed: %s", exc)
+            # One retry, then a WARNING — never silent (round 7): an
+            # unrotated generation after a flake means identity-less
+            # resolves keep reusing the just-consolidated bucket, and the
+            # next consolidation overwrites this one's artifact. Debug-only
+            # logging hid exactly that exposure.
+            for attempt in range(2):
+                try:
+                    generation = 0
+                    if hasattr(self.redis_buffer, "get_session_generation"):
+                        generation = await self.redis_buffer.get_session_generation(
+                            env_session
+                        ) or 0
+                    current_env_id = (
+                        env_session if not generation
+                        else f"{env_session}:c{generation}"
+                    )
+                    if session_id == current_env_id:
+                        await self.redis_buffer.bump_session_generation(env_session)
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        await asyncio.sleep(_SESSION_REDIS_RETRY_BACKOFF)
+                        continue
+                    logger.warning(
+                        "bump_session_generation failed after retry (%s); env "
+                        "session %s was NOT rotated — identity-less resolves "
+                        "will reuse the consolidated bucket until the next "
+                        "successful consolidation.",
+                        exc, env_session,
+                    )
 
         return {
             "success": True,
@@ -3613,6 +3629,30 @@ class UniversalMemoryManager:
         failures degrade exactly as before (WARNING log, sequence falls
         back to 1).
         """
+        # A single Redis flake must not silently fork a new session: each call
+        # is retried once with a short backoff, and if it still fails we log at
+        # WARNING (never silent) before falling back. This never raises — the
+        # no-raise guarantee callers rely on is preserved. Defined before the
+        # tiers so the ENV tier's generation read follows the same discipline
+        # as the user tier's pointer ops (PR #4 review, round 7: a bare
+        # swallow here resolved the base id mid-conversation on a single
+        # flake, with no log at any level).
+        async def _redis_retry(op_name, coro_factory, default):
+            for attempt in range(2):
+                try:
+                    return await coro_factory()
+                except Exception as exc:
+                    if attempt == 0:
+                        await asyncio.sleep(_SESSION_REDIS_RETRY_BACKOFF)
+                        continue
+                    logger.warning(
+                        "resolve_session_id: Redis %s failed after retry (%s); "
+                        "falling back — session continuity may be affected.",
+                        op_name, exc,
+                    )
+                    return default
+            return default
+
         if user_id is None:
             env_session = _host_session_env()
             if env_session:
@@ -3628,12 +3668,13 @@ class UniversalMemoryManager:
                 # (PR #4 review, round 5).
                 generation = 0
                 if hasattr(self.redis_buffer, "get_session_generation"):
-                    try:
-                        generation = await self.redis_buffer.get_session_generation(
+                    generation = await _redis_retry(
+                        "get_session_generation",
+                        lambda: self.redis_buffer.get_session_generation(
                             env_session
-                        ) or 0
-                    except Exception:
-                        generation = 0  # best-effort: degrade to the base id
+                        ),
+                        0,
+                    ) or 0
                 if generation:
                     return f"{env_session}:c{generation}", "host-env"
                 return env_session, "host-env"
@@ -3658,26 +3699,6 @@ class UniversalMemoryManager:
 
         user_canonical_id = user_id
         context = context or "mcp"
-
-        # A single Redis flake must not silently fork a new session: each call
-        # is retried once with a short backoff, and if it still fails we log at
-        # WARNING (never silent) before falling back. This never raises — the
-        # no-raise guarantee callers rely on is preserved.
-        async def _redis_retry(op_name, coro_factory, default):
-            for attempt in range(2):
-                try:
-                    return await coro_factory()
-                except Exception as exc:
-                    if attempt == 0:
-                        await asyncio.sleep(_SESSION_REDIS_RETRY_BACKOFF)
-                        continue
-                    logger.warning(
-                        "resolve_session_id: Redis %s failed after retry (%s); "
-                        "falling back — session continuity may be affected.",
-                        op_name, exc,
-                    )
-                    return default
-            return default
 
         # Reuse the active session when one exists (persists across restarts within a day).
         active = None

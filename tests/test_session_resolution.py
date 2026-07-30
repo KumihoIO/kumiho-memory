@@ -753,6 +753,75 @@ def test_consolidating_an_old_env_generation_does_not_rotate_the_live_one(
     assert asyncio.run(scenario()) == "host-uuid-9:c2"
 
 
+def test_a_generation_read_flake_is_retried_not_swallowed(monkeypatch):
+    """A single Redis flake on the generation read used to resolve the BASE
+    env id mid-conversation — the consolidated, cleared bucket — silently,
+    with no log at any level (round 7). The read now follows the same
+    one-retry discipline as every other session-continuity Redis op."""
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-9")
+
+    class _FlakyGenBuffer(_PointerBuffer):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def get_session_generation(self, base_session_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("transient flake")
+            return 1
+
+    buffer = _FlakyGenBuffer()
+    session_id, source = asyncio.run(_manager(buffer).resolve_session_id())
+    assert (session_id, source) == ("host-uuid-9:c1", "host-env")
+    assert buffer.calls == 2  # initial + one retry
+
+
+def test_a_bump_flake_at_consolidation_is_retried(monkeypatch, caplog):
+    """An unrotated generation after a consolidation flake reintroduces the
+    cleared-bucket reuse and the artifact overwrite; a debug-only log hid
+    the exposure (round 7). One retry, then a WARNING."""
+    import logging
+
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-9")
+
+    class _FlakyIncrRedis(_FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.incr_calls = 0
+
+        async def incr(self, key):
+            self.incr_calls += 1
+            if self.incr_calls == 1:
+                raise ConnectionError("transient flake")
+            return await super().incr(key)
+
+    client = _FlakyIncrRedis()
+    buffer = RedisMemoryBuffer(client=client, redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=None,
+    )
+
+    async def scenario():
+        await buffer.add_message(
+            project=manager.project, session_id="host-uuid-9",
+            role="user", content="hello",
+        )
+        await manager.consolidate_session(session_id="host-uuid-9")
+        return await manager.resolve_session_id()
+
+    with caplog.at_level(logging.WARNING, logger="kumiho_memory.memory_manager"):
+        rotated, _ = asyncio.run(scenario())
+
+    # The retry succeeded, so the rotation happened and no warning fired.
+    assert rotated == "host-uuid-9:c1"
+    assert client.incr_calls == 2
+    assert not [r for r in caplog.records if "NOT rotated" in r.getMessage()]
+
+
 def test_reading_the_generation_slides_its_ttl():
     """Bump-only expiry meant a conversation that stayed on one env id for
     more than 24 h after its last consolidation regressed to the base
