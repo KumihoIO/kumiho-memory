@@ -1,12 +1,15 @@
 """Tests for kumiho_memory.mcp_tools — MCP tool wrappers for memory operations."""
 
 import asyncio
+import copy
 import json
 import os
 import tempfile
 from unittest.mock import patch
 
 from kumiho_memory.mcp_tools import (
+    EDGE_DISCOVERY_TYPES,
+    MEMORY_TYPES,
     MEMORY_TOOLS,
     MEMORY_TOOL_HANDLERS,
     tool_chat_add,
@@ -146,6 +149,88 @@ def test_tool_names_are_prefixed():
     """All tool names should start with kumiho_ prefix."""
     for tool in MEMORY_TOOLS:
         assert tool["name"].startswith("kumiho_"), f"Bad prefix: {tool['name']}"
+
+
+# ---------------------------------------------------------------------------
+# Tests — the schema has to survive the transport
+# ---------------------------------------------------------------------------
+
+
+def _as_a_lossy_host_forwards_it(tool):
+    """Reduce a tool the way a real MCP host was measured to reduce it.
+
+    Property ``description`` text reaches the caller only for REQUIRED
+    top-level properties; the ``required`` arrays themselves — top-level and
+    nested — do not reach it at all. Structural keywords (``type``, ``enum``,
+    ``default``, ``items``) and the tool-level ``description`` do.
+
+    This was measured, not assumed. ``reflect`` arrived carrying descriptions
+    on exactly ``session_id`` and ``response``; ``engage`` and ``recall`` on
+    exactly ``query``. Each of those is precisely that tool's required set,
+    while the source documents every property of all three.
+    """
+    schema = copy.deepcopy(tool["inputSchema"])
+    required = set(schema.pop("required", []))
+
+    def strip(node, keep):
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            for name, spec in properties.items():
+                if isinstance(spec, dict):
+                    if name not in keep:
+                        spec.pop("description", None)
+                    strip(spec, set())  # nothing nested is ever top-level
+        items = node.get("items")
+        if isinstance(items, dict):
+            items.pop("required", None)
+            strip(items, set())
+
+    strip(schema, required)
+    return schema
+
+
+def test_reflect_still_tells_a_caller_the_capture_types_after_stripping():
+    """A caller must not have to guess ``captures[].type``.
+
+    It had to. The ten valid types lived only in that sub-property's prose,
+    ``captures`` is optional, so the whole sub-schema arrived undocumented and
+    the type got picked by guesswork — a wrong guess is not rejected either
+    (``cap.get("type", "summary")`` takes anything), it just files the memory
+    under a type no reader branches on.
+
+    ``enum`` is structural, so it survives where the prose did not.
+    """
+    tool = next(t for t in MEMORY_TOOLS if t["name"] == "kumiho_memory_reflect")
+    reduced = _as_a_lossy_host_forwards_it(tool)
+    capture = reduced["properties"]["captures"]["items"]["properties"]
+
+    # What the transport really does take away.
+    assert "required" not in reduced
+    assert "description" not in capture["type"]
+
+    # What has to reach the caller regardless.
+    assert capture["type"]["enum"] == list(MEMORY_TYPES)
+
+
+def test_reflect_states_its_required_fields_where_they_survive():
+    """``required`` is dropped in transit, so the tool description carries it.
+
+    Calling reflect without ``session_id`` fails with a bare validation error
+    and the turn's memory is lost. The schema alone cannot warn about that
+    once the array is gone; the tool description is the channel that does.
+    """
+    tool = next(t for t in MEMORY_TOOLS if t["name"] == "kumiho_memory_reflect")
+    text = tool["description"]
+    assert "session_id" in text and "response" in text
+    assert "requires type, title and content" in text
+
+
+def test_edge_discovery_types_are_a_subset_of_the_memory_types():
+    """The edge gate used to be a tuple typed out inline next to a prose list
+    that named ten — three lists in total, none of them checked against each
+    other. A type that drifts out of MEMORY_TYPES silently stops earning
+    edges."""
+    assert set(EDGE_DISCOVERY_TYPES) <= set(MEMORY_TYPES)
 
 
 # ---------------------------------------------------------------------------
