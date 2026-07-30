@@ -3685,18 +3685,34 @@ class UniversalMemoryManager:
                 if generation:
                     return f"{env_session}:c{generation}", "host-env"
                 return env_session, "host-env"
-            # No host identity and no user identity: REFUSE, loudly. Every
-            # silent default tried here was a cross-conversation merge in
-            # disguise. The shared ("mcp","default") pointer merged every
-            # env-less conversation on one Redis (round 4); the process-
-            # scoped id that replaced it merged every chat on hosts that
-            # keep ONE server across conversations — Claude Desktop launches
-            # stdio servers once per app run, which is exactly the env-less
-            # population (round 6). With no per-conversation signal there is
-            # nothing correct to default to; a loud instruction beats a
-            # silent bleed, and the created_bucket flag makes an explicit
-            # id's drift visible. Host-side identity delivery is
+            # No host identity and no user identity: REFUSE, loudly.
+            #
+            # Not a fallback we failed to find — a measured absence. A live
+            # process survey (14 kumiho servers, 10 launch trees) showed
+            # every candidate substitute splits or merges conversations:
+            #
+            #   - the shared ("mcp","default") pointer merged every env-less
+            #     conversation on one Redis into one bucket;
+            #   - a PROCESS-scoped id splits one conversation 3-4 ways: a
+            #     single launch is a chain of that many server processes;
+            #   - a LAUNCH-TREE-scoped id splits it too: one conversation
+            #     was observed spanning two trees spawned 100 minutes apart
+            #     (same session id in both), so a tree is not a conversation
+            #     either.
+            #
+            # The host env is the only signal that grouped them correctly.
+            # With none of it present there is nothing correct to default
+            # to, and a loud instruction beats a silent bleed; created_bucket
+            # keeps an explicit id's drift visible. Host-side delivery is
             # kumiho-plugins#45.
+            #
+            # How often this fires is smaller than the earlier review
+            # assumed: the claim that the session env is "absent on the
+            # Desktop local-agent path" is FALSE as a blanket statement —
+            # measured, a live Desktop-spawned tree carried the session id
+            # and only stale trees (hours old, no live conversation) lacked
+            # it. Both hosts are covered once the launcher publishes
+            # KUMIHO_SESSION_ID.
             raise ValueError(
                 "no session identity available: no session_id argument, no "
                 "user_id, and no KUMIHO_SESSION_ID "
