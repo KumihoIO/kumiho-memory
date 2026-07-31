@@ -575,6 +575,64 @@ def test_memory_engage_exposes_approx_tokens():
         _cleanup_manager()
 
 
+def _engage_with_siblings(recall_mode):
+    """engage over one memory carrying 18 sibling revisions of real prose."""
+    manager, _ = _install_test_manager()
+
+    async def recall_stub(*args, **kwargs):
+        return [{
+            "kref": "kref://memory/test/primary",
+            "summary": "primary summary",
+            "score": 0.9,
+            "sibling_revisions": [
+                {"kref": "kref://memory/test/primary?r=%d" % i,
+                 "title": "rev %d" % i,
+                 "summary": "prose " * 400}
+                for i in range(18)
+            ],
+        }]
+
+    manager.recall_memories = recall_stub
+    return tool_memory_engage({
+        "query": "user preferences", "limit": 3, "recall_mode": recall_mode,
+    })
+
+
+def test_memory_engage_summarized_drops_sibling_prose_but_not_the_count():
+    """Siblings feed build_recalled_context; echoing them back in results too
+    made them 86% of a measured 56 KB response, which overran the host's
+    tool-result ceiling and spilled the whole recall to a file."""
+    try:
+        result = _engage_with_siblings("summarized")
+        mem = result["results"][0]
+        assert "sibling_revisions" not in mem
+        assert mem["sibling_count"] == 18, "a dropped list must still be counted"
+        assert len(json.dumps(result)) < 5000
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_engage_full_mode_keeps_the_siblings():
+    """full is the mode that asks for the prose; it must still get it."""
+    try:
+        result = _engage_with_siblings("full")
+        mem = result["results"][0]
+        assert len(mem["sibling_revisions"]) == 18
+        assert "sibling_count" not in mem
+    finally:
+        _cleanup_manager()
+
+
+def test_memory_engage_reports_payload_tokens_not_just_context_tokens():
+    """approx_tokens sizes the context alone; budgeting on it understated a
+    measured response by ~18x. The envelope now reports its own size."""
+    try:
+        result = _engage_with_siblings("full")
+        assert result["approx_payload_tokens"] > result["approx_tokens"]
+    finally:
+        _cleanup_manager()
+
+
 def test_memory_engage_filters_by_min_score():
     """kumiho_memory_engage should drop low-scoring memories before context."""
     try:

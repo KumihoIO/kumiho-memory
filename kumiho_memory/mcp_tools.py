@@ -841,6 +841,9 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
             results, args["query"], recall_mode
         )
         source_krefs = [m["kref"] for m in results if m.get("kref")]
+        _drop_sibling_prose(results, recall_mode)
+
+        import json
 
         from kumiho_memory.context_compose import approx_tokens
 
@@ -855,12 +858,44 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
             # size the assembled context without a tokenizer.
             "approx_tokens": approx_tokens(context),
         }
+        # ``approx_tokens`` sizes the assembled context only; a caller budgeting
+        # on it was off by a factor of ~18 (762 reported vs a 56 KB response,
+        # measured 2026-07-31). What lands in the caller's context window is the
+        # whole envelope, so report that too rather than silently redefining the
+        # older field.
+        engage_result["approx_payload_tokens"] = approx_tokens(
+            json.dumps(engage_result, ensure_ascii=False, default=str)
+        )
         # Additive: surface a backend failure so an empty result isn't read as
         # "no memories" when the graph/retrieve backend was actually down.
         backend_error = getattr(manager, "_last_backend_error", None)
         if backend_error:
             engage_result["backend_error"] = backend_error
         return engage_result
+
+
+def _drop_sibling_prose(results: List[Dict[str, Any]], recall_mode: str) -> None:
+    """Summarized engage: keep the sibling COUNT, drop the sibling prose.
+
+    ``sibling_revisions`` exists so ``build_recalled_context`` can rank every
+    revision of an item globally and fold the winners into ``context``. Once it
+    has run, returning those same summaries again in ``results`` is pure
+    duplication -- and it dominates the response: 47,903 of 55,939 chars (86%)
+    over 31 siblings on a plain ``limit=5`` engage, measured 2026-07-31. That
+    response overran the host's tool-result ceiling and was spilled to a file,
+    so a call whose whole purpose is to put memory INTO the context window put
+    none of it there.
+
+    The count stays because a silently shortened list reads as "this item has
+    one revision". Callers that want the prose ask for ``recall_mode="full"``,
+    where siblings are left untouched.
+    """
+    if recall_mode == "full":
+        return
+    for mem in results:
+        siblings = mem.pop("sibling_revisions", None)
+        if siblings:
+            mem["sibling_count"] = len(siblings)
 
 
 def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
