@@ -1,5 +1,31 @@
 # Release Notes — kumiho-memory
 
+## v1.2.1
+
+**Release Date:** 2026-07-31
+
+**`kumiho_memory_engage` no longer overruns the caller's tool-result budget.**
+
+In `recall_mode="summarized"`, engage returned every recalled memory's
+`sibling_revisions` in `results[]` — the same revision summaries that
+`build_recalled_context` had already ranked and folded into `context`. On a
+plain `limit=5` call that duplication was **47,903 of 55,939 characters (86%)**
+across 31 siblings. The response exceeded the host's tool-result ceiling and was
+spilled to a file, so a call whose entire purpose is to put memory *into* the
+context window put none of it there.
+
+Summarized mode now drops the sibling prose and reports `sibling_count` instead,
+so a shortened list can never be misread as "this item has one revision".
+`recall_mode="full"` is unchanged and still returns the full sibling records.
+Measured on the captured response: **55,939 → 8,029 characters (-85.6%)**,
+roughly 14k → 2k tokens.
+
+Engage also now reports **`approx_payload_tokens`** alongside `approx_tokens`.
+The existing field sizes the assembled `context` alone; a caller budgeting on it
+underestimated the real response by about 18x (762 reported against a 56 KB
+envelope). `approx_tokens` keeps its documented meaning — the new field is
+additive.
+
 ## v1.0.0
 
 **Release Date:** 2026-07-22
