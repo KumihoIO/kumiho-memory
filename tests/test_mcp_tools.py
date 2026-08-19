@@ -788,6 +788,127 @@ def test_memory_reflect_with_captures():
         _cleanup_manager()
 
 
+def _reflect_one_capture(capture, **extra):
+    """One-capture reflect through a fake store; returns the store kwargs."""
+    store_calls = []
+    ingest = tool_memory_ingest({"user_id": "user-stack", "message": "hi"})
+    with patch("kumiho.mcp_server.tool_memory_store",
+               _fake_store_recorder(store_calls)):
+        tool_memory_reflect(dict(
+            {"session_id": ingest["session_id"], "response": "ok",
+             "captures": [capture]},
+            **extra))
+    return store_calls[0]
+
+
+def test_an_unrouted_capture_is_never_stacked():
+    """kumiho-plugins#58 item 2. A capture with no space lands at the project
+    root, and _find_similar_item then searches context=<project> -- every
+    unrouted memory in the graph. Above 0.92 it stacks, which is how a
+    marketing capture became r=3 of a July SDK-bugfix conversation. Stacking
+    is only safe inside a space the caller named."""
+    try:
+        _install_test_manager()
+        kwargs = _reflect_one_capture({
+            "type": "fact", "title": "T", "content": "C",
+        })
+        assert kwargs["space_path"] == ""
+        assert kwargs["stack_revisions"] is False
+    finally:
+        _cleanup_manager()
+
+
+def test_a_routed_capture_still_stacks():
+    """The repair must not cost correctly-routed callers their stacking --
+    inside a real space the similarity search is scoped to that space."""
+    try:
+        _install_test_manager()
+        kwargs = _reflect_one_capture({
+            "type": "fact", "title": "T", "content": "C",
+            "space_hint": "marketing",
+        })
+        assert kwargs["space_path"] == "marketing"
+        assert kwargs["stack_revisions"] is True
+    finally:
+        _cleanup_manager()
+
+
+def test_a_top_level_space_path_routes_a_hintless_capture():
+    """space_path is the documented default for captures without a hint, so
+    it has to count as routing -- otherwise a caller that routes the whole
+    call still loses stacking."""
+    try:
+        _install_test_manager()
+        kwargs = _reflect_one_capture(
+            {"type": "fact", "title": "T", "content": "C"},
+            space_path="marketing")
+        assert kwargs["space_path"] == "marketing"
+        assert kwargs["stack_revisions"] is True
+    finally:
+        _cleanup_manager()
+
+
+def test_a_whitespace_space_hint_does_not_pass_for_routing():
+    """"   " is not a space. Treating it as one would restore exactly the
+    root-bucket stacking this guards against."""
+    try:
+        _install_test_manager()
+        kwargs = _reflect_one_capture({
+            "type": "fact", "title": "T", "content": "C", "space_hint": "   ",
+        })
+        assert kwargs["stack_revisions"] is False
+    finally:
+        _cleanup_manager()
+
+
+def _reflect_batch(captures):
+    """A >=2-capture reflect through a fake batch store; returns its kwargs."""
+    batch_calls = []
+
+    def fake_batch(**kwargs):
+        batch_calls.append(kwargs)
+        return {"results": [{"revision_kref": f"kref://memory/cap/{i}"}
+                            for i, _ in enumerate(kwargs["captures"])]}
+
+    ingest = tool_memory_ingest({"user_id": "user-batch", "message": "hi"})
+    with patch("kumiho.mcp_server.tool_memory_store_batch", fake_batch),             patch("kumiho.batch_create_revisions", create=True):
+        tool_memory_reflect({"session_id": ingest["session_id"],
+                             "response": "ok", "captures": captures})
+    assert batch_calls, "the batch path did not run"
+    return batch_calls[0]
+
+
+def test_one_unrouted_capture_disables_stacking_for_the_whole_batch():
+    """The batch RPC takes a single stacking flag, so the decision is
+    all-or-nothing. It has to fail closed: a missed stack costs one extra
+    item, a wrong stack fuses two memories and is not cleanly reversible."""
+    try:
+        _install_test_manager()
+        kwargs = _reflect_batch([
+            {"type": "fact", "title": "A", "content": "a",
+             "space_hint": "marketing"},
+            {"type": "fact", "title": "B", "content": "b"},
+        ])
+        assert kwargs["stack_revisions"] is False
+        assert [c["space_hint"] for c in kwargs["captures"]] == ["marketing", ""]
+    finally:
+        _cleanup_manager()
+
+
+def test_a_fully_routed_batch_still_stacks():
+    try:
+        _install_test_manager()
+        kwargs = _reflect_batch([
+            {"type": "fact", "title": "A", "content": "a",
+             "space_hint": "marketing"},
+            {"type": "decision", "title": "B", "content": "b",
+             "space_hint": "decisions"},
+        ])
+        assert kwargs["stack_revisions"] is True
+    finally:
+        _cleanup_manager()
+
+
 def _fake_store_recorder(store_calls):
     def fake_store(**kwargs):
         store_calls.append(kwargs)
