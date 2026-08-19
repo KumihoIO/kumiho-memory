@@ -898,6 +898,17 @@ def _drop_sibling_prose(results: List[Dict[str, Any]], recall_mode: str) -> None
             mem["sibling_count"] = len(siblings)
 
 
+def _capture_space(cap: Dict[str, Any], space_path: str) -> str:
+    """The space this capture was routed to, or "" when the caller named none.
+
+    Empty means the project root, and the root is not a space: it is where
+    every unrouted memory in the project accumulates. Truthiness is therefore
+    the stacking test -- stacking searches the capture's space for something to
+    merge into, which is only meaningful inside a space the caller chose.
+    """
+    return (cap.get("space_hint") or "").strip() or (space_path or "").strip()
+
+
 def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
     """Capture what matters after responding — buffers response + stores facts.
 
@@ -988,6 +999,11 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
         # An idempotency_prefix (bulk/backfill resume) forces the batched path even
         # for a single capture, so the caller always gets positional capture_results.
         if (len(prepared) >= 2 or idempotency_prefix) and _has_batch:
+            # The batch RPC takes ONE stacking flag for the whole write, so a
+            # single unrouted capture disables stacking for its siblings too.
+            # That is the safe direction: a missed stack costs one extra item,
+            # a wrong stack silently fuses two memories.
+            spaces = [_capture_space(p["cap"], space_path) for p in prepared]
             batch_out = tool_memory_store_batch(
                 captures=[{
                     "type": p["cap"].get("type", "summary"),
@@ -995,13 +1011,13 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                     "content": p["cap"].get("content", ""),
                     "tags": p["cap"].get("tags"),
                     "metadata": p["metadata"],
-                    "space_hint": p["cap"].get("space_hint", "") or space_path,
-                } for p in prepared],
+                    "space_hint": space,
+                } for p, space in zip(prepared, spaces)],
                 project=manager.project,
                 space_path=space_path,
                 source_revision_krefs=source_krefs if source_krefs else None,
                 edge_type="DERIVED_FROM",
-                stack_revisions=True,
+                stack_revisions=all(spaces),
                 idempotency_prefix=idempotency_prefix,
             )
             # Positionally-aligned per-capture results (each {revision_kref, ...} or
@@ -1018,7 +1034,7 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
         else:
             for p in prepared:
                 cap = p["cap"]
-                cap_space = cap.get("space_hint", "") or space_path
+                cap_space = _capture_space(cap, space_path)
                 store_result = tool_memory_store(
                     project=manager.project,
                     space_path=cap_space,
@@ -1030,7 +1046,7 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                     edge_type="DERIVED_FROM",
                     tags=cap.get("tags"),
                     metadata=p["metadata"],
-                    stack_revisions=True,
+                    stack_revisions=bool(cap_space),
                 )
                 rev_kref = store_result.get("revision_kref", "")
                 if rev_kref:
@@ -1604,8 +1620,16 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                             "space_hint": {
                                 "type": "string",
                                 "description": (
-                                    "Space path hint for this capture. "
-                                    "Overrides top-level space_path."
+                                    "Space this capture belongs in; overrides "
+                                    "top-level space_path. Copy an existing "
+                                    "space name exactly — it is used verbatim, "
+                                    "so 'Skills' and 'skills' are two spaces. "
+                                    "Without it the capture is filed at the "
+                                    "project root AND stored as its own item: "
+                                    "revision stacking is only attempted "
+                                    "inside a space you named, because at the "
+                                    "root the similarity search spans every "
+                                    "unrouted memory in the project."
                                 ),
                             },
                             "event_date": {

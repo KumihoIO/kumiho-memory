@@ -1,5 +1,40 @@
 # Release Notes — kumiho-memory
 
+## v1.2.2
+
+**Release Date:** 2026-08-19
+
+**`kumiho_memory_reflect` no longer stacks a capture onto a memory the caller
+never pointed at.**
+
+Reflect asked for `stack_revisions=True` unconditionally. Stacking searches
+`context=<the capture's space>` for a similar item and, above 0.92, writes the
+capture as a new revision of it instead of a new item. A capture with neither
+`space_hint` nor `space_path` resolves to the project root — which is not a
+space but the bucket every unrouted memory in the project falls into — so the
+search ran against the whole project.
+
+Reported in kumiho-plugins#58: a marketing capture and a benchmark-caveats
+capture were both stored as revisions of
+`kref://CognitiveMemory/2026-07-03-kumiho-sdks-21-22-pr-23-12058b40.conversation`,
+a July conversation about `memory_type` mirroring and interactive login. One
+item's `_search_text` ended up carrying all three fused together, which degrades
+retrieval for every one of them and is not cleanly reversible.
+
+Stacking is now attempted **only inside a space the caller named**. A routed
+capture behaves exactly as before — the search is scoped to that space, which is
+what makes it meaningful. An unrouted capture is stored as its own item. The
+asymmetry is deliberate: a missed stack costs one extra item, a wrong stack
+silently fuses two memories.
+
+The batch RPC takes one stacking flag for the whole write, so a single unrouted
+capture disables stacking for its siblings in that call too.
+
+Not addressed here: the 0.92 threshold and the same-item test itself live in
+kumiho core, and per-capture `memory_item_kind` (every capture is still a
+`conversation`) needs a core change — the batch store takes one kind per batch,
+and kind is part of kref identity.
+
 ## v1.2.1
 
 **Release Date:** 2026-07-31
