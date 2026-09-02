@@ -1,7 +1,14 @@
 """Kumiho Memory - Universal memory provider for AI agents."""
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
+from kumiho_memory._request_context import (
+    RequestContext,
+    current_request,
+    hosted_mode,
+    is_hosted,
+    request_context,
+)
 from kumiho_memory.redis_memory import RedisMemoryBuffer, _token_override_var as redis_token_override_var
 from kumiho_memory.memory_manager import (
     AutoAssessFn,
@@ -75,6 +82,11 @@ from kumiho_memory.recall_rerank import (
 
 __all__ = [
     "__version__",
+    "RequestContext",
+    "current_request",
+    "hosted_mode",
+    "is_hosted",
+    "request_context",
     "LLMAdapter",
     "EmbeddingAdapter",
     "OpenAICompatAdapter",
