@@ -23,6 +23,8 @@ from kumiho.discovery import (
     _DEFAULT_CACHE_KEY,
 )
 
+from kumiho_memory._request_context import current_request, is_hosted
+
 logger = logging.getLogger(__name__)
 
 # Context variable for per-request token override.
@@ -69,25 +71,62 @@ class RedisMemoryBuffer:
         self.default_ttl = int(default_ttl)
         self.tenant_hint = tenant_hint
         self.tenant_id = tenant_id
-        self.control_plane_url = control_plane_url or DEFAULT_CONTROL_PLANE_URL
+        # Hosted mode is decided ONCE, at construction, and remembered: a
+        # per-tenant manager is built inside a request and then reused by
+        # later ones, so a buffer that re-derived "am I hosted?" per call
+        # would flip to the single-tenant rules the moment it were touched
+        # outside a request (an eviction sweep, a background consolidation).
+        self._hosted = is_hosted()
+        if self._hosted:
+            # Operator-supplied control-plane URL wins in hosted mode: the RS
+            # is pointed at a region/staging origin by env, and the compiled-in
+            # default would silently send one tenant's traffic to production.
+            # Deliberately NOT consulted on the stdio path — that would change
+            # today's behavior for anyone who happens to have the var set.
+            self.control_plane_url = (
+                control_plane_url
+                or os.getenv("KUMIHO_CONTROL_PLANE_URL")
+                or DEFAULT_CONTROL_PLANE_URL
+            )
+        else:
+            self.control_plane_url = control_plane_url or DEFAULT_CONTROL_PLANE_URL
         self.discovery_timeout = discovery_timeout
         self.force_refresh = force_refresh
         self.proxy_url = proxy_url or os.getenv("KUMIHO_MEMORY_PROXY_URL")
 
         if not self.tenant_id:
-            cached_tenant = self._load_cached_tenant()
-            if cached_tenant:
-                self.tenant_id = cached_tenant.get("tenant_id")
+            if self._hosted:
+                # The request's tenant, never the machine's cached one:
+                # ~/.kumiho holds whichever tenant last ran `kumiho-auth
+                # login` on the host, which in a shared server is nobody's.
+                ctx = current_request()
+                if ctx is not None:
+                    self.tenant_id = ctx.tenant_id
+            else:
+                cached_tenant = self._load_cached_tenant()
+                if cached_tenant:
+                    self.tenant_id = cached_tenant.get("tenant_id")
 
         resolved_url = redis_url
-        if not resolved_url and prefer_discovery and client is None and not self.proxy_url:
+        if (
+            not resolved_url
+            and prefer_discovery
+            and client is None
+            and not self.proxy_url
+            and not self._hosted
+        ):
             discovery = self._discover_upstash_url()
             if discovery:
                 resolved_url = discovery.redis_url
                 if not self.tenant_id:
                     self.tenant_id = discovery.tenant_id
 
-        if not resolved_url:
+        if not resolved_url and not self._hosted:
+            # Ambient Redis credentials are a single-tenant convenience. In a
+            # shared server they would hand every tenant the SAME database,
+            # under keys the proxy namespaces per tenant precisely so that
+            # cannot happen — so hosted mode has exactly one route to Redis:
+            # the control-plane proxy, authenticated per request.
             resolved_url = os.getenv("KUMIHO_UPSTASH_REDIS_URL") or os.getenv("UPSTASH_REDIS_URL")
 
         # Auto-fallback: when no direct Redis URL is available, use the
@@ -608,11 +647,34 @@ class RedisMemoryBuffer:
         When running inside kumiho-FastAPI (or any server that sets the
         ``_token_override_var`` context variable), the override token is
         returned immediately — no filesystem lookup is needed.
+
+        The hosted connector sets no override; it sets a
+        :class:`RequestContext`, and the caller's own bearer token lives on
+        it. Resolution happens HERE, per proxy call, rather than being baked
+        into the buffer at construction — one buffer serves every request for
+        its tenant, and each of those requests carries a different (and
+        expiring) token.
         """
         # Server-injected token takes priority (e.g. kumiho-FastAPI Playground).
         override = _token_override_var.get()
         if override:
             return override
+
+        ctx = current_request()
+        if ctx is not None and ctx.auth_token:
+            return ctx.auth_token
+
+        if is_hosted():
+            # No request token and no override, in a process that serves many
+            # tenants: the local credential cache belongs to the machine's
+            # operator, and using it would run one tenant's memory operation
+            # as another identity. Fail instead.
+            raise RedisDiscoveryError(
+                "No request credentials available for the memory proxy in "
+                "hosted mode (KUMIHO_MCP_HOSTED). The caller's token must be "
+                "supplied via kumiho.request_context; local ~/.kumiho "
+                "credentials are never used here."
+            )
 
         if not force_refresh:
             token = load_firebase_token() or load_bearer_token()
