@@ -349,12 +349,44 @@ def _build_hosted_manager(ctx):
         reranker=None,
         retry_queue=None,
         failure_ledger=None,
+        entity_promotion=_hosted_entity_promotion(),
     )
     logger.debug(
         "Built hosted memory manager for tenant %s (llm=%s)",
         ctx.tenant_id, "on" if hosted_llm_enabled() else "off",
     )
     return manager
+
+
+def _hosted_entity_promotion() -> bool:
+    """Whether a hosted manager promotes extracted entities to graph Items.
+
+    OFF by default, because ``_build_hosted_manager`` claims hosted tenants
+    run lean and this was the one on-by-default write-path feature it never
+    spelled out: ``UniversalMemoryManager``'s ``entity_promotion=True``
+    sentinel follows the ontology switch, so every hosted tenant silently
+    inherited a burst of get-or-create + ABOUT-edge RPCs against their graph
+    on each consolidation. "Lean" has to include the writes, not just the LLM
+    calls.
+
+    Returned as the manager's tri-state sentinel rather than a config object,
+    so ``True`` re-enters the same env resolution the stdio path uses
+    (``KUMIHO_MEMORY_ENTITY_PROMOTION=0`` still wins there) instead of
+    forcing promotion on from a second place.
+
+    Reachability, stated plainly: the consolidation branch prefers full
+    ontology decomposition, which subsumes entity promotion, so this only
+    changes behavior for a hosted deployment that also sets
+    ``KUMIHO_MEMORY_ONTOLOGY=0``. Ontology itself is deliberately left ON —
+    ``kumiho_memory_decompose`` is in the connector profile and is gated on
+    it, and its decomposition is keyless (the agent supplies the structure),
+    so it is not an LLM cost.
+    """
+    if hosted_llm_enabled():
+        return True
+    return os.environ.get(
+        "KUMIHO_MEMORY_ENTITY_PROMOTION", "",
+    ).strip() == "1"
 
 
 def _hosted_keyless_summarizer():
@@ -695,28 +727,44 @@ async def _resolve_session(
     return explicit, "argument"
 
 
+#: Distinguishes "key absent" from "key present, value null" — see
+#: _identity_from_args_or_request.
+_MISSING = object()
+
+
 def _identity_from_args_or_request(
     args: Dict[str, Any],
     *,
     default_context: str = "personal",
-) -> "Tuple[Optional[str], str]":
+) -> "Tuple[Optional[str], Optional[str]]":
     """``(user_id, context)`` for an identity-BEARING tool.
 
     The argument always wins; a hosted request fills the gaps with its
     authenticated identity (plan §2.3: "default user_id/context for every tool
-    that accepts them = ctx.user_id/ctx.context"). On stdio this is exactly
-    ``args["user_id"]`` and ``args.get("context", "personal")`` — the request
-    branch is unreachable, so the plugin path is unchanged.
+    that accepts them = ctx.user_id/ctx.context").
+
+    On stdio this must be *exactly* ``args.get("user_id")`` and
+    ``args.get("context", "personal")``, which means an explicit
+    ``"context": null`` has to stay ``None`` rather than becoming
+    ``"personal"``. The distinction is not academic: ``None`` reaches
+    ``resolve_session_id``, whose own default is ``"mcp"``, so collapsing the
+    two moves that caller from the ``mcp:user-…`` bucket to the
+    ``personal:user-…`` one — a conversation-continuity break on upgrade, for
+    the many MCP clients that serialize omitted optional fields as null.
+    Hence the sentinel: "absent" and "explicitly null" are different inputs
+    here, and only the first one gets the default.
     """
     user_id = args.get("user_id")
-    context = args.get("context")
+    context = args.get("context", _MISSING)
     ctx = current_request()
     if ctx is not None:
         if user_id is None:
             user_id = ctx.user_id or None
-        if context is None:
+        # Hosted treats both spellings of "unspecified" the same, because the
+        # request is the identity either way.
+        if context is _MISSING or context is None:
             context = ctx.context
-    if context is None:
+    elif context is _MISSING:
         context = default_context
     return user_id, context
 
@@ -821,9 +869,23 @@ def tool_memory_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
     # still applies to that case.
     user_id, context = _identity_from_args_or_request(args)
     if user_id is None:
+        if current_request() is None:
+            # Stdio: user_id is a declared required argument, and main raised
+            # KeyError here via `args["user_id"]`. Keep both the type and the
+            # message: `args["message"]` — the sibling required field, two
+            # lines below — still raises KeyError, so anything else would make
+            # one tool report its two missing required arguments as two
+            # different kinds of failure. The old text also offered a hosted
+            # request context as the alternative, which a plugin caller has no
+            # way to produce.
+            raise KeyError("user_id")
+        # Hosted: a request context exists but carries no user, which is a
+        # hosting-layer bug rather than a caller mistake — so it gets its own
+        # message, naming the thing that has to be fixed.
         raise ValueError(
-            "user_id is required: pass it explicitly, or call through a "
-            "hosted request context that supplies the authenticated user"
+            "user_id is required: the request context carries no user_id. "
+            "The hosting layer must set RequestContext.user_id, or the "
+            "caller must pass user_id explicitly."
         )
 
     async def _run():

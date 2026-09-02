@@ -73,6 +73,8 @@ def _clean_process_state(monkeypatch, tmp_path):
         "KUMIHO_HOSTED_LLM",
         "KUMIHO_HOSTED_LOCAL_REDIS",
         "KUMIHO_LOCAL_REDIS_URL",
+        "KUMIHO_MEMORY_ENTITY_PROMOTION",
+        "KUMIHO_MEMORY_ONTOLOGY",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("KUMIHO_CONTROL_PLANE_URL", CONTROL_PLANE)
@@ -340,6 +342,65 @@ def test_hosted_llm_opt_in_builds_a_real_summarizer(monkeypatch, proxy, hosted_m
     assert manager.summarizer.provider == "openai"
 
 
+# --- entity promotion is part of "lean", not just the LLM switches ---------
+
+
+def test_entity_promotion_is_off_for_a_hosted_tenant_by_default(proxy, hosted_managers):
+    """The manager's ``True`` sentinel follows the ontology switch, so hosted
+    tenants silently inherited a burst of get-or-create + ABOUT-edge RPCs per
+    consolidation — against the hosted build's own stated intent."""
+    with bind_request(make_request_context("tenant-a")):
+        manager = mcp_tools._get_manager()
+    assert manager.entity_promotion_config is None
+
+
+def test_entity_promotion_follows_the_hosted_llm_opt_in(
+    monkeypatch, proxy, hosted_managers,
+):
+    monkeypatch.setenv("KUMIHO_HOSTED_LLM", "1")
+    with bind_request(make_request_context("tenant-a")):
+        manager = mcp_tools._get_manager()
+    assert manager.entity_promotion_config is not None
+
+
+def test_entity_promotion_can_be_forced_on_by_its_own_env(
+    monkeypatch, proxy, hosted_managers,
+):
+    """The same switch the stdio path honours, so an operator who wants it
+    does not have to enable LLM calls to get it."""
+    monkeypatch.setenv("KUMIHO_MEMORY_ENTITY_PROMOTION", "1")
+    with bind_request(make_request_context("tenant-a")):
+        manager = mcp_tools._get_manager()
+    assert manager.entity_promotion_config is not None
+
+
+def test_the_entity_promotion_kill_switch_still_wins_when_hosted(
+    monkeypatch, proxy, hosted_managers,
+):
+    monkeypatch.setenv("KUMIHO_HOSTED_LLM", "1")
+    monkeypatch.setenv("KUMIHO_MEMORY_ENTITY_PROMOTION", "0")
+    with bind_request(make_request_context("tenant-a")):
+        manager = mcp_tools._get_manager()
+    assert manager.entity_promotion_config is None
+
+
+def test_ontology_stays_on_for_hosted_tenants(proxy, hosted_managers):
+    """Deliberately NOT turned off alongside entity promotion:
+    kumiho_memory_decompose is in the connector profile and is gated on it,
+    and its decomposition is keyless — the agent supplies the structure, so it
+    is not an LLM cost."""
+    with bind_request(make_request_context("tenant-a")):
+        manager = mcp_tools._get_manager()
+    assert manager.ontology_enabled is True
+
+
+def test_the_stdio_manager_keeps_entity_promotion_on(monkeypatch):
+    """The hosted default must not leak into the plugin build."""
+    monkeypatch.delenv("KUMIHO_MEMORY_ENTITY_PROMOTION", raising=False)
+    monkeypatch.delenv("KUMIHO_MEMORY_ONTOLOGY", raising=False)
+    assert _local_manager().entity_promotion_config is not None
+
+
 # ---------------------------------------------------------------------------
 # Session resolution order and source labels (§2.3 item 2)
 # ---------------------------------------------------------------------------
@@ -472,9 +533,83 @@ def test_ingest_takes_its_user_from_the_request(proxy, hosted_managers):
     assert result["session_id_source"] == "generated"
 
 
-def test_ingest_without_a_user_or_a_request_fails_before_writing():
-    with pytest.raises(ValueError, match="user_id is required"):
+def test_stdio_ingest_without_user_id_still_raises_keyerror(monkeypatch):
+    """Regression: hosted mode made user_id optional, and the ValueError it
+    introduced changed the stdio failure for a DECLARED required argument.
+    Its sibling required field, `message`, still raises KeyError, so one tool
+    reported its two missing required arguments as two different kinds of
+    failure — and the ValueError's text offered a hosted request context,
+    which a plugin caller has no way to produce."""
+    class _Stub:
+        project = "P"
+
+        async def resolve_session_id(self, user_id=None, context=None):
+            return "sess-1", "generated"
+
+        async def handle_user_message(self, **kwargs):
+            return {}
+
+    monkeypatch.setattr(mcp_tools, "_build_manager", _Stub)
+    with pytest.raises(KeyError) as missing_user:
         mcp_tools.tool_memory_ingest({"message": "hello"})
+    with pytest.raises(KeyError) as missing_message:
+        mcp_tools.tool_memory_ingest({"user_id": "alice"})
+    assert missing_user.value.args == ("user_id",)
+    assert missing_message.value.args == ("message",)
+
+
+def test_hosted_ingest_without_any_user_names_the_hosting_layer(proxy, hosted_managers):
+    """Hosted is the case where a descriptive error IS right: a request
+    context that carries no user is a hosting-layer bug, not a caller
+    mistake."""
+    ctx = RequestContext(tenant_id="tenant-a", user_id="", auth_token="jwt")
+    with bind_request(ctx):
+        with pytest.raises(ValueError, match="RequestContext.user_id"):
+            mcp_tools.tool_memory_ingest({"message": "hello"})
+
+
+def test_stdio_ingest_keeps_an_explicit_null_context_as_none(monkeypatch):
+    """Regression: `args.get("context", "personal")` distinguishes an absent
+    key from an explicit null; collapsing them moved a caller that sends
+    `"context": null` — which many MCP clients do for omitted optional fields
+    — out of the `mcp:user-…` bucket resolve_session_id gives None into the
+    `personal:user-…` one, breaking conversation continuity on upgrade."""
+    seen = {}
+
+    class _Spy:
+        project = "P"
+
+        async def resolve_session_id(self, user_id=None, context=None):
+            seen["resolve_context"] = context
+            return "sess-1", "generated"
+
+        async def handle_user_message(self, **kwargs):
+            seen["handle_context"] = kwargs["context"]
+            return {"session_id": "sess-1"}
+
+    monkeypatch.setattr(mcp_tools, "_build_manager", lambda: _Spy())
+    mcp_tools.tool_memory_ingest(
+        {"user_id": "alice", "message": "hi", "context": None},
+    )
+    # None all the way through, exactly as before hosted mode existed.
+    assert seen == {"resolve_context": None, "handle_context": None}
+
+    seen.clear()
+    mcp_tools._manager = None
+    monkeypatch.setattr(mcp_tools, "_build_manager", lambda: _Spy())
+    mcp_tools.tool_memory_ingest({"user_id": "alice", "message": "hi"})
+    # ...while an ABSENT key still gets ingest's advertised default.
+    assert seen == {"resolve_context": "personal", "handle_context": "personal"}
+
+
+def test_hosted_ingest_treats_a_null_context_as_unspecified(proxy, hosted_managers):
+    """The stdio distinction is not carried into hosted: there, both spellings
+    of "unspecified" mean the request's namespace."""
+    with bind_request(make_request_context("tenant-a", user_id="alice", context="claude")):
+        result = mcp_tools.tool_memory_ingest(
+            {"message": "hi", "context": None},
+        )
+    assert result["session_id"].startswith("claude:user-")
 
 
 # ---------------------------------------------------------------------------

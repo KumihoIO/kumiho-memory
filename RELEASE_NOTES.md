@@ -54,7 +54,12 @@ Under a request context:
   reading a stored `artifact_location` is disabled too, since that value is
   caller-writable data and on a shared server it names the operator's disk.
 - **No LLM** unless `KUMIHO_HOSTED_LLM=1` — v1 is the keyless core, so the
-  operator's API key is not spent on tenant traffic.
+  operator's API key is not spent on tenant traffic. **Entity promotion** is off
+  by the same rule (or an explicit `KUMIHO_MEMORY_ENTITY_PROMOTION=1`): lean has
+  to cover the write path too, and promotion is a burst of get-or-create and
+  edge RPCs against the tenant's graph on every consolidation. Ontology
+  decomposition stays on — `kumiho_memory_decompose` is gated on it and is
+  keyless, since the agent supplies the structure.
 - **Process-global caches are tenant-keyed**: the engage/recall 5-second dedup
   guard (and its lock, which previously serialized every recall in the
   process), and the entity-promotion project-handle cache, which was keyed by
