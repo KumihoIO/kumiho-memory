@@ -1593,7 +1593,17 @@ async def mine_session(
 def _load_conversation_artifact(conversation_kref: str) -> Optional[str]:
     """Local markdown transcript of the consolidated conversation, resolved
     through the revision's artifact list.  Raw conversations never leave the
-    machine — the artifact location is a local path by design."""
+    machine — the artifact location is a local path by design.
+
+    ``None`` in hosted mode. The location is stored revision metadata, i.e.
+    caller-writable, so on a shared server this would read an arbitrary file
+    from the operator's disk; and hosted consolidation writes no artifact in
+    the first place, so there is never a legitimate one to find."""
+    from kumiho_memory._request_context import is_hosted
+
+    if is_hosted():
+        return None
+
     import kumiho
 
     try:

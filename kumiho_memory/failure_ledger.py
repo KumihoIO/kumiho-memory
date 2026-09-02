@@ -35,6 +35,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from kumiho_memory._request_context import is_hosted
 from kumiho_memory.retry import FailureClass
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,15 @@ def default_failure_ledger() -> "Optional[FailureLedger]":
     Set ``KUMIHO_FAILURE_LEDGER_DISABLED=1`` to opt out (parking off).
     Construction is side-effect-free — the storage directory is only created
     on the first write — so this is safe to call from entrypoints.
+
+    Always ``None`` in hosted mode: the ledger is one JSON file on local disk
+    keyed by content hash, so a shared server would blend every tenant's
+    failures into one file and let one tenant's poison content park another's
+    write. Parking is a single-machine optimisation and it does not survive
+    the move to a multi-tenant server.
     """
+    if is_hosted():
+        return None
     disabled = os.getenv("KUMIHO_FAILURE_LEDGER_DISABLED", "").strip().casefold() in (
         "1",
         "true",
@@ -336,7 +345,13 @@ class FailureLedger:
 
         The directory is created here (not at construction) so an unused
         ledger touches no filesystem state.
+
+        A no-op in hosted mode. ``default_failure_ledger`` already returns
+        ``None`` there, so this is the belt to that braces: a ledger passed
+        in explicitly still must not write to the server's disk.
         """
+        if is_hosted():
+            return
         self.ledger_dir.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
             prefix="ledger-", suffix=".tmp", dir=str(self.ledger_dir)

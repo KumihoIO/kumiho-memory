@@ -41,7 +41,18 @@ logger = logging.getLogger("kumiho_memory")
 
 
 def _load_preferences() -> dict:
-    """Load ~/.kumiho/preferences.json if it exists."""
+    """Load ~/.kumiho/preferences.json if it exists.
+
+    Empty in hosted mode. This CLI is a single-user entrypoint and the hosted
+    server never runs it, but the function's *consequence* —
+    ``_configure_llm_from_prefs`` writing ``KUMIHO_LLM_*`` into ``os.environ``
+    — is exactly the process-wide mutation hosted mode forbids, so the guard
+    sits at the source rather than relying on nobody ever calling it.
+    """
+    from kumiho_memory._request_context import is_hosted
+
+    if is_hosted():
+        return {}
     prefs_path = Path.home() / ".kumiho" / "preferences.json"
     if prefs_path.exists():
         try:

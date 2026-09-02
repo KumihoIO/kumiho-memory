@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from kumiho_memory import _graph_walk as _walk
+from kumiho_memory._request_context import is_hosted
 from kumiho_memory.evidence import (
     CORROBORATED,
     EVIDENCE_LEVELS,
@@ -1010,7 +1011,15 @@ class DreamState:
         )
 
     def _save_cursor_local(self, run_at: str) -> None:
-        """Write the cursor timestamp to a local JSON file."""
+        """Write the cursor timestamp to a local JSON file.
+
+        Skipped in hosted mode: the file is per-machine, so on a shared
+        server one tenant's run would move every other tenant's cursor. The
+        gRPC cursor attribute (already the primary) is per-tenant and remains
+        the only cursor there.
+        """
+        if is_hosted():
+            return
         try:
             self._cursor_file.parent.mkdir(parents=True, exist_ok=True)
             self._cursor_file.write_text(
@@ -1020,7 +1029,14 @@ class DreamState:
             logger.warning("Failed to write local cursor file: %s", exc)
 
     def _load_cursor_local(self) -> Optional[str]:
-        """Read the cursor timestamp from the local JSON file."""
+        """Read the cursor timestamp from the local JSON file.
+
+        ``None`` in hosted mode — the counterpart to :meth:`_save_cursor_local`:
+        a cursor written by whoever ran on this machine last is not this
+        tenant's, and honouring it would silently narrow their run window.
+        """
+        if is_hosted():
+            return None
         try:
             if self._cursor_file.exists():
                 data = json.loads(
@@ -1801,17 +1817,22 @@ class DreamState:
             maintenance=maintenance,
         )
 
-        # Write artifact to local storage.
-        safe_ts = now_iso.replace(":", "").replace("-", "").split(".")[0]
-        artifact_dir = (
-            Path(self.artifact_root)
-            / self.project
-            / self.cursor_item_name
-            / "reports"
-        )
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = artifact_dir / f"dream_state_{safe_ts}.md"
-        artifact_path.write_text(markdown, encoding="utf-8")
+        # Write artifact to local storage — skipped in hosted mode, where the
+        # report revision is still created (the run's numbers live in its
+        # metadata) but carries no local file attachment.
+        hosted = is_hosted()
+        artifact_path: Optional[Path] = None
+        if not hosted:
+            safe_ts = now_iso.replace(":", "").replace("-", "").split(".")[0]
+            artifact_dir = (
+                Path(self.artifact_root)
+                / self.project
+                / self.cursor_item_name
+                / "reports"
+            )
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            artifact_path = artifact_dir / f"dream_state_{safe_ts}.md"
+            artifact_path.write_text(markdown, encoding="utf-8")
 
         # Create revision with metadata.
         try:
@@ -1847,7 +1868,8 @@ class DreamState:
                 ):
                     report_meta[key] = str(maintenance.get(key, 0))
             revision = item.create_revision(metadata=report_meta)
-            revision.create_artifact("report", str(artifact_path))
+            if artifact_path is not None:
+                revision.create_artifact("report", str(artifact_path))
             return revision.kref.uri
         except Exception as exc:
             logger.warning("Failed to create report revision: %s", exc)

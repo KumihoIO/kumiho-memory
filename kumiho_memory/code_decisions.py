@@ -397,17 +397,24 @@ def _author_day(author_date: Any) -> str:
 # ---------------------------------------------------------------------------
 
 _item_locks_guard = threading.Lock()
-_item_locks: Dict[str, threading.Lock] = {}
+_item_locks: Dict[Tuple[str, str], threading.Lock] = {}
 
 
 def _slug_lock(slug: str) -> threading.Lock:
     """Per-slug lock so concurrent writers converge on one anchor revision
-    (same pattern as entity_promotion, kept local — modular boundary)."""
+    (same pattern as entity_promotion, kept local — modular boundary).
+
+    Keyed by (tenant, slug): the anchors two tenants converge on are
+    different anchors in different graphs, so sharing one lock only makes
+    them wait for each other. Empty tenant on the stdio path."""
+    from kumiho_memory._request_context import tenant_scope
+
+    key = (tenant_scope(), slug)
     with _item_locks_guard:
-        lock = _item_locks.get(slug)
+        lock = _item_locks.get(key)
         if lock is None:
             lock = threading.Lock()
-            _item_locks[slug] = lock
+            _item_locks[key] = lock
         return lock
 
 

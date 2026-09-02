@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from kumiho_memory._request_context import is_hosted
+
 logger = logging.getLogger(__name__)
 
 # Exception types considered transient (worth retrying).
@@ -226,18 +228,22 @@ class RetryQueue:
     """
 
     def __init__(self, queue_dir: Optional[str] = None) -> None:
+        # Hosted mode is latched here so a queue built inside a request keeps
+        # its no-write behavior when flushed outside one.
+        self.hosted = is_hosted()
         self.queue_dir = Path(
             queue_dir
             or os.getenv("KUMIHO_RETRY_QUEUE_DIR")
             or os.path.join(os.path.expanduser("~"), ".kumiho", "retry_queue")
         )
-        self.queue_dir.mkdir(parents=True, exist_ok=True)
+        if not self.hosted:
+            self.queue_dir.mkdir(parents=True, exist_ok=True)
         self._queue_file = self.queue_dir / "pending.jsonl"
 
     @property
     def count(self) -> int:
-        """Number of pending items in the queue."""
-        if not self._queue_file.exists():
+        """Number of pending items in the queue (always 0 in hosted mode)."""
+        if self.hosted or not self._queue_file.exists():
             return 0
         count = 0
         with open(self._queue_file, "r", encoding="utf-8") as f:
@@ -247,7 +253,20 @@ class RetryQueue:
         return count
 
     def enqueue(self, payload: Dict[str, Any]) -> None:
-        """Append a failed store payload to the queue."""
+        """Append a failed store payload to the queue.
+
+        A no-op in hosted mode. The payload holds a tenant's conversation
+        text, and one shared file on the server's disk would both mix tenants
+        and outlive the request that produced it — so a hosted failure fails
+        where the caller can see it, rather than being parked somewhere no
+        tenant owns.
+        """
+        if self.hosted:
+            logger.debug(
+                "Retry queue disabled in hosted mode — dropping payload "
+                "instead of writing it to server-local disk",
+            )
+            return
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "payload": payload,
@@ -257,8 +276,14 @@ class RetryQueue:
         logger.info("Enqueued failed memory_store payload (%d pending)", self.count)
 
     def drain(self) -> List[Dict[str, Any]]:
-        """Read and return all pending entries (does not remove them)."""
-        if not self._queue_file.exists():
+        """Read and return all pending entries (does not remove them).
+
+        Empty in hosted mode: a queue file on that disk was written by some
+        other deployment (or another tenant's earlier single-tenant run), and
+        replaying it would store one tenant's content into whichever tenant's
+        graph happens to be flushing.
+        """
+        if self.hosted or not self._queue_file.exists():
             return []
         entries: List[Dict[str, Any]] = []
         with open(self._queue_file, "r", encoding="utf-8") as f:
@@ -318,7 +343,9 @@ class RetryQueue:
                 still_failed.append(entry)
 
         # Rewrite queue with only the items that still failed transiently.
-        if still_failed:
+        if self.hosted:
+            pass  # nothing was ever written; nothing to rewrite
+        elif still_failed:
             with open(self._queue_file, "w", encoding="utf-8") as f:
                 for entry in still_failed:
                     f.write(json.dumps(entry, default=str) + "\n")
@@ -328,6 +355,9 @@ class RetryQueue:
         return {"succeeded": succeeded, "failed": len(still_failed), "dropped": dropped}
 
     def clear(self) -> None:
-        """Remove all pending items."""
+        """Remove all pending items (a no-op in hosted mode — nothing is ours
+        to delete on a shared server's disk)."""
+        if self.hosted:
+            return
         if self._queue_file.exists():
             self._queue_file.unlink()
