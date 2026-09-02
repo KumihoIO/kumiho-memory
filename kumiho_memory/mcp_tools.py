@@ -1300,7 +1300,9 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                         "actions:[{task, status}], open_questions:[]}, "
                         "classification:{topics:[], entities:[]}}. Only "
                         "'summary' is required; missing fields default to "
-                        "empty. Write it for a reader who was not there: "
+                        "empty; 'type' is one of summary, fact, decision, "
+                        "action, reflection, error (default summary). Write "
+                        "it for a reader who was not there: "
                         "what was decided and why, durable facts, open items."
                     ),
                 },
