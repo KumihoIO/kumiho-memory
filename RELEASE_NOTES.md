@@ -1,5 +1,49 @@
 # Release Notes — kumiho-memory
 
+## v1.3.1
+
+**Release Date:** 2026-09-02
+
+**A decision captured by `reflect` and the typed decision node `consolidate`
+projects from it are now connected.**
+
+`kumiho_memory_reflect` stores a capture as a `conversation`-kind item and
+writes no typed node. `kumiho_memory_consolidate` later projects
+`knowledge.decisions` into typed `decision` nodes in the same `decisions`
+space. Until now the two never met: revision stacking filters by kind, so they
+did not merge, and decompose's structural `DERIVED_FROM` pointed at the
+consolidated summary revision, not at the earlier capture. One decision, two
+unrelated nodes, both retrievable, neither aware of the other (#17).
+
+This release links them instead of deduplicating them. When `decompose_and_link`
+creates or reuses a typed decision, it searches the space for a
+`conversation` capture on the same subject and draws
+`<decision> --DERIVED_FROM--> <capture>`:
+
+- **Same primitive as `SUPERSEDES`**: one scoped, kind-filtered fulltext search,
+  then a corpus-independent token-Jaccard decision at the same 0.6 bar. Title
+  and summary are scored separately and the better wins, so a long summary
+  cannot dilute a title that matches exactly.
+- **Strict capture-type allowlist** (`decision`, the `summary` default, or
+  absent). The space alone does not identify the layer; a `preference` can sit
+  in `decisions` with near-identical wording and must not be claimed.
+- **Self-anchor excluded.** Consolidation's own summary item is a
+  `conversation` too and can match its own decision; the structural edge pins
+  `?r=N` while search resolves latest, so the idempotency precheck alone could
+  not catch it.
+- **Idempotent** through the materializer's existing-edge precheck: re-running
+  consolidation for a session draws nothing twice.
+- **Additive and lossless.** No item is merged, deprecated or rewritten, no
+  tag moves. The ontology vocabulary and edge direction are unchanged, so the
+  spec Item does not bump.
+
+Default **on**, following `KUMIHO_MEMORY_ONTOLOGY`. `KUMIHO_MEMORY_LINK_CAPTURES=0`
+is the kill switch. `decompose` stats gain a `capture_links` counter.
+
+Nothing changes for `reflect` itself. Routing decision-type captures through
+decompose so both paths converge on one node is the larger follow-up recorded
+on #17.
+
 ## v1.3.0
 
 **Release Date:** 2026-09-02
