@@ -106,7 +106,7 @@ additive.
       > generated per-user id        (pointer-registered, identity stamped at the mint)
       > ValueError with instructions (no identity at all — never a silent default)
 
-`session_id` leaves every `required` array; every result reports `session_id`, `session_id_source`, and on writes `created_bucket`, the one observable trace of a drifted id. `CLAUDE_CODE_SESSION_ID` is deliberately not honoured: it reaches the server by env inheritance, frozen at spawn, while Claude Code rotates its session on `/clear` without respawning the server. Identity provisioning belongs to the host integration, which owns rotation (kumiho-plugins#45).
+`session_id` leaves every `required` array; every result reports `session_id` and `session_id_source`, and the buffer writes (`chat_add`, `add_response`, `reflect`) report `created_bucket`, the one observable trace of a drifted id. `CLAUDE_CODE_SESSION_ID` is deliberately not honoured: it reaches the server by env inheritance, frozen at spawn, while Claude Code rotates its session on `/clear` without respawning the server. Identity provisioning belongs to the host integration, which owns rotation (kumiho-plugins#45).
 
 Repairs shipped alongside:
 
@@ -122,11 +122,11 @@ Eight adversarial review rounds preceded the merge. `tests/test_session_resoluti
 
 **Release Date:** 2026-07-30
 
-**`kumiho_memory_reflect`'s capture vocabulary reaches the caller.** A caller reading the tool's schema could not see which memory types a capture may carry. Measured against a live host, property descriptions are forwarded only for required top-level properties and the `required` arrays are dropped in transit, so the optional `captures` sub-schema arrived undocumented, and nothing validated `type`: a wrong guess filed the memory under a type no reader branches on. Structural keywords survive the transport, so the contract moved into them: `captures[].type` gains a real `enum`, and the tool description restates the required fields.
+**`kumiho_memory_reflect`'s capture vocabulary reaches the caller.** A caller reading the tool's schema could not see which memory types a capture may carry. Measured against a live host, property descriptions are forwarded only for required top-level properties and `required` is not reliably forwarded, so the optional `captures` sub-schema arrived undocumented, and nothing validated `type`: a wrong guess filed the memory under a type no reader branches on. Structural keywords survive the transport, so the contract moved into them: `captures[].type` gains a real `enum`, and the tool description restates the required fields.
 
 **Behaviour change:** a `type` outside the ten valid memory types is now rejected at the MCP layer instead of silently stored. A loud rejection the caller can retry beats a permanently miscategorised memory.
 
-- The three copies of the vocabulary (module prose, the edge-discovery gate's inline tuple, the assessor prompts) collapse to one source, `MEMORY_TYPES` and `EDGE_DISCOVERY_TYPES`, with a test pinning the subset relation.
+- Two of the three copies of the vocabulary (the module prose and the edge-discovery gate's inline tuple) collapse to one source, `MEMORY_TYPES` and `EDGE_DISCOVERY_TYPES`, with a test pinning the subset relation; the assessor prompts' four-name list is left alone as a separate change.
 - After adversarial review the documented transport rule was corrected: `required` is not reliably forwarded and no single rule explains every observation, while descriptions survive only for source-required properties and `enum` survives everywhere. The edge gate moved into `earns_edge_discovery()` so tests exercise the predicate the code calls, and the vocabulary is asserted against a spelled-out list.
 - Tests model the lossy transport explicitly and are mutation-checked.
 
