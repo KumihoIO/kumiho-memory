@@ -13,6 +13,7 @@ workers can't accumulate.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import threading
 import time
@@ -21,6 +22,36 @@ from typing import Any, Callable, Coroutine, Optional, TypeVar
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def start_context_thread(
+    target: Callable[[], Any],
+    *,
+    daemon: bool = True,
+    name: Optional[str] = None,
+) -> threading.Thread:
+    """``threading.Thread``, except the worker inherits the caller's context.
+
+    A raw thread starts with an EMPTY :mod:`contextvars` context. Under the
+    hosted connector that silently drops the request: the worker sees
+    ``current_request() is None`` and ``redis_token_override_var`` unset, so
+    best-effort enrichment spawned inside tenant A's request would run with
+    the server's ambient identity, or with none at all — and the failure is
+    invisible, because every one of these paths is deliberately
+    exception-swallowing. ``copy_context()`` at SUBMIT time (not inside the
+    worker, which is already too late) carries the request across the
+    boundary, the way ``asyncio.to_thread`` already does.
+
+    Used for every raw thread in this package, not only the ones that
+    obviously reach the SDK: what a background task touches is a property of
+    the code it calls, and that changes.
+    """
+    ctx = contextvars.copy_context()
+    thread = threading.Thread(
+        target=lambda: ctx.run(target), daemon=daemon, name=name,
+    )
+    thread.start()
+    return thread
 
 
 async def run_bounded_in_thread(
@@ -50,7 +81,7 @@ async def run_bounded_in_thread(
         finally:
             done.set()
 
-    threading.Thread(target=_worker, daemon=True).start()
+    start_context_thread(_worker)
 
     deadline = time.monotonic() + timeout
     while not done.is_set():
@@ -95,6 +126,4 @@ def run_coro_in_daemon_thread(
         except Exception as exc:  # noqa: BLE001 - best-effort, never propagated
             logger.debug("%s failed: %s", label, exc)
 
-    thread = threading.Thread(target=_worker, daemon=True, name=label)
-    thread.start()
-    return thread
+    return start_context_thread(_worker, name=label)
