@@ -1,5 +1,38 @@
 # Release Notes — kumiho-memory
 
+## v1.3.0
+
+**Release Date:** 2026-09-02
+
+**`kumiho_memory_consolidate` is keyless when the caller brings the summary.**
+
+Consolidation was the one lifecycle write that still required an external
+LLM: `consolidate_session` always called the configured summarizer, and the
+Claude plugin's keyless default pins a dead-port placeholder, so every
+consolidation there failed with `Conversation summarization failed:
+Connection error` unless an API key or `KUMIHO_LLM_BASE_URL` was set. That
+contradicted the rule the other writes already follow (reflect, decompose,
+code_capture): the in-loop agent does the extraction.
+
+`consolidate_session` and the MCP tool now take `summary` and `implications`.
+When `summary` is present no summarizer call is made: the agent, or a
+subagent it delegated to, wrote it from the conversation it can see.
+Everything after summarization is unchanged — PII redaction, the local
+Markdown artifact, the graph write with the same metadata, the ontology
+chain, generation rotation and the buffer clear. One addition on this path:
+because the agent saw the raw conversation (the summarizer only ever sees a
+redacted transcript), every string in the supplied object — title, entities,
+facts, decisions, events, topics, implications — is anonymized before
+storage, not only the narrative summary. The summary is
+plain text or the object the summarizer would have produced (`{type, title,
+summary, events, knowledge, classification}`); only `summary` is required
+and missing fields default to empty. An empty or shapeless summary is refused
+before anything is written, the same rule the LLM path applies to a failed
+summary. Omitting `summary` keeps the LLM path exactly as before.
+
+This release also carries the v1.2.2 reflect-stacking fix below, which was
+never tagged or published on its own.
+
 ## v1.2.2
 
 **Release Date:** 2026-08-19

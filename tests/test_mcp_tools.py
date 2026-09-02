@@ -417,6 +417,68 @@ def test_memory_consolidate():
             _cleanup_manager()
 
 
+def test_memory_consolidate_with_agent_summary_is_keyless():
+    """The tool forwards a caller-written summary; a summarizer that raises on
+    contact proves no LLM ran -- which is what lets the plugin's keyless
+    default posture hold for consolidation too."""
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    stored = {}
+
+    async def store_stub(**kwargs):
+        stored.update(kwargs)
+        return {"item_kref": "kref://memory/item", "revision_kref": "kref://memory/item?r=1"}
+
+    async def retrieve_stub(**kwargs):
+        return []
+
+    class NeverSummarizer:
+        async def summarize_conversation(self, messages, context=None):
+            raise AssertionError("summarize_conversation must not be called")
+
+        async def generate_implications(self, messages, context=None):
+            raise AssertionError("generate_implications must not be called")
+
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=NeverSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=store_stub,
+        memory_retrieve=retrieve_stub,
+        consolidation_threshold=2,
+        artifact_root=tempfile.mkdtemp(),
+    )
+    mcp_tools_module._manager = manager
+    try:
+        ingest = tool_memory_ingest({"user_id": "user-mcp-keyless", "message": "I like tea."})
+        tool_memory_add_response({
+            "session_id": ingest["session_id"], "response": "Green tea is best.",
+        })
+        result = tool_memory_consolidate({
+            "session_id": ingest["session_id"],
+            "summary": {"title": "Tea", "summary": "User likes green tea.",
+                        "classification": {"topics": ["tea"]}},
+            "implications": ["Choosing a drink"],
+        })
+        assert result["success"] is True, result
+        assert stored["title"] == "Tea"
+        assert stored["metadata"]["implications"] == "Choosing a drink"
+        assert "Future relevance:" in result["summary"]
+    finally:
+        _cleanup_manager()
+
+
+def test_consolidate_schema_exposes_summary_and_implications_as_optional():
+    by_name = {tool["name"]: tool for tool in MEMORY_TOOLS}
+    tool = by_name["kumiho_memory_consolidate"]
+    props = tool["inputSchema"]["properties"]
+    assert set(props["summary"]["type"]) == {"object", "string"}
+    assert props["implications"]["items"] == {"type": "string"}
+    required = tool["inputSchema"].get("required", [])
+    assert "summary" not in required and "implications" not in required
+    assert "keyless" in tool["description"].lower()
+
+
 def test_memory_consolidate_returns_summary_error_instead_of_storing_fallback():
     fake = FakeRedis()
     buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")

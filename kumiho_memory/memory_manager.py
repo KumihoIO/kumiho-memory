@@ -396,6 +396,112 @@ def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _clean_string_list(value: Any) -> List[str]:
+    """Strings only, stripped, empties dropped; anything that is not a list is []."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return out
+
+
+def _clean_object_list(value: Any, fields: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Objects only, each reduced to ``fields`` (name -> default), strings stripped."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        cleaned: Dict[str, Any] = {}
+        for name, default in fields.items():
+            raw = item.get(name, default)
+            if isinstance(default, list):
+                cleaned[name] = _clean_string_list(raw)
+            else:
+                cleaned[name] = raw.strip() if isinstance(raw, str) else default
+        out.append(cleaned)
+    return out
+
+
+def _redact_provided_summary(redactor: Any, summary_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Anonymize every string in an agent-written summary before the shared pipeline.
+
+    The LLM path's structured fields are clean by construction: the summarizer
+    only ever saw a redacted transcript (``_redact_messages_for_llm``). An
+    agent-written summary saw the raw conversation, so without this pass the
+    title, entities, facts, decisions, events, topics and implications would
+    reach the graph metadata unredacted while only the narrative text got
+    ``anonymize_summary``. Same redactor, same idempotent pass, every string.
+    """
+    def walk(value: Any) -> Any:
+        if isinstance(value, str):
+            return redactor.anonymize_summary(value)
+        if isinstance(value, list):
+            return [walk(v) for v in value]
+        if isinstance(value, dict):
+            return {k: walk(v) for k, v in value.items()}
+        return value
+    return walk(summary_result)
+
+
+def _coerce_provided_summary(summary: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a caller-written summary to the summarizer's output shape.
+
+    Keyless consolidation hands the summary in from the agent instead of an
+    LLM call.  Accepts plain text or an object; only ``summary`` is required.
+    Every other field is coerced to the shape ``consolidate_session`` and the
+    ontology chain already consume, so the two paths converge on one structure
+    (``build_summary_schema_mode`` in summarization.py is the reference).
+    Returns ``None`` when there is no usable summary text -- the caller refuses
+    the consolidation rather than storing an empty memory.
+    """
+    if isinstance(summary, str):
+        summary = {"summary": summary}
+    if not isinstance(summary, dict):
+        return None
+    text = summary.get("summary", "")
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    def _text(name: str, default: str) -> str:
+        raw = summary.get(name, "")
+        return raw.strip() if isinstance(raw, str) and raw.strip() else default
+
+    knowledge = summary.get("knowledge")
+    knowledge = knowledge if isinstance(knowledge, dict) else {}
+    classification = summary.get("classification")
+    classification = classification if isinstance(classification, dict) else {}
+    result: Dict[str, Any] = {
+        "type": _text("type", "summary"),
+        "title": _text("title", "Conversation"),
+        "summary": text.strip(),
+        "events": _clean_object_list(summary.get("events"), {
+            "event": "", "when": "", "event_date": "", "participants": [],
+            "consequence": "",
+        }),
+        "knowledge": {
+            "facts": _clean_object_list(knowledge.get("facts"), {"claim": "", "certainty": ""}),
+            "decisions": _clean_object_list(knowledge.get("decisions"), {"decision": "", "reason": ""}),
+            "actions": _clean_object_list(knowledge.get("actions"), {"task": "", "status": ""}),
+            "open_questions": _clean_string_list(knowledge.get("open_questions")),
+        },
+        "classification": {
+            "topics": _clean_string_list(classification.get("topics")),
+            "entities": _clean_string_list(classification.get("entities")),
+        },
+    }
+    # Convenience: implications riding inside the object are honoured when the
+    # caller did not pass them separately (consolidate_session pops this key).
+    if "implications" in summary:
+        result["implications"] = _clean_string_list(summary.get("implications"))
+    return result
+
+
 class UniversalMemoryManager:
     """Orchestrates working memory, summarization, and long-term storage.
 
@@ -1094,7 +1200,22 @@ class UniversalMemoryManager:
         stack_revisions: Optional[bool] = None,
         evidence_level: Optional[str] = None,
         source: Optional[str] = None,
+        summary: Optional[Any] = None,
+        implications: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        """Consolidate a session's working memory into one long-term memory.
+
+        ``summary`` makes this keyless: when the caller supplies it — the
+        in-loop agent wrote it from the conversation it can see, or delegated
+        that to a subagent — no summarizer call is made and no LLM key or
+        endpoint is needed.  It is either plain text or the same object the
+        summarizer would have produced (see ``_coerce_provided_summary``);
+        ``implications`` is the optional light-model list, same shape.
+        Everything after summarization is identical on both paths: PII
+        redaction of the summary, the local artifact, the graph write, the
+        ontology chain, generation rotation and the buffer clear.  Omit
+        ``summary`` to use the configured LLM summarizer as before.
+        """
         # Empty string behaves like None (consistent with ingest_message) —
         # otherwise "" would silently cancel an ingest-stashed grade while
         # bypassing both validation and the session-metadata fallback.
@@ -1187,45 +1308,72 @@ class UniversalMemoryManager:
         # (~/.kumiho/artifacts never leaves the machine).  The
         # anonymize_summary pass over the model's OUTPUT below remains as the
         # second layer.
-        llm_messages = _redact_messages_for_llm(self.pii_redactor, messages)
-        _summary_or_exc, _impl_or_exc = await asyncio.gather(
-            self.summarizer.summarize_conversation(llm_messages),
-            self.summarizer.generate_implications(llm_messages),
-            return_exceptions=True,
-        )
-        # Summary is critical — propagate its exception.
-        if isinstance(_summary_or_exc, BaseException):
-            raise _summary_or_exc
-        summary_result = _summary_or_exc
-        summarization_error = str(summary_result.get("error", "") or "").strip()
-        if summarization_error:
-            debug_info = summary_result.get("debug", {})
-            logger.warning(
-                "summarize_conversation failed for %s: %s",
-                session_id,
-                summarization_error,
+        if summary is not None:
+            # Keyless path.  The agent already read the conversation, so the
+            # summary arrives written; the summarizer (and its key / endpoint)
+            # is never touched.  A shapeless or empty summary is refused HERE,
+            # before the artifact, the store and the buffer clear — the same
+            # rule as the LLM path, which stores nothing on a failed summary.
+            summary_result = _coerce_provided_summary(summary)
+            if summary_result is None:
+                return {
+                    "success": False,
+                    "error": (
+                        "Provided summary must be non-empty text or an object "
+                        "with a non-empty 'summary' field (the same shape the "
+                        "summarizer produces: type, title, summary, events, "
+                        "knowledge, classification)."
+                    ),
+                }
+            implications = _clean_string_list(
+                implications if implications is not None
+                else summary_result.pop("implications", None)
             )
-            if isinstance(debug_info, dict) and debug_info:
-                logger.warning(
-                    "summarize_conversation diagnostics for %s: provider=%s model=%s base_url=%s json_mode=%s raw_len=%s raw_preview=%r",
-                    session_id,
-                    debug_info.get("provider", ""),
-                    debug_info.get("model", ""),
-                    debug_info.get("base_url", ""),
-                    debug_info.get("json_mode", ""),
-                    debug_info.get("raw_response_len", 0),
-                    debug_info.get("raw_response_preview", ""),
-                )
-            return {
-                "success": False,
-                "error": f"Conversation summarization failed: {summarization_error}",
-            }
-        # Implications are best-effort — fall back to empty list.
-        if isinstance(_impl_or_exc, BaseException):
-            logger.warning("generate_implications failed: %s", _impl_or_exc)
-            implications: list = []
+            # The agent saw the RAW conversation; the summarizer never does.
+            # Redact every field now so the shared pipeline below starts from
+            # the same footing on both paths.
+            summary_result = _redact_provided_summary(self.pii_redactor, summary_result)
+            implications = [self.pii_redactor.anonymize_summary(i) for i in implications]
         else:
-            implications = _impl_or_exc
+            llm_messages = _redact_messages_for_llm(self.pii_redactor, messages)
+            _summary_or_exc, _impl_or_exc = await asyncio.gather(
+                self.summarizer.summarize_conversation(llm_messages),
+                self.summarizer.generate_implications(llm_messages),
+                return_exceptions=True,
+            )
+            # Summary is critical — propagate its exception.
+            if isinstance(_summary_or_exc, BaseException):
+                raise _summary_or_exc
+            summary_result = _summary_or_exc
+            summarization_error = str(summary_result.get("error", "") or "").strip()
+            if summarization_error:
+                debug_info = summary_result.get("debug", {})
+                logger.warning(
+                    "summarize_conversation failed for %s: %s",
+                    session_id,
+                    summarization_error,
+                )
+                if isinstance(debug_info, dict) and debug_info:
+                    logger.warning(
+                        "summarize_conversation diagnostics for %s: provider=%s model=%s base_url=%s json_mode=%s raw_len=%s raw_preview=%r",
+                        session_id,
+                        debug_info.get("provider", ""),
+                        debug_info.get("model", ""),
+                        debug_info.get("base_url", ""),
+                        debug_info.get("json_mode", ""),
+                        debug_info.get("raw_response_len", 0),
+                        debug_info.get("raw_response_preview", ""),
+                    )
+                return {
+                    "success": False,
+                    "error": f"Conversation summarization failed: {summarization_error}",
+                }
+            # Implications are best-effort — fall back to empty list.
+            if isinstance(_impl_or_exc, BaseException):
+                logger.warning("generate_implications failed: %s", _impl_or_exc)
+                implications = []
+            else:
+                implications = _impl_or_exc
         redacted_summary = self.pii_redactor.anonymize_summary(summary_result.get("summary", ""))
 
         # Append extracted events to the summary text so they are
