@@ -1,5 +1,61 @@
 # Release Notes — kumiho-memory
 
+## v1.4.0
+
+**Release Date:** 2026-09-02
+
+**Hosted mode: one process can now serve many tenants without leaking one into
+another.**
+
+Everything in this package was written for a single-tenant process — the auth
+token comes from `~/.kumiho`, the manager is a module singleton, the session
+identity comes from `KUMIHO_SESSION_ID`, the transcript is written to local
+disk. All four are correct for the Claude Code plugin and all four are
+cross-tenant leaks in a shared server. The hosted Claude connector
+(`kumiho-plugins/docs/CLOUD-CONNECTOR-PLAN.md`) needs the shared server, so
+this release adds a second mode rather than changing the first.
+
+The switch is a **per-request contextvar**, not an environment variable:
+`kumiho.request_context.RequestContext` carries the verified tenant, user,
+bearer token and session for the request in flight, and
+`kumiho_memory._request_context` imports it with a vendored fallback so this
+package can ship ahead of the SDK. With no request set and `KUMIHO_MCP_HOSTED`
+unset, every path in this release is byte-for-byte what it was.
+
+Under a request context:
+
+- **One manager per tenant**, from a bounded LRU cache (256 entries, 30-minute
+  idle TTL, thread-safe), instead of the process singleton. Its Redis buffer
+  reaches Upstash only through the control-plane proxy, authenticated with the
+  caller's own token — resolved per call, because the manager outlives the
+  request that built it and the token is short-lived. Ambient
+  `UPSTASH_REDIS_URL` / `KUMIHO_UPSTASH_REDIS_URL` and `~/.kumiho` credentials
+  are never consulted; missing request credentials raise rather than fall back
+  to the operator's identity.
+- **Session identity comes from the request**: explicit `session_id` argument →
+  `ctx.session_id` → the active-session pointer for `(ctx.context,
+  ctx.user_id)` → a generated id that registers the pointer. Results report
+  `session_id_source` as `argument` / `request` / `active_session` /
+  `generated`; the stdio labels (`host-env`, `active-pointer`) are unchanged on
+  their own path. `user_id` and `context` default to the request's identity, so
+  `kumiho_memory_ingest` no longer requires `user_id` when the caller is
+  authenticated.
+- **No local filesystem writes.** Conversation artifacts, attachments, the
+  retry queue, the failure ledger and the Dream State cursor are all no-ops;
+  reading a stored `artifact_location` is disabled too, since that value is
+  caller-writable data and on a shared server it names the operator's disk.
+- **No LLM** unless `KUMIHO_HOSTED_LLM=1` — v1 is the keyless core, so the
+  operator's API key is not spent on tenant traffic.
+- **Process-global caches are tenant-keyed**: the engage/recall 5-second dedup
+  guard (and its lock, which previously serialized every recall in the
+  process), and the entity-promotion project-handle cache, which was keyed by
+  project name alone and would otherwise have handed one tenant a gRPC handle
+  bound to another tenant's credentials.
+- **Background work keeps the request.** Raw threads and executor submissions
+  start from an empty `contextvars` context, which silently dropped the tenant
+  in five best-effort enrichment paths; they now copy the caller's context at
+  submit time.
+
 ## v1.3.1
 
 **Release Date:** 2026-09-02
