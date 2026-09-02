@@ -58,6 +58,16 @@ logger = logging.getLogger(__name__)
 # happens to share a name are creating two different anchors in two different
 # graphs, and a shared lock would serialize them for no reason. On the stdio
 # path the tenant component is "" and the key space is what it always was.
+#
+# Capped, for the same reason mcp_tools caps _recall_scope_locks: the key is
+# per ENTITY, not per tenant, so on a long-lived hosted server this grows with
+# every distinct entity every tenant has ever promoted, forever. Over the cap
+# the unheld locks are dropped; a caller mid-promotion keeps working (it holds
+# its own reference), and the only cost of dropping a lock a later caller
+# would have shared is that two threads may both attempt the same anchor —
+# which is the pre-existing cross-process race this lock never covered anyway
+# (see the follow-up note above).
+_ANCHOR_LOCK_CAP = 4096
 _anchor_locks_guard = threading.Lock()
 _anchor_locks: Dict[Tuple[str, str], threading.Lock] = {}
 
@@ -81,6 +91,9 @@ def _anchor_lock(slug: str) -> threading.Lock:
     with _anchor_locks_guard:
         lock = _anchor_locks.get(key)
         if lock is None:
+            if len(_anchor_locks) >= _ANCHOR_LOCK_CAP:
+                for stale in [k for k, v in _anchor_locks.items() if not v.locked()]:
+                    _anchor_locks.pop(stale, None)
             lock = threading.Lock()
             _anchor_locks[key] = lock
         return lock

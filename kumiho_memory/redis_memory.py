@@ -42,6 +42,29 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
+def redact_redis_url(url: Optional[str]) -> str:
+    """A Redis URL safe to put in a log line.
+
+    An Upstash URL is ``rediss://default:<token>@host:port`` — the token IS
+    the credential, and the one place this URL gets logged is a WARNING that
+    an operator is meant to find and read. Logs get shipped, pasted into
+    tickets and shown in CI output, so the userinfo has to go.
+
+    Everything else is kept, because the point of the message is to tell an
+    operator *which* Redis a hosted process is talking to.
+    """
+    if not url:
+        return "<none>"
+    scheme, separator, rest = url.partition("://")
+    if not separator:
+        return url
+    userinfo, at, hostpart = rest.rpartition("@")
+    if not at:
+        return url
+    user = userinfo.split(":", 1)[0]
+    return f"{scheme}://{user}:***@{hostpart}" if user else f"{scheme}://***@{hostpart}"
+
+
 def hosted_local_redis_url() -> Optional[str]:
     """Direct Redis URL for the hosted server's dev mode, or ``None``.
 
@@ -195,7 +218,7 @@ class RedisMemoryBuffer:
                 "proxy. Keys stay namespaced per tenant and user, but the "
                 "per-request token is not checked by anything. Development "
                 "only — never enable this in a deployment serving real tenants.",
-                resolved_url,
+                redact_redis_url(resolved_url),
             )
 
         # Auto-fallback: when no direct Redis URL is available, use the

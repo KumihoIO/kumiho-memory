@@ -12,6 +12,7 @@ import mimetypes
 import os
 import re
 import shutil
+import threading
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -694,7 +695,11 @@ class UniversalMemoryManager:
         # each recall_memories call. The internal recall still returns [] (the
         # established contract); callers (MCP tools) read this AFTER recall to
         # distinguish "no memories" from "backend down" without a type change.
-        self._last_backend_error: Optional[str] = None
+        #
+        # Stored PER CALLING THREAD, not as one attribute — see the
+        # _last_backend_error property below for why the hosted manager makes
+        # that necessary.
+        self._backend_errors: Dict[int, str] = {}
         self.recall_mode = recall_mode
         self.sibling_strong_score = sibling_strong_score
         self.sibling_char_budget = sibling_char_budget
@@ -771,6 +776,45 @@ class UniversalMemoryManager:
         # In-process cursor: message count at last auto-store per session.
         # Resets on process restart (safe — worst case one extra LLM call).
         self._auto_store_cursors: Dict[str, int] = {}
+
+    # -- recall backend-error signal ------------------------------------
+    #
+    # Read and written as if it were a plain attribute (`self.
+    # _last_backend_error = ...`), because that is what it was, and both
+    # call sites in kumiho_memory.mcp_tools still spell it that way. What
+    # changed underneath is who the value belongs to.
+    #
+    # On stdio one manager serves one user, one call at a time, so a single
+    # attribute was exactly right. The hosted manager (mcp_tools.
+    # _tenant_managers) is shared by every user of a tenant and by every
+    # concurrent request within it, and MCP handlers are dispatched into a
+    # thread pool — so one attribute meant a healthy recall could report
+    # another caller's failure, carrying that caller's query text, space
+    # paths and krefs inside the message, while a concurrent reset erased a
+    # failure the other caller was about to read. Neither is possible with
+    # one slot per calling thread.
+    #
+    # The thread is the right key because it is precisely the span involved:
+    # the handler calls `asyncio.run(recall)` and reads this back on the same
+    # OS thread immediately afterwards. A ContextVar would NOT work here —
+    # `asyncio.run` wraps the coroutine in a Task, and a Task copies the
+    # context, so a write inside the recall never reaches the reader.
+    #
+    # Bounded by the size of the dispatch thread pool: the reset at the top
+    # of every recall_memories drops this thread's slot before it can be set
+    # again.
+
+    @property
+    def _last_backend_error(self) -> Optional[str]:
+        return self._backend_errors.get(threading.get_ident())
+
+    @_last_backend_error.setter
+    def _last_backend_error(self, value: Optional[str]) -> None:
+        thread_id = threading.get_ident()
+        if value is None:
+            self._backend_errors.pop(thread_id, None)
+        else:
+            self._backend_errors[thread_id] = value
 
     async def ingest_message(
         self,

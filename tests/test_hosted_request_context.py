@@ -1227,3 +1227,125 @@ def test_a_second_request_for_a_tenant_reuses_its_manager_and_session(
     assert first["session_id"] == second["session_id"]
     assert first["session_id_source"] == "generated"
     assert second["session_id_source"] == "active_session"
+
+
+# ---------------------------------------------------------------------------
+# Shared-manager state that is NOT per-request (found by WP-E1 integration)
+# ---------------------------------------------------------------------------
+
+
+def test_backend_error_does_not_cross_between_concurrent_callers():
+    """One tenant's manager is shared by all its users AND all its concurrent
+    requests, so a recall's failure signal cannot live on the instance.
+
+    ``_last_backend_error`` was a plain attribute — correct while a manager
+    served one user one call at a time, which is exactly what stopped being
+    true when `_get_manager` started returning a per-TENANT manager. The
+    failure mode is not theoretical: the message carries the failing query's
+    text and space paths, and the reader is whichever caller happens to look
+    next.
+    """
+    manager = _local_manager()
+    started = threading.Barrier(2)
+    seen: dict = {}
+
+    def _caller(label: str, error: str) -> None:
+        # Exactly the sequence a tool handler runs: reset, fail, read back.
+        manager._last_backend_error = None
+        started.wait(timeout=5)
+        manager._last_backend_error = error
+        time.sleep(0.02)  # let the other thread run its own write
+        seen[label] = manager._last_backend_error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(_caller, "alice", "retrieve failed for alice's query"),
+            pool.submit(_caller, "bob", "retrieve failed for bob's query"),
+        ]
+        for future in futures:
+            future.result()
+
+    assert seen["alice"] == "retrieve failed for alice's query"
+    assert seen["bob"] == "retrieve failed for bob's query"
+
+
+def test_backend_error_still_reads_back_on_the_calling_thread():
+    """The stdio contract: set it, read it, clear it — same thread, unchanged."""
+    manager = _local_manager()
+    assert manager._last_backend_error is None
+    manager._last_backend_error = "backend down"
+    assert manager._last_backend_error == "backend down"
+    manager._last_backend_error = None
+    assert manager._last_backend_error is None
+    # And the slot is released rather than accumulating a None per thread.
+    assert manager._backend_errors == {}
+
+
+def test_a_blank_tenant_id_is_refused_rather_than_sharing_one_manager():
+    """A blank tenant is a cache key like any other — and the worst one.
+
+    Every request carrying it would share a manager, a Redis prefix and an
+    active-session pointer: the complete version of the collapse the
+    per-tenant cache exists to prevent. The hosting layer rejects a token
+    with no tenant claim; this is what keeps that a requirement.
+    """
+    for blank in ("", "   "):
+        with request_context(make_request_context(blank)):
+            with pytest.raises(ValueError, match="no tenant_id"):
+                mcp_tools._get_manager()
+    assert len(mcp_tools._tenant_managers) == 0
+
+
+def test_the_direct_redis_warning_does_not_print_the_credential(monkeypatch, caplog):
+    """The dev escape hatch logs which Redis it chose. Upstash URLs are
+    ``rediss://default:<token>@host`` — that token is the credential, and this
+    WARNING exists to be read, shipped and pasted into tickets."""
+    monkeypatch.setenv("KUMIHO_MCP_HOSTED", "1")
+    monkeypatch.setenv("KUMIHO_HOSTED_LOCAL_REDIS", "1")
+    monkeypatch.setenv(
+        "KUMIHO_LOCAL_REDIS_URL", "rediss://default:SUPERSECRETTOKEN@fake.upstash.io:6379"
+    )
+
+    with caplog.at_level("WARNING"):
+        with request_context(make_request_context("tenant-a")):
+            RedisMemoryBuffer(client=SessionFakeRedis())
+
+    warnings = [r.getMessage() for r in caplog.records
+                if "KUMIHO_HOSTED_LOCAL_REDIS is active" in r.getMessage()]
+    assert warnings, caplog.records
+    assert "SUPERSECRETTOKEN" not in warnings[0]
+    # Still identifies the host, which is the whole point of the warning.
+    assert "fake.upstash.io:6379" in warnings[0]
+    assert "default:***@" in warnings[0]
+
+
+def test_redact_redis_url_leaves_a_credential_free_url_alone():
+    assert redis_memory.redact_redis_url("redis://127.0.0.1:6379") == "redis://127.0.0.1:6379"
+    assert redis_memory.redact_redis_url(None) == "<none>"
+    assert redis_memory.redact_redis_url("") == "<none>"
+    assert (
+        redis_memory.redact_redis_url("rediss://:tok@h:1") == "rediss://***@h:1"
+    )
+
+
+def test_the_entity_anchor_lock_table_is_capped():
+    """Keyed per ENTITY, not per tenant: uncapped it grows with every entity
+    every tenant has ever promoted, for the life of the process. Capped for
+    the same reason (and in the same shape) as _recall_scope_locks."""
+    import kumiho_memory.entity_promotion as entity_promotion
+
+    with request_context(make_request_context("tenant-a")):
+        for i in range(entity_promotion._ANCHOR_LOCK_CAP + 50):
+            entity_promotion._anchor_lock(f"entity-{i}")
+
+    assert len(entity_promotion._anchor_locks) <= entity_promotion._ANCHOR_LOCK_CAP
+    # A lock a caller is holding survives the sweep.
+    with request_context(make_request_context("tenant-b")):
+        held = entity_promotion._anchor_lock("in-flight")
+        held.acquire()
+        try:
+            for i in range(entity_promotion._ANCHOR_LOCK_CAP + 50):
+                entity_promotion._anchor_lock(f"more-{i}")
+            assert entity_promotion._anchor_lock("in-flight") is held
+        finally:
+            held.release()

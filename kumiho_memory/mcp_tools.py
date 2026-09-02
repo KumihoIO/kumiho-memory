@@ -272,8 +272,21 @@ def _get_manager():
     global _manager
     ctx = current_request()
     if ctx is not None:
+        tenant_id = (ctx.tenant_id or "").strip()
+        if not tenant_id:
+            # The cache key IS the isolation boundary, and "" is a key like
+            # any other: a blank tenant would hand every such request one
+            # shared manager, one Redis prefix and one active-session
+            # pointer — the exact collapse this cache exists to prevent, in
+            # its most complete form. The hosting layer is supposed to reject
+            # a token with no tenant claim before it ever gets here; refusing
+            # loudly is how that stays true rather than degrading quietly.
+            raise ValueError(
+                "hosted request context has no tenant_id; refusing to build a "
+                "memory manager under a blank tenant key"
+            )
         return _tenant_managers.get(
-            ctx.tenant_id, lambda: _build_hosted_manager(ctx),
+            tenant_id, lambda: _build_hosted_manager(ctx),
         )
     if _manager is not None:
         return _manager
