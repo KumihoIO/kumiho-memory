@@ -600,10 +600,18 @@ def tool_memory_consolidate(args: Dict[str, Any]) -> Dict[str, Any]:
 
     async def _run():
         session_id, source = await _resolve_session(args, manager)
+        # Keyless consolidation: forwarded only when supplied, so a manager
+        # with the pre-summary signature keeps working on the LLM path.
+        keyless: Dict[str, Any] = {}
+        if args.get("summary") is not None:
+            keyless["summary"] = args.get("summary")
+        if args.get("implications") is not None:
+            keyless["implications"] = args.get("implications")
         result = await manager.consolidate_session(
             session_id=session_id,
             evidence_level=args.get("evidence_level"),
             source=args.get("source"),
+            **keyless,
         )
         return _annotate_session(result, session_id, source)
 
@@ -1264,9 +1272,13 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
         "name": "kumiho_memory_consolidate",
         "description": (
             "Consolidate a conversation session into long-term memory. "
-            "Summarizes the conversation with an LLM, redacts PII, writes "
-            "a local artifact, and stores the summary to the Kumiho graph. "
-            "The session's working memory is cleared after consolidation."
+            "Keyless when you pass `summary`: write the session summary "
+            "yourself from the conversation (or have a subagent write it) "
+            "and no external LLM is called. Redacts PII, writes a local "
+            "artifact, stores the summary to the Kumiho graph, and clears "
+            "the session's working memory. Without `summary` the configured "
+            "LLM summarizer runs instead, which needs an API key or "
+            "KUMIHO_LLM_BASE_URL and fails keyless."
             + _SESSION_DEFAULT_NOTE
         ),
         "inputSchema": {
@@ -1275,6 +1287,31 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                 "session_id": {
                     "type": "string",
                     "description": "Session identifier to consolidate.",
+                },
+                "summary": {
+                    "type": ["object", "string"],
+                    "description": (
+                        "The summary of this session, written by you (or a "
+                        "subagent) from the conversation — keyless, no LLM "
+                        "call. Plain text, or an object: {type, title, "
+                        "summary, events:[{event, when, event_date (ISO), "
+                        "participants:[], consequence}], knowledge:{facts:"
+                        "[{claim, certainty}], decisions:[{decision, reason}], "
+                        "actions:[{task, status}], open_questions:[]}, "
+                        "classification:{topics:[], entities:[]}}. Only "
+                        "'summary' is required; missing fields default to "
+                        "empty. Write it for a reader who was not there: "
+                        "what was decided and why, durable facts, open items."
+                    ),
+                },
+                "implications": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional, with summary: future situations in which "
+                        "this conversation would matter, worded differently "
+                        "from the summary so vector search bridges to them."
+                    ),
                 },
                 "evidence_level": {
                     "type": "string",

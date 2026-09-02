@@ -52,6 +52,217 @@ class StubRedactor:
         pass
 
 
+class NeverSummarizer:
+    """Any call proves the keyless path leaked into the LLM path."""
+
+    async def summarize_conversation(self, messages, context=None):
+        raise AssertionError("summarize_conversation must not be called")
+
+    async def generate_implications(self, messages, context=None):
+        raise AssertionError("generate_implications must not be called")
+
+
+AGENT_SUMMARY = {
+    "type": "summary",
+    "title": "Tea preferences",
+    "summary": "The user prefers green tea over coffee.",
+    "events": [
+        {"event": "Switched from coffee to tea", "when": "last week",
+         "event_date": "2026-08-25", "participants": ["user"],
+         "consequence": "sleeps better"},
+        "not an event object",
+    ],
+    "knowledge": {
+        "facts": [{"claim": "User drinks green tea daily", "certainty": "high"}],
+        "decisions": [{"decision": "Buy loose-leaf", "reason": "cheaper per cup"}],
+        "actions": [{"task": "Order a teapot", "status": "open"}],
+        "open_questions": ["Which supplier?", ""],
+    },
+    "classification": {"topics": ["tea", "habits"], "entities": ["green tea"]},
+}
+
+
+def _keyless_manager(tmpdir, stored, summarizer=None):
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+
+    async def store_stub(**kwargs):
+        stored.append(kwargs)
+        return {"item_kref": "kref://memory/item", "revision_kref": "kref://memory/item?r=1"}
+
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=summarizer or NeverSummarizer(),
+        pii_redactor=StubRedactor(),
+        memory_store=store_stub,
+        consolidation_threshold=2,
+        artifact_root=tmpdir,
+    )
+    return manager, buffer
+
+
+async def _two_turn_session(manager):
+    ingest = await manager.ingest_message(
+        user_id="user-keyless", message="I like tea.", context="personal",
+    )
+    session_id = ingest["session_id"]
+    await manager.add_assistant_response(session_id=session_id, response="Green tea is best.")
+    return session_id
+
+
+def test_consolidation_with_a_provided_summary_never_calls_the_summarizer():
+    """The keyless path: the agent wrote the summary, so a summarizer that
+    raises on contact proves no LLM was consulted, and everything downstream
+    of summarization (redaction, artifact, store, buffer clear) still runs."""
+    stored = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager, buffer = _keyless_manager(tmpdir, stored)
+
+        async def run():
+            session_id = await _two_turn_session(manager)
+            result = await manager.consolidate_session(
+                session_id=session_id,
+                summary=AGENT_SUMMARY,
+                implications=["Choosing a drink for the user", " "],
+            )
+            assert result["success"] is True, result
+            assert len(stored) == 1
+            payload = stored[0]
+            assert payload["title"] == "Tea preferences"
+            assert payload["memory_type"] == "summary"
+            # Redaction still applies to an agent-written summary.
+            assert "[topic]" in result["summary"]
+            assert "green [topic]" in result["summary"]
+            # Structured sections are appended exactly as on the LLM path.
+            assert "Key events:" in result["summary"]
+            assert "Key facts:" in result["summary"]
+            assert "Decisions:" in result["summary"]
+            assert "Future relevance:" in result["summary"]
+            assert "Choosing a drink for the user" in result["summary"]
+            meta = payload["metadata"]
+            # Structured fields are redacted too: the agent saw the raw
+            # conversation, so they cannot be clean by construction the way
+            # the summarizer's output is.
+            assert meta["topics"] == "[topic],habits"
+            assert meta["entities"] == "green [topic]"
+            assert "green [topic] daily" in meta["facts"]
+            assert meta["event_date"] == "2026-08-25"
+            assert meta["implications"] == "Choosing a drink for the user"
+            assert os.path.isfile(payload["artifact_location"])
+            working = await buffer.get_messages(
+                project=manager.project, session_id=session_id, limit=10,
+            )
+            assert working["message_count"] == 0
+
+        asyncio.run(run())
+
+
+def test_provided_summary_structured_fields_are_redacted_before_storage():
+    """The LLM path's title/entities/facts are clean by construction (the
+    summarizer only sees a redacted transcript). An agent-written summary saw
+    the raw conversation, so every field must go through the same redactor,
+    not just the narrative text."""
+    stored = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager, _buffer = _keyless_manager(tmpdir, stored)
+
+        async def run():
+            session_id = await _two_turn_session(manager)
+            result = await manager.consolidate_session(
+                session_id=session_id,
+                summary={
+                    "title": "tea with Alice",
+                    "summary": "tea",
+                    "events": [{"event": "tea at 4", "when": "today", "consequence": "tea"}],
+                    "knowledge": {"decisions": [{"decision": "buy tea", "reason": "tea"}]},
+                    "classification": {"topics": ["tea"], "entities": ["tea"]},
+                },
+                implications=["tea later"],
+            )
+            assert result["success"] is True, result
+            payload = stored[0]
+            assert "tea" not in payload["title"]
+            meta = payload["metadata"]
+            for key in ("topics", "entities", "decisions", "events", "implications"):
+                assert "tea" not in meta[key], (key, meta[key])
+            assert "tea" not in result["summary"]
+
+        asyncio.run(run())
+
+
+def test_consolidation_accepts_a_plain_text_summary():
+    stored = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager, _buffer = _keyless_manager(tmpdir, stored)
+
+        async def run():
+            session_id = await _two_turn_session(manager)
+            result = await manager.consolidate_session(
+                session_id=session_id, summary="  Talked about tea.  ",
+            )
+            assert result["success"] is True, result
+            assert stored[0]["title"] == "Conversation"
+            assert stored[0]["memory_type"] == "summary"
+            assert result["summary"].startswith("Talked about [topic].")
+            assert "Key facts:" not in result["summary"]
+
+        asyncio.run(run())
+
+
+def test_consolidation_refuses_an_unusable_provided_summary():
+    """Nothing is written and the buffer survives -- the same contract the LLM
+    path keeps when its summary fails (no raw-text fallback, no fake success)."""
+    stored = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager, buffer = _keyless_manager(tmpdir, stored)
+
+        async def run():
+            session_id = await _two_turn_session(manager)
+            for bad in ("   ", {"title": "no summary field"}, {"summary": ""}, 42, ["x"]):
+                result = await manager.consolidate_session(session_id=session_id, summary=bad)
+                assert result["success"] is False, bad
+                assert "Provided summary" in result["error"]
+            assert stored == []
+            working = await buffer.get_messages(
+                project=manager.project, session_id=session_id, limit=10,
+            )
+            assert working["message_count"] == 2
+
+        asyncio.run(run())
+
+
+def test_provided_summary_implications_may_ride_inside_the_object():
+    stored = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager, _buffer = _keyless_manager(tmpdir, stored)
+
+        async def run():
+            session_id = await _two_turn_session(manager)
+            result = await manager.consolidate_session(
+                session_id=session_id,
+                summary={"summary": "Tea talk.", "implications": ["Picking a cafe"]},
+            )
+            assert result["success"] is True, result
+            assert stored[0]["metadata"]["implications"] == "Picking a cafe"
+
+        asyncio.run(run())
+
+
+def test_omitting_the_summary_still_uses_the_summarizer():
+    """The LLM path is untouched: no summary argument, the stub summarizer runs."""
+    stored = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager, _buffer = _keyless_manager(tmpdir, stored, summarizer=StubSummarizer())
+
+        async def run():
+            session_id = await _two_turn_session(manager)
+            result = await manager.consolidate_session(session_id=session_id)
+            assert result["success"] is True
+            assert stored[0]["title"] == "Stub summary"
+
+        asyncio.run(run())
+
+
 def test_memory_manager_consolidation_calls_store():
     fake = FakeRedis()
     buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
