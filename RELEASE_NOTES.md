@@ -94,6 +94,44 @@ underestimated the real response by about 18x (762 reported against a 56 KB
 envelope). `approx_tokens` keeps its documented meaning — the new field is
 additive.
 
+## v1.2.0
+
+**Release Date:** 2026-07-30
+
+**`session_id` becomes optional on every session-scoped tool, resolved server-side (#3).** Six tools required a session id from an LLM caller and used it as a Redis key component, so an omission lost the turn to a validation error and a typo silently fragmented the buffer into per-typo buckets that the TTL then erased. One resolver now serves ingest and the tools alike:
+
+    explicit session_id argument
+      > KUMIHO_SESSION_ID            (identity-less callers; the explicit host contract)
+      > (context, user) pointer      (user-scoped callers; SET NX compare-and-claim)
+      > generated per-user id        (pointer-registered, identity stamped at the mint)
+      > ValueError with instructions (no identity at all — never a silent default)
+
+`session_id` leaves every `required` array; every result reports `session_id`, `session_id_source`, and on writes `created_bucket`, the one observable trace of a drifted id. `CLAUDE_CODE_SESSION_ID` is deliberately not honoured: it reaches the server by env inheritance, frozen at spawn, while Claude Code rotates its session on `/clear` without respawning the server. Identity provisioning belongs to the host integration, which owns rotation (kumiho-plugins#45).
+
+Repairs shipped alongside:
+
+- `clear_active_session` gains `only_if` compare-and-delete (enforced client-side in proxy mode too), so consolidating a backfill id no longer severs the live conversation's pointer.
+- Consolidation clears the pointer under both key pairs, and the generation bump moves before the buffer clear so a sibling's in-window write lands in a surviving bucket.
+- Pointer registration is SET NX compare-and-claim; the loser adopts the winner.
+- The env id rotates through a Redis-persisted generation (`{env}:c{n}`), shared across sibling servers with a sliding TTL and an exact-generation guard so a backfill consolidation never rotates the live session.
+- `created_bucket` derives from RPUSH's atomic return (proxy mode derives it when the server omits it); user-scoped mints stamp `{user_id, context}`; `list_sessions` round-trips the colon-bearing ids this system mints; `code_mine_session` resolves through the generation-aware resolver and fails fast before the paid ingest pre-pass; a blank id is loud on the identity-less tools.
+
+Eight adversarial review rounds preceded the merge. `tests/test_session_resolution.py` adds 45 tests, and `tests/conftest.py` strips the host-session env vars so the pointer and generated tiers are actually exercised. (#4)
+
+## v1.1.0
+
+**Release Date:** 2026-07-30
+
+**`kumiho_memory_reflect`'s capture vocabulary reaches the caller.** A caller reading the tool's schema could not see which memory types a capture may carry. Measured against a live host, property descriptions are forwarded only for required top-level properties and the `required` arrays are dropped in transit, so the optional `captures` sub-schema arrived undocumented, and nothing validated `type`: a wrong guess filed the memory under a type no reader branches on. Structural keywords survive the transport, so the contract moved into them: `captures[].type` gains a real `enum`, and the tool description restates the required fields.
+
+**Behaviour change:** a `type` outside the ten valid memory types is now rejected at the MCP layer instead of silently stored. A loud rejection the caller can retry beats a permanently miscategorised memory.
+
+- The three copies of the vocabulary (module prose, the edge-discovery gate's inline tuple, the assessor prompts) collapse to one source, `MEMORY_TYPES` and `EDGE_DISCOVERY_TYPES`, with a test pinning the subset relation.
+- After adversarial review the documented transport rule was corrected: `required` is not reliably forwarded and no single rule explains every observation, while descriptions survive only for source-required properties and `enum` survives everywhere. The edge gate moved into `earns_edge_discovery()` so tests exercise the predicate the code calls, and the vocabulary is asserted against a spelled-out list.
+- Tests model the lossy transport explicitly and are mutation-checked.
+
+Minor version rather than patch: a newly enforced constraint plus newly advertised vocabulary. (#2)
+
 ## v1.0.0
 
 **Release Date:** 2026-07-22
