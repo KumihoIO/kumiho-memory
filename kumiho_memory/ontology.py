@@ -31,6 +31,9 @@ Relational edges (``relations`` module extends this):
 
     decision  --DEPENDS_ON-->  fact                      (summarizer-emitted)
     decision  --SUPERSEDES-->  decision                  (subject match)
+    decision  --DERIVED_FROM-->  conversation            (same-subject reflect
+                                                          capture in the same
+                                                          space; #17)
 
 Every typed node carries ``title``/``summary`` so the graph-augmented reader
 surfaces it as content (not a bare stub) when it hops through a shared entity.
@@ -215,6 +218,7 @@ class _Materializer:
 
 _ALIAS_RESOLUTION_ENV = "KUMIHO_MEMORY_ALIAS_RESOLUTION"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSEY = frozenset({"0", "false", "no", "off"})
 
 
 def _alias_resolution_enabled() -> bool:
@@ -222,6 +226,33 @@ def _alias_resolution_enabled() -> bool:
     import os
 
     return str(os.getenv(_ALIAS_RESOLUTION_ENV, "")).strip().casefold() in _TRUTHY
+
+
+# --------------------------------------------------------------------------- #
+# Cross-layer capture linking (#17)                                           #
+#                                                                             #
+# Gated like every other write-path switch in this module, but DEFAULT ON —   #
+# this mirrors _alias_resolution_enabled's *mechanism*, not its default.      #
+# Alias resolution defaults OFF because its failure mode is destructive to    #
+# identity: it folds two surface forms onto one hub, and afterwards a wrong   #
+# fold is indistinguishable from a right one. Capture linking only ever ADDS  #
+# one edge — merges nothing, deprecates nothing, rewrites no metadata, and is #
+# idempotent across re-runs — so it satisfies the additive principle          #
+# (docs/ONTOLOGY_PRINCIPLES_GAP.md, "Plan": every phase opt-in *or* lossless) #
+# that governs whether something may ship default-ON. The default follows the #
+# closest precedent for an additive write path, KUMIHO_MEMORY_ONTOLOGY ("1"   #
+# unless explicitly "0"); the flag is the kill switch, so a graph that does   #
+# not want the edge can drop it without dropping decomposition.               #
+# --------------------------------------------------------------------------- #
+
+_CAPTURE_LINK_ENV = "KUMIHO_MEMORY_LINK_CAPTURES"
+
+
+def _capture_linking_enabled() -> bool:
+    """True unless cross-layer capture linking is switched off via env."""
+    import os
+
+    return str(os.getenv(_CAPTURE_LINK_ENV, "1")).strip().casefold() not in _FALSEY
 
 
 def _entity_slug_from_uri(uri: str) -> str:
@@ -363,7 +394,7 @@ def _sync_decompose(
     m = _Materializer(project, project_name, schema)
     stats: Dict[str, int] = {"entities": 0, "entities_reused": 0, "facts": 0,
                              "decisions": 0, "events": 0, "actions": 0,
-                             "questions": 0, "edges": 0}
+                             "questions": 0, "edges": 0, "capture_links": 0}
 
     resolver = _AliasResolver(
         project_name, schema, enabled=_alias_resolution_enabled(),
@@ -536,8 +567,15 @@ def _sync_decompose(
             stats["edges"] += 1
 
     # --- Relational edges (DEPENDS_ON via token overlap, SUPERSEDES via
-    #     subject overlap) ---
-    from .relations import link_depends_on, link_depends_on_by_overlap, link_supersedes
+    #     subject overlap, DERIVED_FROM to a same-subject reflect capture) ---
+    from .relations import (
+        link_capture_source,
+        link_depends_on,
+        link_depends_on_by_overlap,
+        link_supersedes,
+    )
+
+    link_captures = _capture_linking_enabled()
 
     for anchor, slug, text, body, based_on in decision_entries:
         if based_on:
@@ -554,6 +592,18 @@ def _sync_decompose(
         stats["edges"] += link_supersedes(
             m, "decision", schema.decisions_space, slug, anchor, text, project_name,
         )
+        # #17: the same decision may already exist in this space as a
+        # `conversation` capture written by reflect. Link the two layers
+        # instead of leaving one decision as two unrelated nodes — additive,
+        # and idempotent through _Materializer.edge's existing-edge precheck,
+        # so re-consolidating the same session never draws it twice.
+        if link_captures:
+            linked = link_capture_source(
+                m, schema.decisions_space, anchor, text, project_name,
+                exclude_item_uri=conversation_kref,
+            )
+            stats["capture_links"] += linked
+            stats["edges"] += linked
     for anchor, slug, claim in fact_entries:
         stats["edges"] += link_supersedes(
             m, "fact", schema.facts_space, slug, anchor, claim, project_name,
