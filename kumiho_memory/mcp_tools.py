@@ -889,9 +889,15 @@ _recall_recent: Dict[str, float] = {}
 # _recall_lock and is uncontended; hosted callers in different scopes hold
 # DIFFERENT critical-section locks, so the shared dict needs its own.
 _recall_recent_guard = threading.Lock()
-# Per-scope critical-section locks (hosted only). Created on demand and never
-# evicted — a lock per (tenant, user, session) is a few hundred bytes and the
-# alternative, reclaiming them, races with the callers holding them.
+# Per-scope critical-section locks (hosted only), created on demand. Capped
+# because a hosted server is long-lived and a scope is per SESSION, not per
+# tenant: unbounded, this grows with every conversation the process ever
+# serves. Over the cap the unheld locks are dropped — a caller that still
+# holds one keeps working (it holds the reference), and the only cost of
+# dropping a lock some later caller would have shared is that one duplicate
+# recall runs instead of being suppressed, which is the guard's benign
+# direction. Correctness of the dedup record itself is _recall_recent's job.
+_RECALL_SCOPE_LOCK_CAP = 4096
 _recall_scope_locks: Dict[str, threading.Lock] = {}
 _recall_scope_locks_guard = threading.Lock()
 
@@ -930,6 +936,10 @@ def _recall_guard_lock(scope: str) -> threading.Lock:
     with _recall_scope_locks_guard:
         lock = _recall_scope_locks.get(scope)
         if lock is None:
+            if len(_recall_scope_locks) >= _RECALL_SCOPE_LOCK_CAP:
+                for key in [k for k, v in _recall_scope_locks.items()
+                            if not v.locked()]:
+                    _recall_scope_locks.pop(key, None)
             lock = threading.Lock()
             _recall_scope_locks[scope] = lock
         return lock

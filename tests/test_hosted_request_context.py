@@ -528,6 +528,23 @@ def test_the_recall_guard_lock_is_shared_only_on_the_stdio_path():
     assert mcp_tools._recall_guard_lock("tenant-a\x1eu\x1es") is a
 
 
+def test_the_scope_lock_table_is_capped_but_never_drops_a_held_lock():
+    """A scope is per SESSION, so on a long-lived server this table grows with
+    every conversation the process ever serves."""
+    cap = mcp_tools._RECALL_SCOPE_LOCK_CAP
+    held = mcp_tools._recall_guard_lock("tenant-a\x1eu\x1ekeep-me")
+    held.acquire()
+    try:
+        for i in range(cap + 1):
+            mcp_tools._recall_guard_lock(f"tenant-a\x1eu\x1es{i}")
+        assert len(mcp_tools._recall_scope_locks) <= cap
+        # The in-flight scope kept its lock, so a concurrent caller in that
+        # same conversation still serializes behind it.
+        assert mcp_tools._recall_guard_lock("tenant-a\x1eu\x1ekeep-me") is held
+    finally:
+        held.release()
+
+
 # ---------------------------------------------------------------------------
 # No filesystem writes (§2.3 item 5)
 # ---------------------------------------------------------------------------
