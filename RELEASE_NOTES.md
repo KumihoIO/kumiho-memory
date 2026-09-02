@@ -31,7 +31,16 @@ Under a request context:
   request that built it and the token is short-lived. Ambient
   `UPSTASH_REDIS_URL` / `KUMIHO_UPSTASH_REDIS_URL` and `~/.kumiho` credentials
   are never consulted; missing request credentials raise rather than fall back
-  to the operator's identity.
+  to the operator's identity. One exception, for development: with
+  `KUMIHO_HOSTED_LOCAL_REDIS=1` **and** `KUMIHO_MCP_HOSTED=1` the hosted server
+  may use a direct Redis from `KUMIHO_LOCAL_REDIS_URL` / `UPSTASH_REDIS_URL` /
+  `redis://127.0.0.1:6379`, so the hosted path can be exercised against a local
+  CE backend with no control plane in the picture. Keys stay namespaced per
+  tenant and user exactly as behind the proxy, an explicitly configured proxy
+  still wins, and taking the hatch logs a WARNING at manager build time.
+  Without `KUMIHO_MCP_HOSTED` it warns and does nothing, so the plugin cannot
+  be reached by it. Nothing checks a per-request token on that path — it is for
+  development only.
 - **Session identity comes from the request**: explicit `session_id` argument →
   `ctx.session_id` → the active-session pointer for `(ctx.context,
   ctx.user_id)` → a generated id that registers the pointer. Results report

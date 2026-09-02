@@ -23,7 +23,7 @@ from kumiho.discovery import (
     _DEFAULT_CACHE_KEY,
 )
 
-from kumiho_memory._request_context import current_request, is_hosted
+from kumiho_memory._request_context import current_request, hosted_mode, is_hosted
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,52 @@ logger = logging.getLogger(__name__)
 _token_override_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "redis_token_override", default=None,
 )
+
+#: Where the dev escape hatch points when nothing else names a Redis.
+HOSTED_LOCAL_REDIS_DEFAULT = "redis://127.0.0.1:6379"
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def hosted_local_redis_url() -> Optional[str]:
+    """Direct Redis URL for the hosted server's dev mode, or ``None``.
+
+    Hosted mode normally has exactly one route to Redis — the control-plane
+    proxy — because that is what namespaces keys per tenant and authenticates
+    per request. WP-C's ``KUMIHO_MCP_DEV_MODE=ce`` has no control plane at
+    all, so without an escape hatch it has no Redis at all, and the hosted
+    path cannot be exercised locally against a CE backend.
+
+    So ``KUMIHO_HOSTED_LOCAL_REDIS=1`` opts into a direct connection, taken
+    from ``KUMIHO_LOCAL_REDIS_URL``, else ``UPSTASH_REDIS_URL``, else
+    :data:`HOSTED_LOCAL_REDIS_DEFAULT`. Keys are still built by the same
+    tenant/user-prefixed key methods (``kumiho:memory:{tenant}:…``, and the
+    active-session pointer carries ``{context}:{user}``), so two tenants
+    sharing one dev Redis stay in separate key spaces exactly as they do
+    behind the proxy.
+
+    **It also requires ``KUMIHO_MCP_HOSTED=1``**, and warns rather than acting
+    when that is missing. Gating on the coarse process-wide flag rather than
+    on ``is_hosted()`` is the point: a request context alone would let a stray
+    env var redirect a plugin user's working memory to localhost. Turning this
+    on takes saying so twice.
+    """
+    if not _env_flag("KUMIHO_HOSTED_LOCAL_REDIS"):
+        return None
+    if not hosted_mode():
+        logger.warning(
+            "KUMIHO_HOSTED_LOCAL_REDIS is set but KUMIHO_MCP_HOSTED is not — "
+            "ignoring it. The direct-Redis escape hatch belongs to the hosted "
+            "server's dev mode and never changes local plugin behavior.",
+        )
+        return None
+    return (
+        os.getenv("KUMIHO_LOCAL_REDIS_URL", "").strip()
+        or os.getenv("UPSTASH_REDIS_URL", "").strip()
+        or HOSTED_LOCAL_REDIS_DEFAULT
+    )
 
 
 class RedisDiscoveryError(RuntimeError):
@@ -121,13 +167,36 @@ class RedisMemoryBuffer:
                 if not self.tenant_id:
                     self.tenant_id = discovery.tenant_id
 
+        # Called unconditionally, because it also carries the "you set this but
+        # not KUMIHO_MCP_HOSTED, so it is being ignored" warning — which has to
+        # reach an operator who set it in the wrong process.
+        local_dev_url = hosted_local_redis_url()
+
         if not resolved_url and not self._hosted:
             # Ambient Redis credentials are a single-tenant convenience. In a
             # shared server they would hand every tenant the SAME database,
             # under keys the proxy namespaces per tenant precisely so that
-            # cannot happen — so hosted mode has exactly one route to Redis:
-            # the control-plane proxy, authenticated per request.
+            # cannot happen — so hosted mode's route to Redis is the
+            # control-plane proxy, authenticated per request. (The one way
+            # past that is the deliberate dev opt-in below, which still
+            # namespaces every key by tenant and user.)
             resolved_url = os.getenv("KUMIHO_UPSTASH_REDIS_URL") or os.getenv("UPSTASH_REDIS_URL")
+        elif not resolved_url and self._hosted and local_dev_url and not self.proxy_url:
+            # Dev-mode escape hatch (see hosted_local_redis_url). Beaten by an
+            # explicitly configured proxy, so a deployment that has a control
+            # plane keeps using it even if the flag is left set by accident.
+            # WARNING, not INFO: a hosted process talking straight to a Redis
+            # is a fact an operator must be able to find in the logs, and this
+            # fires once per manager build rather than once per operation.
+            resolved_url = local_dev_url
+            logger.warning(
+                "KUMIHO_HOSTED_LOCAL_REDIS is active: hosted memory is using a "
+                "DIRECT Redis connection (%s) instead of the control-plane "
+                "proxy. Keys stay namespaced per tenant and user, but the "
+                "per-request token is not checked by anything. Development "
+                "only — never enable this in a deployment serving real tenants.",
+                resolved_url,
+            )
 
         # Auto-fallback: when no direct Redis URL is available, use the
         # control-plane memory proxy so clients never need the raw Redis secret.

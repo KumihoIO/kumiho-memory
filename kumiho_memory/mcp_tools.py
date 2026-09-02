@@ -175,7 +175,11 @@ class _TenantManagerCache:
     Eviction just drops the reference. A hosted manager's buffer talks to the
     control-plane proxy over stateless HTTP and holds no Redis client
     (``RedisMemoryBuffer.close`` is a no-op there), so there is no socket to
-    leak and no async close to schedule from this synchronous path.
+    leak and no async close to schedule from this synchronous path. The one
+    exception is the dev escape hatch (``KUMIHO_HOSTED_LOCAL_REDIS``), where
+    the buffer does own a client: an evicted one leaves its connection pool to
+    the garbage collector, which is fine on a dev box and is one more reason
+    that flag is not for production.
     """
 
     def __init__(

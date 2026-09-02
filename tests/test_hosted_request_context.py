@@ -71,6 +71,8 @@ def _clean_process_state(monkeypatch, tmp_path):
         "KUMIHO_MEMORY_PROXY_URL",
         "KUMIHO_MCP_HOSTED",
         "KUMIHO_HOSTED_LLM",
+        "KUMIHO_HOSTED_LOCAL_REDIS",
+        "KUMIHO_LOCAL_REDIS_URL",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("KUMIHO_CONTROL_PLANE_URL", CONTROL_PLANE)
@@ -702,6 +704,141 @@ def test_non_hosted_still_uses_ambient_upstash_credentials(monkeypatch):
     monkeypatch.setenv("UPSTASH_REDIS_URL", "redis://local.invalid:6379")
     buffer = RedisMemoryBuffer(prefer_discovery=False)
     assert buffer.redis_url == "redis://local.invalid:6379"
+
+
+# --- dev-only direct-Redis escape hatch (WP-C's KUMIHO_MCP_DEV_MODE=ce) ----
+# Hosted mode has exactly one route to Redis, because that route is what
+# authenticates and namespaces. Dev mode has no control plane, so it needs a
+# second one — and these tests are mostly about how tightly it is shut.
+
+
+def test_the_escape_hatch_is_off_by_default(monkeypatch, proxy):
+    monkeypatch.setenv("KUMIHO_MCP_HOSTED", "1")
+    with request_context(make_request_context("t1")):
+        buffer = RedisMemoryBuffer(tenant_id="t1", prefer_discovery=False)
+    assert buffer.redis_url is None
+    assert buffer.proxy_url == PROXY_URL
+
+
+def test_the_escape_hatch_gives_hosted_mode_a_direct_redis(monkeypatch, proxy, caplog):
+    monkeypatch.setenv("KUMIHO_MCP_HOSTED", "1")
+    monkeypatch.setenv("KUMIHO_HOSTED_LOCAL_REDIS", "1")
+    monkeypatch.setenv("KUMIHO_LOCAL_REDIS_URL", "redis://127.0.0.1:6399")
+    with caplog.at_level("WARNING"), request_context(make_request_context("t1")):
+        buffer = RedisMemoryBuffer(tenant_id="t1", prefer_discovery=False)
+    assert buffer.redis_url == "redis://127.0.0.1:6399"
+    assert buffer.proxy_url is None, "the proxy must not also be configured"
+    # Exactly one warning, at build time: an operator has to be able to find a
+    # hosted process talking straight to Redis in the logs, and it must not
+    # repeat per operation.
+    hatch = [r for r in caplog.records
+             if r.levelname == "WARNING"
+             and "KUMIHO_HOSTED_LOCAL_REDIS is active" in r.getMessage()]
+    assert len(hatch) == 1
+
+
+def test_the_escape_hatch_url_falls_back_in_order(monkeypatch):
+    from kumiho_memory.redis_memory import (
+        HOSTED_LOCAL_REDIS_DEFAULT,
+        hosted_local_redis_url,
+    )
+
+    monkeypatch.setenv("KUMIHO_MCP_HOSTED", "1")
+    monkeypatch.setenv("KUMIHO_HOSTED_LOCAL_REDIS", "1")
+    assert hosted_local_redis_url() == HOSTED_LOCAL_REDIS_DEFAULT
+    monkeypatch.setenv("UPSTASH_REDIS_URL", "redis://from-upstash:6379")
+    assert hosted_local_redis_url() == "redis://from-upstash:6379"
+    monkeypatch.setenv("KUMIHO_LOCAL_REDIS_URL", "redis://from-local:6379")
+    assert hosted_local_redis_url() == "redis://from-local:6379"
+
+
+def test_the_escape_hatch_is_ignored_without_the_hosted_env(monkeypatch, caplog):
+    """The stdio plugin must be unreachable by this flag."""
+    from kumiho_memory.redis_memory import hosted_local_redis_url
+
+    monkeypatch.setenv("KUMIHO_HOSTED_LOCAL_REDIS", "1")
+    monkeypatch.setenv("KUMIHO_LOCAL_REDIS_URL", "redis://127.0.0.1:6399")
+    with caplog.at_level("WARNING"):
+        assert hosted_local_redis_url() is None
+    assert any("ignoring it" in r.getMessage() for r in caplog.records)
+
+
+def test_a_request_context_alone_does_not_arm_the_escape_hatch(monkeypatch, proxy):
+    """is_hosted() is true here (a request is set) but hosted_mode() is not, so
+    the buffer still goes through the proxy. Gating on the coarse process-wide
+    flag is what keeps a stray env var from redirecting a plugin user's
+    working memory to localhost."""
+    monkeypatch.setenv("KUMIHO_HOSTED_LOCAL_REDIS", "1")
+    monkeypatch.setenv("KUMIHO_LOCAL_REDIS_URL", "redis://127.0.0.1:6399")
+    with request_context(make_request_context("t1")):
+        buffer = RedisMemoryBuffer(tenant_id="t1", prefer_discovery=False)
+    assert buffer.redis_url is None
+    assert buffer.proxy_url == PROXY_URL
+
+
+def test_the_escape_hatch_does_not_change_the_stdio_path(monkeypatch):
+    """Without KUMIHO_MCP_HOSTED the plugin resolves exactly as it always has:
+    the ambient UPSTASH_REDIS_URL, not the hatch's default."""
+    monkeypatch.setenv("KUMIHO_HOSTED_LOCAL_REDIS", "1")
+    monkeypatch.setenv("UPSTASH_REDIS_URL", "redis://plugin-redis.invalid:6379")
+    buffer = RedisMemoryBuffer(prefer_discovery=False)
+    assert buffer.redis_url == "redis://plugin-redis.invalid:6379"
+
+
+def test_a_configured_proxy_still_beats_the_escape_hatch(monkeypatch, proxy):
+    """A deployment that HAS a control plane keeps using it even if the flag
+    was left set by accident."""
+    monkeypatch.setenv("KUMIHO_MCP_HOSTED", "1")
+    monkeypatch.setenv("KUMIHO_HOSTED_LOCAL_REDIS", "1")
+    monkeypatch.setenv("KUMIHO_MEMORY_PROXY_URL", PROXY_URL)
+    with request_context(make_request_context("t1")):
+        buffer = RedisMemoryBuffer(tenant_id="t1", prefer_discovery=False)
+    assert buffer.redis_url is None
+    assert buffer.proxy_url == PROXY_URL
+
+
+def test_the_escape_hatch_keeps_keys_namespaced_per_tenant_and_user(monkeypatch):
+    """The whole safety argument for the hatch: one dev Redis, still no
+    collision between tenants or between users."""
+    monkeypatch.setenv("KUMIHO_MCP_HOSTED", "1")
+    monkeypatch.setenv("KUMIHO_HOSTED_LOCAL_REDIS", "1")
+
+    def _buffer(tenant):
+        with request_context(make_request_context(tenant)):
+            return RedisMemoryBuffer(client=SessionFakeRedis(), tenant_id=tenant)
+
+    a, b = _buffer("tenant-a"), _buffer("tenant-b")
+    assert a._session_messages_key("P", "s1") != b._session_messages_key("P", "s1")
+    assert "tenant-a" in a._session_messages_key("P", "s1")
+    assert "tenant-b" in b._session_messages_key("P", "s1")
+    # Pointers carry the tenant AND (context, user), exactly as behind the proxy.
+    assert a._active_session_key("claude", "alice") != a._active_session_key("claude", "bob")
+    assert a._active_session_key("claude", "alice") != b._active_session_key("claude", "alice")
+    for key in (a._session_metadata_key("P", "s1"),
+                a._sequence_key("alice", "20260902"),
+                a._session_generation_key("s1"),
+                a._active_session_key("claude", "alice")):
+        assert "tenant-a" in key
+
+
+def test_the_escape_hatch_reaches_a_hosted_manager_end_to_end(
+    monkeypatch, proxy, hosted_managers,
+):
+    """What WP-C's dev mode actually needs: a built manager whose buffer talks
+    to Redis directly, with no control plane in the picture."""
+    monkeypatch.setenv("KUMIHO_MCP_HOSTED", "1")
+    monkeypatch.setenv("KUMIHO_HOSTED_LOCAL_REDIS", "1")
+    monkeypatch.setenv("KUMIHO_LOCAL_REDIS_URL", "redis://127.0.0.1:6399")
+    with bind_request(make_request_context("tenant-dev")):
+        manager = mcp_tools._get_manager()
+    assert manager.redis_buffer.redis_url == "redis://127.0.0.1:6399"
+    assert manager.redis_buffer.proxy_url is None
+    assert manager.redis_buffer.tenant_id == "tenant-dev"
+    # Still a hosted manager in every other respect.
+    assert manager.hosted is True
+    assert manager.artifact_root is None
+    assert manager.failure_ledger is None
+    assert proxy.calls == [], "dev mode must not touch the control plane at all"
 
 
 def test_hosted_proxy_url_follows_the_control_plane_env(monkeypatch, proxy):
