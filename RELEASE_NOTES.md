@@ -2,7 +2,7 @@
 
 ## v1.4.0
 
-**Release Date:** 2026-09-02
+**Release Date:** 2026-09-04
 
 **Hosted mode: one process can now serve many tenants without leaking one into
 another.**
