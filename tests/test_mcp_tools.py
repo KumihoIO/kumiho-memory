@@ -624,6 +624,41 @@ def test_memory_engage_returns_context_and_krefs():
         _cleanup_manager()
 
 
+def test_memory_engage_touches_no_session():
+    """engage is annotated ``readOnlyHint=true``, and must stay that way.
+
+    Two things follow from that annotation, which Claude reads to decide
+    whether a call needs the user's confirmation:
+
+    * engage reports no ``session_id`` / ``session_id_source`` — it resolves
+      none, so there is nothing honest to report;
+    * and it leaves no active-session pointer or sequence counter behind,
+      because ``resolve_session_id`` WRITES both when it generates an id.
+
+    So "make engage report a session too" is not the free additive change it
+    looks like: it would turn a read-only tool into a Redis writer, and on the
+    hosted connector engage is the first call of every conversation. The
+    connector instructions in kumiho 0.13.0 state the same contract from the
+    other side ("engage is read-only and reports none"); this pins the
+    behaviour those instructions describe.
+    """
+    try:
+        manager, _ = _install_test_manager()
+        client = manager.redis_buffer.client
+        result = tool_memory_engage({"query": "user preferences", "limit": 3})
+
+        assert "session_id" not in result
+        assert "session_id_source" not in result
+        written = [
+            key
+            for key in client.storage
+            if "active_session" in key or "session_seq" in key
+        ]
+        assert written == [], written
+    finally:
+        _cleanup_manager()
+
+
 def test_memory_engage_exposes_approx_tokens():
     """engage should surface an additive approx_tokens (chars/4) budget field."""
     from kumiho_memory.context_compose import approx_tokens

@@ -25,6 +25,7 @@ Order of operations in :func:`rerank`:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import logging
 import math
@@ -488,8 +489,13 @@ async def rerank_async(
     )
     if not offload:
         return call()
+    # The executor is a shared, long-lived single worker; run_in_executor does
+    # not propagate contextvars, so without this the reranker (and anything it
+    # reaches) would run under whatever context that worker started with —
+    # under the hosted connector, some earlier tenant's or none.
+    ctx = contextvars.copy_context()
     return await asyncio.get_running_loop().run_in_executor(
-        _rerank_executor(), call,
+        _rerank_executor(), functools.partial(ctx.run, call),
     )
 
 
@@ -665,8 +671,12 @@ def _run_coro_sync(make_coro: Callable[[], Any]) -> Any:
         return asyncio.run(make_coro())
     import concurrent.futures
 
+    # The throwaway thread must carry the caller's context: the coroutine is
+    # an LLM adapter call, and under the hosted connector the request context
+    # is what says which tenant it belongs to.
+    ctx = contextvars.copy_context()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(lambda: asyncio.run(make_coro())).result()
+        return ex.submit(ctx.run, lambda: asyncio.run(make_coro())).result()
 
 
 def _parse_llm_scores(raw: Any, n: int) -> List[float]:

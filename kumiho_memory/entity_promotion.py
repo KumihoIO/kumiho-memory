@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from kumiho._text import slugify
 
 from ._bounded import run_bounded_in_thread
+from ._request_context import tenant_scope
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +53,32 @@ logger = logging.getLogger(__name__)
 # single process spawns, so concurrent promotions of the same *new* entity
 # don't each create an anchor. (Cross-process races still need server-side
 # get-or-create — tracked as a follow-up.)
+#
+# Keyed by (tenant, slug), not slug: two tenants promoting an entity that
+# happens to share a name are creating two different anchors in two different
+# graphs, and a shared lock would serialize them for no reason. On the stdio
+# path the tenant component is "" and the key space is what it always was.
+#
+# Capped, for the same reason mcp_tools caps _recall_scope_locks: the key is
+# per ENTITY, not per tenant, so on a long-lived hosted server this grows with
+# every distinct entity every tenant has ever promoted, forever. Over the cap
+# the unheld locks are dropped; a caller mid-promotion keeps working (it holds
+# its own reference), and the only cost of dropping a lock a later caller
+# would have shared is that two threads may both attempt the same anchor —
+# which is the pre-existing cross-process race this lock never covered anyway
+# (see the follow-up note above).
+_ANCHOR_LOCK_CAP = 4096
 _anchor_locks_guard = threading.Lock()
-_anchor_locks: Dict[str, threading.Lock] = {}
+_anchor_locks: Dict[Tuple[str, str], threading.Lock] = {}
 
 # Cache resolved Project handles by name to avoid a ListProjects per store.
-_project_cache: Dict[str, Any] = {}
+#
+# Keyed by (tenant, project name). A Project handle is bound to the gRPC
+# client — and therefore the credentials — of whoever resolved it first, so
+# a name-only key in a shared server would hand tenant B a handle that reads
+# and writes tenant A's graph. This is the leak class plan §0 flags in the
+# SDK's own `_project_cache`.
+_project_cache: Dict[Tuple[str, str], Any] = {}
 
 
 def _slugify_entity(name: str) -> str:
@@ -65,11 +87,15 @@ def _slugify_entity(name: str) -> str:
 
 
 def _anchor_lock(slug: str) -> threading.Lock:
+    key = (tenant_scope(), slug)
     with _anchor_locks_guard:
-        lock = _anchor_locks.get(slug)
+        lock = _anchor_locks.get(key)
         if lock is None:
+            if len(_anchor_locks) >= _ANCHOR_LOCK_CAP:
+                for stale in [k for k, v in _anchor_locks.items() if not v.locked()]:
+                    _anchor_locks.pop(stale, None)
             lock = threading.Lock()
-            _anchor_locks[slug] = lock
+            _anchor_locks[key] = lock
         return lock
 
 
@@ -97,12 +123,13 @@ class EntityPromotionConfig:
 def _resolve_project(project_name: str):
     import kumiho
 
-    cached = _project_cache.get(project_name)
+    key = (tenant_scope(), project_name)
+    cached = _project_cache.get(key)
     if cached is not None:
         return cached
     project = kumiho.get_project(project_name)
     if project is not None:
-        _project_cache[project_name] = project
+        _project_cache[key] = project
     return project
 
 

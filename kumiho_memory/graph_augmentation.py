@@ -27,7 +27,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Union
 
-from kumiho_memory._bounded import run_bounded_in_thread
+from kumiho_memory._bounded import run_bounded_in_thread, start_context_thread
 from kumiho_memory.grounding import apply_grounding_marker
 from kumiho_memory.valid_time import apply_valid_interval_marker
 from kumiho_memory.summarization import (
@@ -812,8 +812,9 @@ class GraphAugmentedRecall:
                     # coroutine is gone, so signalling completion is moot.
                     pass
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
+        # copy_context so the hosted request (and its Redis token override)
+        # crosses into the worker; a raw thread starts with an empty context.
+        t = start_context_thread(_worker)
 
         # Same deadline as the old poll loop (timeout seconds), but woken by the
         # completion event instead of re-checking every 0.5s.
@@ -1128,8 +1129,9 @@ class GraphAugmentedRecall:
                     # Loop already closed (interpreter shutdown) — nothing waits.
                     pass
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
+        # copy_context so the hosted request (and its Redis token override)
+        # crosses into the worker; a raw thread starts with an empty context.
+        t = start_context_thread(_worker)
 
         # Wake the instant the worker completes, or after `timeout` seconds.
         # A raw daemon thread (not an executor future) means the loop is free to

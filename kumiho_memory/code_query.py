@@ -32,6 +32,7 @@ answer without seeing what replaced it.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -84,8 +85,17 @@ async def _ce_scores(
 
     try:
         loop = asyncio.get_running_loop()
+        # run_in_executor does NOT propagate contextvars (unlike
+        # asyncio.to_thread), and the executor is a long-lived shared pool
+        # whose worker thread therefore keeps whatever context it happened to
+        # start with. Copy the caller's context explicitly so a hosted request
+        # — and the Redis token override riding on it — reaches the callable.
+        ctx = contextvars.copy_context()
         raw = await loop.run_in_executor(
-            _rerank_executor(), functools.partial(reranker, question, list(texts)),
+            _rerank_executor(),
+            functools.partial(
+                ctx.run, functools.partial(reranker, question, list(texts)),
+            ),
         )
         scores = [float(s) for s in raw]
         return scores if len(scores) == len(texts) else None

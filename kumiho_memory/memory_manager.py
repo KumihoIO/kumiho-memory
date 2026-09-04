@@ -12,6 +12,7 @@ import mimetypes
 import os
 import re
 import shutil
+import threading
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from kumiho_memory._request_context import current_request, is_hosted
 from kumiho_memory.evidence import EVIDENCE_LEVELS, evidence_tag
 from kumiho_memory.grounding import apply_grounding_marker
 from kumiho_memory.privacy import PIIRedactor
@@ -65,7 +67,19 @@ _SESSION_ENV_VARS = ("KUMIHO_SESSION_ID",)
 
 
 def _host_session_env() -> Optional[str]:
-    """The host-supplied session id, or None. Read per call, not cached."""
+    """The host-supplied session id, or None. Read per call, not cached.
+
+    The REQUEST wins over the environment. In a shared server the env var is
+    process-wide — one value for every tenant on the box — so honouring it
+    ahead of the caller's own ``ctx.session_id`` would file every hosted
+    conversation into a single bucket, which is the exact failure this
+    resolver was built to refuse. On the stdio path no request exists and
+    this is the env read it has always been.
+    """
+    ctx = current_request()
+    if ctx is not None:
+        session_id = (ctx.session_id or "").strip()
+        return session_id or None
     for var in _SESSION_ENV_VARS:
         value = os.getenv(var, "").strip()
         if value:
@@ -551,10 +565,24 @@ class UniversalMemoryManager:
     ) -> None:
         self.project = project
         self.consolidation_threshold = consolidation_threshold
-        self.artifact_root = artifact_root or os.getenv(
-            "KUMIHO_MEMORY_ARTIFACT_ROOT",
-            os.path.join(os.path.expanduser("~"), ".kumiho", "artifacts"),
-        )
+        # Hosted mode is latched at construction, not re-read per call: a
+        # per-tenant manager outlives the request that built it, and a
+        # background task touching it outside a request must still obey the
+        # hosted rules (see kumiho_memory._request_context.is_hosted).
+        self.hosted = is_hosted()
+        if self.hosted:
+            # No artifact root at all. The transcript is the most sensitive
+            # thing this package handles, and in a shared server the local
+            # disk is the operator's, not the tenant's — one tenant's raw
+            # conversation must never be written where another request (or
+            # the host's own backups) can read it. The summary still reaches
+            # the tenant's graph; only the local copy is dropped.
+            self.artifact_root = None
+        else:
+            self.artifact_root = artifact_root or os.getenv(
+                "KUMIHO_MEMORY_ARTIFACT_ROOT",
+                os.path.join(os.path.expanduser("~"), ".kumiho", "artifacts"),
+            )
 
         self.redis_buffer = redis_buffer or RedisMemoryBuffer(
             redis_url=redis_url,
@@ -667,7 +695,11 @@ class UniversalMemoryManager:
         # each recall_memories call. The internal recall still returns [] (the
         # established contract); callers (MCP tools) read this AFTER recall to
         # distinguish "no memories" from "backend down" without a type change.
-        self._last_backend_error: Optional[str] = None
+        #
+        # Stored PER CALLING THREAD, not as one attribute — see the
+        # _last_backend_error property below for why the hosted manager makes
+        # that necessary.
+        self._backend_errors: Dict[int, str] = {}
         self.recall_mode = recall_mode
         self.sibling_strong_score = sibling_strong_score
         self.sibling_char_budget = sibling_char_budget
@@ -744,6 +776,45 @@ class UniversalMemoryManager:
         # In-process cursor: message count at last auto-store per session.
         # Resets on process restart (safe — worst case one extra LLM call).
         self._auto_store_cursors: Dict[str, int] = {}
+
+    # -- recall backend-error signal ------------------------------------
+    #
+    # Read and written as if it were a plain attribute (`self.
+    # _last_backend_error = ...`), because that is what it was, and both
+    # call sites in kumiho_memory.mcp_tools still spell it that way. What
+    # changed underneath is who the value belongs to.
+    #
+    # On stdio one manager serves one user, one call at a time, so a single
+    # attribute was exactly right. The hosted manager (mcp_tools.
+    # _tenant_managers) is shared by every user of a tenant and by every
+    # concurrent request within it, and MCP handlers are dispatched into a
+    # thread pool — so one attribute meant a healthy recall could report
+    # another caller's failure, carrying that caller's query text, space
+    # paths and krefs inside the message, while a concurrent reset erased a
+    # failure the other caller was about to read. Neither is possible with
+    # one slot per calling thread.
+    #
+    # The thread is the right key because it is precisely the span involved:
+    # the handler calls `asyncio.run(recall)` and reads this back on the same
+    # OS thread immediately afterwards. A ContextVar would NOT work here —
+    # `asyncio.run` wraps the coroutine in a Task, and a Task copies the
+    # context, so a write inside the recall never reaches the reader.
+    #
+    # Bounded by the size of the dispatch thread pool: the reset at the top
+    # of every recall_memories drops this thread's slot before it can be set
+    # again.
+
+    @property
+    def _last_backend_error(self) -> Optional[str]:
+        return self._backend_errors.get(threading.get_ident())
+
+    @_last_backend_error.setter
+    def _last_backend_error(self, value: Optional[str]) -> None:
+        thread_id = threading.get_ident()
+        if value is None:
+            self._backend_errors.pop(thread_id, None)
+        else:
+            self._backend_errors[thread_id] = value
 
     async def ingest_message(
         self,
@@ -2024,7 +2095,18 @@ class UniversalMemoryManager:
         -------
         Artifact pointer dict with ``location``, ``hash``, ``size_bytes``,
         ``content_type``, ``original_name``, and ``description``.
+
+        Raises in hosted mode. Unlike the transcript, an attachment has no
+        useful degraded form — the pointer's whole content is a local path —
+        and silently returning one that names a file on the server's disk
+        would be worse than refusing: it would invite a later read of
+        whatever else happens to live there.
         """
+        if self.hosted:
+            raise RuntimeError(
+                "attachments are not supported in hosted mode: the memory "
+                "server has no per-tenant filesystem to copy them into"
+            )
         source = Path(attachment["path"])
         if not source.is_file():
             raise FileNotFoundError(f"Attachment not found: {source}")
@@ -2076,7 +2158,15 @@ class UniversalMemoryManager:
         Directory layout::
 
             {artifact_root}/{project}/{space_segments...}/{session}.md
+
+        Returns ``""`` in hosted mode without touching the filesystem. The
+        empty location travels the same route a missing artifact always has
+        (``artifact_location`` is optional in the store payload and the
+        recall path skips locations it cannot read), so hosted consolidation
+        stores the summary and simply carries no local pointer.
         """
+        if self.hosted:
+            return ""
         safe_name = session_id.replace(":", "_").replace("/", "_")
         target_dir = Path(self.artifact_root) / self.project
         if space_hint:
@@ -3709,7 +3799,17 @@ class UniversalMemoryManager:
 
     @staticmethod
     async def _read_artifact_content(location: str) -> str:
-        """Read a local artifact file and return its text content."""
+        """Read a local artifact file and return its text content.
+
+        Disabled in hosted mode, and this one is a READ on purpose. The
+        location comes back from stored revision metadata — tenant-writable
+        data — so on a shared server it is an arbitrary path supplied by the
+        caller, pointing at the operator's disk rather than the tenant's.
+        Hosted deployments write no artifacts at all (:meth:`_write_artifact`),
+        so there is nothing legitimate to read back.
+        """
+        if is_hosted():
+            return ""
         path = Path(location)
         if not path.is_file():
             return ""
@@ -3737,7 +3837,14 @@ class UniversalMemoryManager:
         """Resolve the session identity for a caller that did not name one.
 
         Returns ``(session_id, source)``; source is ``host-env``,
-        ``active-pointer`` or ``generated``. ONE resolver for every
+        ``active-pointer`` or ``generated`` — or, under a hosted request
+        context, ``request`` / ``active_session`` / ``generated`` (plan
+        §2.3). The hosted labels are separate values on purpose: a client
+        reading ``host-env`` on a multi-tenant server would be told the
+        process environment named its conversation, which is precisely the
+        thing hosted mode must never do.
+
+        ONE resolver for every
         defaulting path on purpose (issue #3): ingest already defaulted
         through the active-session pointer while chat/reflect required an
         explicit id, so giving the tools a default of their own would have
@@ -3807,6 +3914,42 @@ class UniversalMemoryManager:
                     )
                     return default
             return default
+
+        # Hosted mode: the request is the identity. ctx.session_id is the
+        # host-supplied conversation id (the same role KUMIHO_SESSION_ID plays
+        # on stdio, minus the process-wide blast radius), and ctx.user_id /
+        # ctx.context supply the pointer key when it is absent. Ordering and
+        # labels are the shared contract in CLOUD-CONNECTOR-PLAN §2.3.
+        ctx = current_request()
+        hosted = ctx is not None
+        pointer_source = "active_session" if hosted else "active-pointer"
+        if hosted:
+            # An explicit user_id that DISAGREES with the request identity is
+            # the bulk/ingest-on-behalf-of case, and it keeps the resolver's
+            # user-scoping guard: the request's session must not become that
+            # other user's session, or one caller's ingest would file another
+            # user's turns into the caller's bucket. Everything the connector
+            # profile does lands on the first branch, where user_id was
+            # defaulted FROM ctx and the two agree by construction.
+            if user_id is None or user_id == ctx.user_id:
+                request_session = (ctx.session_id or "").strip()
+                if request_session:
+                    generation = 0
+                    if hasattr(self.redis_buffer, "get_session_generation"):
+                        generation = await _redis_retry(
+                            "get_session_generation",
+                            lambda: self.redis_buffer.get_session_generation(
+                                request_session
+                            ),
+                            0,
+                        ) or 0
+                    if generation:
+                        return f"{request_session}:c{generation}", "request"
+                    return request_session, "request"
+                if user_id is None:
+                    user_id = ctx.user_id or None
+            if context is None:
+                context = ctx.context
 
         if user_id is None:
             env_session = _host_session_env()
@@ -3883,7 +4026,7 @@ class UniversalMemoryManager:
                 None,
             )
         if active:
-            return active, "active-pointer"
+            return active, pointer_source
 
         user_hash = hashlib.sha256(user_canonical_id.encode()).hexdigest()[:10]
         date = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -3937,7 +4080,7 @@ class UniversalMemoryManager:
                     None,
                 )
                 if winner:
-                    return winner, "active-pointer"
+                    return winner, pointer_source
 
         # Stamp identity metadata AT THE MINT: consolidation derives the
         # storage space from it, and only ingest's first-message path used

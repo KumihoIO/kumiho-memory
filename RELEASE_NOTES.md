@@ -1,5 +1,75 @@
 # Release Notes — kumiho-memory
 
+## v1.4.0
+
+**Release Date:** 2026-09-02
+
+**Hosted mode: one process can now serve many tenants without leaking one into
+another.**
+
+Everything in this package was written for a single-tenant process — the auth
+token comes from `~/.kumiho`, the manager is a module singleton, the session
+identity comes from `KUMIHO_SESSION_ID`, the transcript is written to local
+disk. All four are correct for the Claude Code plugin and all four are
+cross-tenant leaks in a shared server. The hosted Claude connector
+(`kumiho-plugins/docs/CLOUD-CONNECTOR-PLAN.md`) needs the shared server, so
+this release adds a second mode rather than changing the first.
+
+The switch is a **per-request contextvar**, not an environment variable:
+`kumiho.request_context.RequestContext` carries the verified tenant, user,
+bearer token and session for the request in flight, and
+`kumiho_memory._request_context` imports it with a vendored fallback so this
+package can ship ahead of the SDK. With no request set and `KUMIHO_MCP_HOSTED`
+unset, every path in this release is byte-for-byte what it was.
+
+Under a request context:
+
+- **One manager per tenant**, from a bounded LRU cache (256 entries, 30-minute
+  idle TTL, thread-safe), instead of the process singleton. Its Redis buffer
+  reaches Upstash only through the control-plane proxy, authenticated with the
+  caller's own token — resolved per call, because the manager outlives the
+  request that built it and the token is short-lived. Ambient
+  `UPSTASH_REDIS_URL` / `KUMIHO_UPSTASH_REDIS_URL` and `~/.kumiho` credentials
+  are never consulted; missing request credentials raise rather than fall back
+  to the operator's identity. One exception, for development: with
+  `KUMIHO_HOSTED_LOCAL_REDIS=1` **and** `KUMIHO_MCP_HOSTED=1` the hosted server
+  may use a direct Redis from `KUMIHO_LOCAL_REDIS_URL` / `UPSTASH_REDIS_URL` /
+  `redis://127.0.0.1:6379`, so the hosted path can be exercised against a local
+  CE backend with no control plane in the picture. Keys stay namespaced per
+  tenant and user exactly as behind the proxy, an explicitly configured proxy
+  still wins, and taking the hatch logs a WARNING at manager build time.
+  Without `KUMIHO_MCP_HOSTED` it warns and does nothing, so the plugin cannot
+  be reached by it. Nothing checks a per-request token on that path — it is for
+  development only.
+- **Session identity comes from the request**: explicit `session_id` argument →
+  `ctx.session_id` → the active-session pointer for `(ctx.context,
+  ctx.user_id)` → a generated id that registers the pointer. Results report
+  `session_id_source` as `argument` / `request` / `active_session` /
+  `generated`; the stdio labels (`host-env`, `active-pointer`) are unchanged on
+  their own path. `user_id` and `context` default to the request's identity, so
+  `kumiho_memory_ingest` no longer requires `user_id` when the caller is
+  authenticated.
+- **No local filesystem writes.** Conversation artifacts, attachments, the
+  retry queue, the failure ledger and the Dream State cursor are all no-ops;
+  reading a stored `artifact_location` is disabled too, since that value is
+  caller-writable data and on a shared server it names the operator's disk.
+- **No LLM** unless `KUMIHO_HOSTED_LLM=1` — v1 is the keyless core, so the
+  operator's API key is not spent on tenant traffic. **Entity promotion** is off
+  by the same rule (or an explicit `KUMIHO_MEMORY_ENTITY_PROMOTION=1`): lean has
+  to cover the write path too, and promotion is a burst of get-or-create and
+  edge RPCs against the tenant's graph on every consolidation. Ontology
+  decomposition stays on — `kumiho_memory_decompose` is gated on it and is
+  keyless, since the agent supplies the structure.
+- **Process-global caches are tenant-keyed**: the engage/recall 5-second dedup
+  guard (and its lock, which previously serialized every recall in the
+  process), and the entity-promotion project-handle cache, which was keyed by
+  project name alone and would otherwise have handed one tenant a gRPC handle
+  bound to another tenant's credentials.
+- **Background work keeps the request.** Raw threads and executor submissions
+  start from an empty `contextvars` context, which silently dropped the tenant
+  in five best-effort enrichment paths; they now copy the caller's context at
+  submit time.
+
 ## v1.3.1
 
 **Release Date:** 2026-09-02

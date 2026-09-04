@@ -23,6 +23,8 @@ from kumiho.discovery import (
     _DEFAULT_CACHE_KEY,
 )
 
+from kumiho_memory._request_context import current_request, hosted_mode, is_hosted
+
 logger = logging.getLogger(__name__)
 
 # Context variable for per-request token override.
@@ -31,6 +33,75 @@ logger = logging.getLogger(__name__)
 _token_override_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "redis_token_override", default=None,
 )
+
+#: Where the dev escape hatch points when nothing else names a Redis.
+HOSTED_LOCAL_REDIS_DEFAULT = "redis://127.0.0.1:6379"
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def redact_redis_url(url: Optional[str]) -> str:
+    """A Redis URL safe to put in a log line.
+
+    An Upstash URL is ``rediss://default:<token>@host:port`` — the token IS
+    the credential, and the one place this URL gets logged is a WARNING that
+    an operator is meant to find and read. Logs get shipped, pasted into
+    tickets and shown in CI output, so the userinfo has to go.
+
+    Everything else is kept, because the point of the message is to tell an
+    operator *which* Redis a hosted process is talking to.
+    """
+    if not url:
+        return "<none>"
+    scheme, separator, rest = url.partition("://")
+    if not separator:
+        return url
+    userinfo, at, hostpart = rest.rpartition("@")
+    if not at:
+        return url
+    user = userinfo.split(":", 1)[0]
+    return f"{scheme}://{user}:***@{hostpart}" if user else f"{scheme}://***@{hostpart}"
+
+
+def hosted_local_redis_url() -> Optional[str]:
+    """Direct Redis URL for the hosted server's dev mode, or ``None``.
+
+    Hosted mode normally has exactly one route to Redis — the control-plane
+    proxy — because that is what namespaces keys per tenant and authenticates
+    per request. WP-C's ``KUMIHO_MCP_DEV_MODE=ce`` has no control plane at
+    all, so without an escape hatch it has no Redis at all, and the hosted
+    path cannot be exercised locally against a CE backend.
+
+    So ``KUMIHO_HOSTED_LOCAL_REDIS=1`` opts into a direct connection, taken
+    from ``KUMIHO_LOCAL_REDIS_URL``, else ``UPSTASH_REDIS_URL``, else
+    :data:`HOSTED_LOCAL_REDIS_DEFAULT`. Keys are still built by the same
+    tenant/user-prefixed key methods (``kumiho:memory:{tenant}:…``, and the
+    active-session pointer carries ``{context}:{user}``), so two tenants
+    sharing one dev Redis stay in separate key spaces exactly as they do
+    behind the proxy.
+
+    **It also requires ``KUMIHO_MCP_HOSTED=1``**, and warns rather than acting
+    when that is missing. Gating on the coarse process-wide flag rather than
+    on ``is_hosted()`` is the point: a request context alone would let a stray
+    env var redirect a plugin user's working memory to localhost. Turning this
+    on takes saying so twice.
+    """
+    if not _env_flag("KUMIHO_HOSTED_LOCAL_REDIS"):
+        return None
+    if not hosted_mode():
+        logger.warning(
+            "KUMIHO_HOSTED_LOCAL_REDIS is set but KUMIHO_MCP_HOSTED is not — "
+            "ignoring it. The direct-Redis escape hatch belongs to the hosted "
+            "server's dev mode and never changes local plugin behavior.",
+        )
+        return None
+    return (
+        os.getenv("KUMIHO_LOCAL_REDIS_URL", "").strip()
+        or os.getenv("UPSTASH_REDIS_URL", "").strip()
+        or HOSTED_LOCAL_REDIS_DEFAULT
+    )
 
 
 class RedisDiscoveryError(RuntimeError):
@@ -69,26 +140,86 @@ class RedisMemoryBuffer:
         self.default_ttl = int(default_ttl)
         self.tenant_hint = tenant_hint
         self.tenant_id = tenant_id
-        self.control_plane_url = control_plane_url or DEFAULT_CONTROL_PLANE_URL
+        # Hosted mode is decided ONCE, at construction, and remembered: a
+        # per-tenant manager is built inside a request and then reused by
+        # later ones, so a buffer that re-derived "am I hosted?" per call
+        # would flip to the single-tenant rules the moment it were touched
+        # outside a request (an eviction sweep, a background consolidation).
+        self._hosted = is_hosted()
+        if self._hosted:
+            # Operator-supplied control-plane URL wins in hosted mode: the RS
+            # is pointed at a region/staging origin by env, and the compiled-in
+            # default would silently send one tenant's traffic to production.
+            # Deliberately NOT consulted on the stdio path — that would change
+            # today's behavior for anyone who happens to have the var set.
+            self.control_plane_url = (
+                control_plane_url
+                or os.getenv("KUMIHO_CONTROL_PLANE_URL")
+                or DEFAULT_CONTROL_PLANE_URL
+            )
+        else:
+            self.control_plane_url = control_plane_url or DEFAULT_CONTROL_PLANE_URL
         self.discovery_timeout = discovery_timeout
         self.force_refresh = force_refresh
         self.proxy_url = proxy_url or os.getenv("KUMIHO_MEMORY_PROXY_URL")
 
         if not self.tenant_id:
-            cached_tenant = self._load_cached_tenant()
-            if cached_tenant:
-                self.tenant_id = cached_tenant.get("tenant_id")
+            if self._hosted:
+                # The request's tenant, never the machine's cached one:
+                # ~/.kumiho holds whichever tenant last ran `kumiho-auth
+                # login` on the host, which in a shared server is nobody's.
+                ctx = current_request()
+                if ctx is not None:
+                    self.tenant_id = ctx.tenant_id
+            else:
+                cached_tenant = self._load_cached_tenant()
+                if cached_tenant:
+                    self.tenant_id = cached_tenant.get("tenant_id")
 
         resolved_url = redis_url
-        if not resolved_url and prefer_discovery and client is None and not self.proxy_url:
+        if (
+            not resolved_url
+            and prefer_discovery
+            and client is None
+            and not self.proxy_url
+            and not self._hosted
+        ):
             discovery = self._discover_upstash_url()
             if discovery:
                 resolved_url = discovery.redis_url
                 if not self.tenant_id:
                     self.tenant_id = discovery.tenant_id
 
-        if not resolved_url:
+        # Called unconditionally, because it also carries the "you set this but
+        # not KUMIHO_MCP_HOSTED, so it is being ignored" warning — which has to
+        # reach an operator who set it in the wrong process.
+        local_dev_url = hosted_local_redis_url()
+
+        if not resolved_url and not self._hosted:
+            # Ambient Redis credentials are a single-tenant convenience. In a
+            # shared server they would hand every tenant the SAME database,
+            # under keys the proxy namespaces per tenant precisely so that
+            # cannot happen — so hosted mode's route to Redis is the
+            # control-plane proxy, authenticated per request. (The one way
+            # past that is the deliberate dev opt-in below, which still
+            # namespaces every key by tenant and user.)
             resolved_url = os.getenv("KUMIHO_UPSTASH_REDIS_URL") or os.getenv("UPSTASH_REDIS_URL")
+        elif not resolved_url and self._hosted and local_dev_url and not self.proxy_url:
+            # Dev-mode escape hatch (see hosted_local_redis_url). Beaten by an
+            # explicitly configured proxy, so a deployment that has a control
+            # plane keeps using it even if the flag is left set by accident.
+            # WARNING, not INFO: a hosted process talking straight to a Redis
+            # is a fact an operator must be able to find in the logs, and this
+            # fires once per manager build rather than once per operation.
+            resolved_url = local_dev_url
+            logger.warning(
+                "KUMIHO_HOSTED_LOCAL_REDIS is active: hosted memory is using a "
+                "DIRECT Redis connection (%s) instead of the control-plane "
+                "proxy. Keys stay namespaced per tenant and user, but the "
+                "per-request token is not checked by anything. Development "
+                "only — never enable this in a deployment serving real tenants.",
+                redact_redis_url(resolved_url),
+            )
 
         # Auto-fallback: when no direct Redis URL is available, use the
         # control-plane memory proxy so clients never need the raw Redis secret.
@@ -608,11 +739,34 @@ class RedisMemoryBuffer:
         When running inside kumiho-FastAPI (or any server that sets the
         ``_token_override_var`` context variable), the override token is
         returned immediately — no filesystem lookup is needed.
+
+        The hosted connector sets no override; it sets a
+        :class:`RequestContext`, and the caller's own bearer token lives on
+        it. Resolution happens HERE, per proxy call, rather than being baked
+        into the buffer at construction — one buffer serves every request for
+        its tenant, and each of those requests carries a different (and
+        expiring) token.
         """
         # Server-injected token takes priority (e.g. kumiho-FastAPI Playground).
         override = _token_override_var.get()
         if override:
             return override
+
+        ctx = current_request()
+        if ctx is not None and ctx.auth_token:
+            return ctx.auth_token
+
+        if is_hosted():
+            # No request token and no override, in a process that serves many
+            # tenants: the local credential cache belongs to the machine's
+            # operator, and using it would run one tenant's memory operation
+            # as another identity. Fail instead.
+            raise RedisDiscoveryError(
+                "No request credentials available for the memory proxy in "
+                "hosted mode (KUMIHO_MCP_HOSTED). The caller's token must be "
+                "supplied via kumiho.request_context; local ~/.kumiho "
+                "credentials are never used here."
+            )
 
         if not force_refresh:
             token = load_firebase_token() or load_bearer_token()

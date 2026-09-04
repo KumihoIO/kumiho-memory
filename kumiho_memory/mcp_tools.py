@@ -25,7 +25,10 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
+
+from kumiho_memory._request_context import current_request, hosted_llm_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -147,23 +150,144 @@ _SESSION_IDENTITY_PROPS: Dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
-# Lazy singleton manager
+# Lazy singleton manager (stdio) / per-tenant manager cache (hosted)
 # ---------------------------------------------------------------------------
 
 _manager: Optional[Any] = None
 _manager_lock = threading.Lock()
 
+#: Hosted manager cache bounds (plan §2.3). 256 tenants is roughly a busy
+#: App Runner instance's working set; the idle TTL is what actually keeps the
+#: cache small, since a connector tenant goes quiet between conversations.
+_TENANT_CACHE_MAX = 256
+_TENANT_CACHE_IDLE_TTL = 1800.0  # 30 minutes
+
+
+class _TenantManagerCache:
+    """Bounded, thread-safe LRU of ``UniversalMemoryManager`` per tenant.
+
+    A manager is expensive to build (summarizer resolution, buffer setup) and
+    cheap to reuse, but it must never be reused ACROSS tenants: it carries the
+    Redis buffer whose keys are tenant-prefixed, and the project handle its
+    writes go to. So this is deliberately a cache, not a singleton — one entry
+    per ``tenant_id``, evicted by idle time first and size second.
+
+    Eviction just drops the reference. A hosted manager's buffer talks to the
+    control-plane proxy over stateless HTTP and holds no Redis client
+    (``RedisMemoryBuffer.close`` is a no-op there), so there is no socket to
+    leak and no async close to schedule from this synchronous path. The one
+    exception is the dev escape hatch (``KUMIHO_HOSTED_LOCAL_REDIS``), where
+    the buffer does own a client: an evicted one leaves its connection pool to
+    the garbage collector, which is fine on a dev box and is one more reason
+    that flag is not for production.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = _TENANT_CACHE_MAX,
+        idle_ttl: float = _TENANT_CACHE_IDLE_TTL,
+    ) -> None:
+        self.max_entries = max_entries
+        self.idle_ttl = idle_ttl
+        self._lock = threading.Lock()
+        # key -> (manager, last_used_monotonic); ordered by recency of use.
+        self._entries: "OrderedDict[str, Tuple[Any, float]]" = OrderedDict()
+
+    def get(self, key: str, factory) -> Any:
+        """Return the cached manager for *key*, building it if needed.
+
+        ``factory`` runs OUTSIDE the lock. Manager construction can touch the
+        network (discovery, summarizer probing), and holding a process-wide
+        lock across that would let one slow tenant stall every other tenant's
+        tool call. The cost is that two concurrent first-calls for the same
+        tenant may both build; the loser's manager is discarded and the winner
+        is returned, so callers still converge on ONE instance per tenant —
+        which is the property the isolation depends on.
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._evict_idle(now)
+            entry = self._entries.get(key)
+            if entry is not None:
+                self._entries[key] = (entry[0], now)
+                self._entries.move_to_end(key)
+                return entry[0]
+
+        manager = factory()
+
+        with self._lock:
+            existing = self._entries.get(key)
+            if existing is not None:
+                self._entries[key] = (existing[0], time.monotonic())
+                self._entries.move_to_end(key)
+                return existing[0]
+            self._entries[key] = (manager, time.monotonic())
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+            return manager
+
+    def _evict_idle(self, now: float) -> None:
+        """Drop entries unused for longer than the idle TTL. Caller holds the
+        lock."""
+        if self.idle_ttl <= 0:
+            return
+        stale = [
+            key for key, (_m, last) in self._entries.items()
+            if now - last >= self.idle_ttl
+        ]
+        for key in stale:
+            self._entries.pop(key, None)
+
+    # -- test/introspection helpers -------------------------------------
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_tenant_managers = _TenantManagerCache()
+
 
 def _get_manager():
-    """Lazily create and return a shared ``UniversalMemoryManager``.
+    """The ``UniversalMemoryManager`` for this call.
 
-    Double-checked locking makes first-time initialization race-free: the
-    first concurrent callers (parallel ``asyncio.to_thread`` dispatch) can
-    otherwise each observe ``_manager is None`` and double-create the manager
-    / Redis client. Construction stays lazy — the lock is only contended on
-    the very first call and is free thereafter.
+    Hosted (a request context is active): one manager per ``tenant_id`` from
+    :data:`_tenant_managers`. The tenant is the isolation boundary the whole
+    package is built around — buffer key prefix, graph project, active-session
+    pointers — so sharing one manager across tenants would defeat every one of
+    them at once.
+
+    Otherwise: the pre-existing process singleton, byte-for-byte. Double-checked
+    locking makes first-time initialization race-free: the first concurrent
+    callers (parallel ``asyncio.to_thread`` dispatch) can otherwise each observe
+    ``_manager is None`` and double-create the manager / Redis client.
+    Construction stays lazy — the lock is only contended on the very first call
+    and is free thereafter.
     """
     global _manager
+    ctx = current_request()
+    if ctx is not None:
+        tenant_id = (ctx.tenant_id or "").strip()
+        if not tenant_id:
+            # The cache key IS the isolation boundary, and "" is a key like
+            # any other: a blank tenant would hand every such request one
+            # shared manager, one Redis prefix and one active-session
+            # pointer — the exact collapse this cache exists to prevent, in
+            # its most complete form. The hosting layer is supposed to reject
+            # a token with no tenant claim before it ever gets here; refusing
+            # loudly is how that stays true rather than degrading quietly.
+            raise ValueError(
+                "hosted request context has no tenant_id; refusing to build a "
+                "memory manager under a blank tenant key"
+            )
+        return _tenant_managers.get(
+            tenant_id, lambda: _build_hosted_manager(ctx),
+        )
     if _manager is not None:
         return _manager
     with _manager_lock:
@@ -173,10 +297,131 @@ def _get_manager():
         return _manager
 
 
+def _build_hosted_manager(ctx):
+    """Construct a per-tenant manager for a hosted request (plan §2.3).
+
+    Deliberately NOT ``_build_manager`` with flags: that function's whole body
+    is environment reads, and in a shared server the environment belongs to the
+    operator, not the tenant. The differences are the point —
+
+    * Redis: the control-plane proxy only, authenticated per request with
+      ``ctx.auth_token`` (resolved at call time inside the buffer, because the
+      manager outlives the request that built it).
+    * No local artifact root, no retry queue, no failure ledger — nothing this
+      process writes to disk (see ``UniversalMemoryManager.hosted``).
+    * No LLM assessors, reranker, embedding adapter or provider summarizer
+      unless ``KUMIHO_HOSTED_LLM=1``.
+    """
+    from kumiho_memory import (
+        RedisMemoryBuffer,
+        UniversalMemoryManager,
+        MemorySummarizer,
+        PIIRedactor,
+    )
+
+    buffer = RedisMemoryBuffer(
+        tenant_id=ctx.tenant_id,
+        # Never probe the control plane for a raw Redis URL: hosted traffic
+        # goes through the proxy, which namespaces keys per tenant.
+        prefer_discovery=False,
+    )
+
+    if hosted_llm_enabled():
+        # Opt-in per deployment. The env config is the operator's, applied to
+        # every tenant equally — acceptable only because they asked for it.
+        summarizer = MemorySummarizer()
+    else:
+        summarizer = _hosted_keyless_summarizer()
+
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer,
+        summarizer=summarizer,
+        pii_redactor=PIIRedactor(),
+        # Everything below is the explicit "off" of the corresponding
+        # _build_manager env switch. Spelled out rather than defaulted so a
+        # new opt-in feature there cannot silently become hosted default.
+        graph_augmentation=None,
+        sibling_similarity_threshold=0.0,
+        embedding_adapter=None,
+        auto_assess_fn=None,
+        evidence_rank=None,
+        rerank=None,
+        reranker=None,
+        retry_queue=None,
+        failure_ledger=None,
+        entity_promotion=_hosted_entity_promotion(),
+    )
+    logger.debug(
+        "Built hosted memory manager for tenant %s (llm=%s)",
+        ctx.tenant_id, "on" if hosted_llm_enabled() else "off",
+    )
+    return manager
+
+
+def _hosted_entity_promotion() -> bool:
+    """Whether a hosted manager promotes extracted entities to graph Items.
+
+    OFF by default, because ``_build_hosted_manager`` claims hosted tenants
+    run lean and this was the one on-by-default write-path feature it never
+    spelled out: ``UniversalMemoryManager``'s ``entity_promotion=True``
+    sentinel follows the ontology switch, so every hosted tenant silently
+    inherited a burst of get-or-create + ABOUT-edge RPCs against their graph
+    on each consolidation. "Lean" has to include the writes, not just the LLM
+    calls.
+
+    Returned as the manager's tri-state sentinel rather than a config object,
+    so ``True`` re-enters the same env resolution the stdio path uses
+    (``KUMIHO_MEMORY_ENTITY_PROMOTION=0`` still wins there) instead of
+    forcing promotion on from a second place.
+
+    Reachability, stated plainly: the consolidation branch prefers full
+    ontology decomposition, which subsumes entity promotion, so this only
+    changes behavior for a hosted deployment that also sets
+    ``KUMIHO_MEMORY_ONTOLOGY=0``. Ontology itself is deliberately left ON —
+    ``kumiho_memory_decompose`` is in the connector profile and is gated on
+    it, and its decomposition is keyless (the agent supplies the structure),
+    so it is not an LLM cost.
+    """
+    if hosted_llm_enabled():
+        return True
+    return os.environ.get(
+        "KUMIHO_MEMORY_ENTITY_PROMOTION", "",
+    ).strip() == "1"
+
+
+def _hosted_keyless_summarizer():
+    """A ``MemorySummarizer`` that can never reach a provider.
+
+    Hosted v1 is the keyless core (plan §1 decision 10): the operator's LLM
+    key must not be spent on tenant traffic, and there is no per-tenant key
+    yet. Rather than invent a new "no LLM" branch through the manager, this
+    raises from ``adapter`` — the exact failure the manager already handles
+    everywhere it reaches for one (graph-augmented reformulation and sibling
+    selection both catch it and fall back, and ``summarize_conversation``
+    returns its deterministic fallback), so hosted mode travels a path that
+    is already covered by tests rather than a new one.
+    """
+    from kumiho_memory import MemorySummarizer
+
+    class _KeylessSummarizer(MemorySummarizer):
+        @property
+        def adapter(self):
+            raise RuntimeError(
+                "LLM calls are disabled in hosted mode; set KUMIHO_HOSTED_LLM=1 "
+                "to enable them for this deployment"
+            )
+
+    return _KeylessSummarizer(
+        api_key=None, provider="disabled", model="disabled", light_model="disabled",
+    )
+
+
 def _build_manager():
     """Construct a fresh ``UniversalMemoryManager`` from environment config.
 
-    Called exactly once, under ``_manager_lock`` via ``_get_manager``.
+    Called exactly once, under ``_manager_lock`` via ``_get_manager``. The
+    stdio path only — hosted requests go through
+    :func:`_build_hosted_manager`, which reads no environment auth at all.
     """
     from kumiho_memory import (
         RedisMemoryBuffer,
@@ -423,6 +668,11 @@ async def _resolve_session(
     conversation buffers silently (issue #3), so omission is the recommended
     path and every result reports which id was actually used.
 
+    Under a hosted request context the order is the same shape with the
+    request substituted for the process environment (plan §2.3):
+    ``argument`` → ``request`` (``ctx.session_id``) → ``active_session``
+    (the pointer for ``(ctx.context, ctx.user_id)``) → ``generated``.
+
     ``user_id``/``context`` MUST be threaded through by identity-bearing
     tools (ingest). Resolving identity-less on their behalf bypassed the
     resolver's user-scoping guard from the MCP side and collapsed every user
@@ -451,7 +701,19 @@ async def _resolve_session(
         # review, round 4).
         if user_id is None:
             user_id = args.get("user_id")
-        if user_id is not None and context is None:
+        ctx = current_request()
+        if ctx is not None:
+            # Hosted: the authenticated request supplies the identity the
+            # process environment supplies on stdio. Defaulting from ctx here
+            # (rather than leaving it None) is what makes the pointer key
+            # (ctx.context, ctx.user_id) — an identity-less hosted tool and an
+            # identity-bearing one then land on the SAME bucket, which is the
+            # convergence issue #3 exists to protect.
+            if user_id is None:
+                user_id = ctx.user_id or None
+            if context is None:
+                context = args.get("context") or ctx.context
+        elif user_id is not None and context is None:
             # Match ingest's context default so "same user_id" lands on the
             # same (context, user) pointer.
             context = args.get("context", "personal")
@@ -463,6 +725,48 @@ async def _resolve_session(
             "omit it entirely for server-side resolution"
         )
     return explicit, "argument"
+
+
+#: Distinguishes "key absent" from "key present, value null" — see
+#: _identity_from_args_or_request.
+_MISSING = object()
+
+
+def _identity_from_args_or_request(
+    args: Dict[str, Any],
+    *,
+    default_context: str = "personal",
+) -> "Tuple[Optional[str], Optional[str]]":
+    """``(user_id, context)`` for an identity-BEARING tool.
+
+    The argument always wins; a hosted request fills the gaps with its
+    authenticated identity (plan §2.3: "default user_id/context for every tool
+    that accepts them = ctx.user_id/ctx.context").
+
+    On stdio this must be *exactly* ``args.get("user_id")`` and
+    ``args.get("context", "personal")``, which means an explicit
+    ``"context": null`` has to stay ``None`` rather than becoming
+    ``"personal"``. The distinction is not academic: ``None`` reaches
+    ``resolve_session_id``, whose own default is ``"mcp"``, so collapsing the
+    two moves that caller from the ``mcp:user-…`` bucket to the
+    ``personal:user-…`` one — a conversation-continuity break on upgrade, for
+    the many MCP clients that serialize omitted optional fields as null.
+    Hence the sentinel: "absent" and "explicitly null" are different inputs
+    here, and only the first one gets the default.
+    """
+    user_id = args.get("user_id")
+    context = args.get("context", _MISSING)
+    ctx = current_request()
+    if ctx is not None:
+        if user_id is None:
+            user_id = ctx.user_id or None
+        # Hosted treats both spellings of "unspecified" the same, because the
+        # request is the identity either way.
+        if context is _MISSING or context is None:
+            context = ctx.context
+    elif context is _MISSING:
+        context = default_context
+    return user_id, context
 
 
 def _annotate_session(
@@ -558,16 +862,42 @@ def tool_memory_ingest(args: Dict[str, Any]) -> Dict[str, Any]:
     if args.get("session_id") == "":
         args = {k: v for k, v in args.items() if k != "session_id"}
 
+    # Hosted: identity comes from the authenticated request, so user_id stops
+    # being a required argument and context defaults to the request's
+    # namespace instead of "personal". A caller MAY still name another user
+    # (bulk ingest on someone's behalf) and the resolver's user-scoping guard
+    # still applies to that case.
+    user_id, context = _identity_from_args_or_request(args)
+    if user_id is None:
+        if current_request() is None:
+            # Stdio: user_id is a declared required argument, and main raised
+            # KeyError here via `args["user_id"]`. Keep both the type and the
+            # message: `args["message"]` — the sibling required field, two
+            # lines below — still raises KeyError, so anything else would make
+            # one tool report its two missing required arguments as two
+            # different kinds of failure. The old text also offered a hosted
+            # request context as the alternative, which a plugin caller has no
+            # way to produce.
+            raise KeyError("user_id")
+        # Hosted: a request context exists but carries no user, which is a
+        # hosting-layer bug rather than a caller mistake — so it gets its own
+        # message, naming the thing that has to be fixed.
+        raise ValueError(
+            "user_id is required: the request context carries no user_id. "
+            "The hosting layer must set RequestContext.user_id, or the "
+            "caller must pass user_id explicitly."
+        )
+
     async def _run():
         session_id, source = await _resolve_session(
             args, manager,
-            user_id=args["user_id"],
-            context=args.get("context", "personal"),
+            user_id=user_id,
+            context=context,
         )
         result = await manager.handle_user_message(
-            user_id=args["user_id"],
+            user_id=user_id,
             message=args["message"],
-            context=args.get("context", "personal"),
+            context=context,
             session_id=session_id,
             working_memory_limit=args.get("working_memory_limit", 10),
             recall_limit=args.get("recall_limit", 5),
@@ -634,26 +964,94 @@ _RECALL_DEDUP_WINDOW_SECS = 5.0
 # Recall signature -> monotonic time it last executed. Only a true duplicate
 # (same query + scope) within the window is suppressed.
 _recall_recent: Dict[str, float] = {}
+# Guards _recall_recent itself. On stdio this is always taken inside
+# _recall_lock and is uncontended; hosted callers in different scopes hold
+# DIFFERENT critical-section locks, so the shared dict needs its own.
+_recall_recent_guard = threading.Lock()
+# Per-scope critical-section locks (hosted only), created on demand. Capped
+# because a hosted server is long-lived and a scope is per SESSION, not per
+# tenant: unbounded, this grows with every conversation the process ever
+# serves. Over the cap the unheld locks are dropped — a caller that still
+# holds one keeps working (it holds the reference), and the only cost of
+# dropping a lock some later caller would have shared is that one duplicate
+# recall runs instead of being suppressed, which is the guard's benign
+# direction. Correctness of the dedup record itself is _recall_recent's job.
+_RECALL_SCOPE_LOCK_CAP = 4096
+_recall_scope_locks: Dict[str, threading.Lock] = {}
+_recall_scope_locks_guard = threading.Lock()
 
 
-def _recall_signature(args: Dict[str, Any]) -> str:
-    """Dedup key: the query plus the scope args that determine the result set."""
-    return "\x1f".join(str(x) for x in (
+def _recall_scope(args: Dict[str, Any]) -> str:
+    """Who this recall belongs to: "" on stdio, (tenant, user, session) hosted.
+
+    The dedup guard exists to swallow a model's duplicate tool calls *within
+    one response*. Process-global, that is exactly wrong on a shared server:
+    two tenants asking the same question at the same moment are not
+    duplicates, and the second one would silently receive an empty result
+    labelled "you already asked this". Scoping restores the guard's actual
+    meaning — same conversation, same question, same instant.
+    """
+    ctx = current_request()
+    if ctx is None:
+        return ""
+    return "\x1e".join((
+        ctx.tenant_id or "",
+        ctx.user_id or "",
+        str(args.get("session_id") or ctx.session_id or ""),
+    ))
+
+
+def _recall_guard_lock(scope: str) -> threading.Lock:
+    """The lock serializing recall for *scope*.
+
+    Stdio keeps the single process-wide lock it has always used. Hosted gets
+    one lock per scope, because the critical section spans the recall itself
+    (network I/O to the graph backend): a shared lock would make every
+    tenant's recall wait behind every other tenant's, turning an unrelated
+    slow query into a process-wide stall.
+    """
+    if not scope:
+        return _recall_lock
+    with _recall_scope_locks_guard:
+        lock = _recall_scope_locks.get(scope)
+        if lock is None:
+            if len(_recall_scope_locks) >= _RECALL_SCOPE_LOCK_CAP:
+                for key in [k for k, v in _recall_scope_locks.items()
+                            if not v.locked()]:
+                    _recall_scope_locks.pop(key, None)
+            lock = threading.Lock()
+            _recall_scope_locks[scope] = lock
+        return lock
+
+
+def _recall_signature(args: Dict[str, Any], scope: str = "") -> str:
+    """Dedup key: the query plus the scope args that determine the result set,
+    prefixed by the requesting identity when there is one."""
+    signature = "\x1f".join(str(x) for x in (
         args.get("query", ""),
         args.get("space_paths") or "",
         args.get("memory_types") or "",
         args.get("recall_mode") or "",
         bool(args.get("graph_augmented", False)),
     ))
+    return f"{scope}\x1d{signature}" if scope else signature
 
 
-def _recall_is_duplicate(args: Dict[str, Any], now: float) -> bool:
+def _recall_is_duplicate(args: Dict[str, Any], now: float, scope: str = "") -> bool:
     """True if an identical recall ran within the dedup window. Prunes expired
     signatures first so the cache stays small."""
-    for key in [k for k, t in _recall_recent.items()
-                if now - t >= _RECALL_DEDUP_WINDOW_SECS]:
-        _recall_recent.pop(key, None)
-    return _recall_signature(args) in _recall_recent
+    signature = _recall_signature(args, scope)
+    with _recall_recent_guard:
+        for key in [k for k, t in _recall_recent.items()
+                    if now - t >= _RECALL_DEDUP_WINDOW_SECS]:
+            _recall_recent.pop(key, None)
+        return signature in _recall_recent
+
+
+def _recall_mark(args: Dict[str, Any], scope: str = "") -> None:
+    """Record that this recall just executed."""
+    with _recall_recent_guard:
+        _recall_recent[_recall_signature(args, scope)] = time.monotonic()
 
 
 def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -663,9 +1061,10 @@ def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
     time window (e.g. parallel tool calls from the model), subsequent calls
     return an empty result with a note instead of hitting the backend again.
     """
-    with _recall_lock:
+    scope = _recall_scope(args)
+    with _recall_guard_lock(scope):
         now = time.monotonic()
-        if _recall_is_duplicate(args, now):
+        if _recall_is_duplicate(args, now, scope):
             logger.warning(
                 "kumiho_memory_recall called again with the same query within "
                 "%.1fs — returning empty (query=%r)",
@@ -701,7 +1100,7 @@ def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
         if backend_error:
             result["backend_error"] = backend_error
 
-        _recall_recent[_recall_signature(args)] = time.monotonic()
+        _recall_mark(args, scope)
         return result
 
 
@@ -818,9 +1217,10 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
     Returns pre-built context, raw results, and source krefs for linking.
     Shares the recall deduplication guard with ``tool_memory_recall``.
     """
-    with _recall_lock:
+    scope = _recall_scope(args)
+    with _recall_guard_lock(scope):
         now = time.monotonic()
-        if _recall_is_duplicate(args, now):
+        if _recall_is_duplicate(args, now, scope):
             return {
                 "context": "",
                 "results": [],
@@ -855,7 +1255,7 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
 
         from kumiho_memory.context_compose import approx_tokens
 
-        _recall_recent[_recall_signature(args)] = time.monotonic()
+        _recall_mark(args, scope)
         engage_result = {
             "context": context,
             "results": results,
