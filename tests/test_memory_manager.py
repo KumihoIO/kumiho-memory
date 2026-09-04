@@ -2065,3 +2065,44 @@ def test_consolidation_marks_relative_date_derived_via_in_content_anchor():
     )
     assert meta["event_date"] == "2023-05-06"
     assert meta["event_date_confidence"] == "derived"
+
+
+def test_keyless_consolidation_stores_the_summary_when_the_buffer_expired():
+    """The buffer is the artifact's transcript, not the summary's source: the
+    agent wrote the summary from the conversation it can still see.  A TTL
+    that elapsed during a long turn must not throw that summary away."""
+    stored = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager, buffer = _keyless_manager(tmpdir, stored)
+
+        async def run():
+            session_id = await _two_turn_session(manager)
+            await buffer.clear_session(manager.project, session_id)  # the TTL elapsed
+            result = await manager.consolidate_session(
+                session_id=session_id, summary=AGENT_SUMMARY,
+            )
+            assert result["success"] is True, result
+            assert result["buffer_was_empty"] is True
+            assert len(stored) == 1
+            payload = stored[0]
+            assert payload["title"] == "Tea preferences"
+            assert payload["metadata"]["message_count"] == "0"
+            assert "green [topic]" in payload["summary"]
+            assert os.path.isfile(payload["artifact_location"])
+
+        asyncio.run(run())
+
+
+def test_llm_consolidation_still_refuses_an_empty_buffer():
+    """Without a provided summary there is nothing to summarize, so the
+    pre-existing refusal stands -- and nothing is stored."""
+    stored = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager, _buffer = _keyless_manager(tmpdir, stored)
+
+        async def run():
+            result = await manager.consolidate_session(session_id="never-written")
+            assert result == {"success": False, "error": "No messages to consolidate"}
+            assert stored == []
+
+        asyncio.run(run())

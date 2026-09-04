@@ -1301,7 +1301,15 @@ class UniversalMemoryManager:
         )
         messages = messages_result["messages"]
 
-        if not messages:
+        # An empty buffer stops the LLM path (nothing to summarize) but NOT
+        # the keyless one: there the agent wrote the summary from the
+        # conversation it can still see, and the buffer is only the
+        # artifact's transcript.  It is usually empty because its idle TTL
+        # (KUMIHO_WORKING_MEMORY_TTL, an hour by default) elapsed during a
+        # long turn or a pause; refusing here threw that summary away and left
+        # the plugin's consolidation floor nudging on every cooldown.
+        buffer_was_empty = not messages
+        if buffer_was_empty and summary is None:
             return {"success": False, "error": "No messages to consolidate"}
 
         # Resolve storage space.  Priority:
@@ -1827,6 +1835,7 @@ class UniversalMemoryManager:
 
         return {
             "success": True,
+            "buffer_was_empty": buffer_was_empty,
             "summary": redacted_summary,
             "store_result": store_result,
         }

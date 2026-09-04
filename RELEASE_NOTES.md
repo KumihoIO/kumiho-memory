@@ -70,6 +70,28 @@ Under a request context:
   in five best-effort enrichment paths; they now copy the caller's context at
   submit time.
 
+**Working memory stops evaporating under long turns, and keyless consolidation
+no longer needs it.**
+
+Diagnosed on 2026-09-04 from four days of Claude Code transcripts: every
+mid-session `created_bucket=true` was a first write, the write right after a
+consolidate, or a gap of more than 60 minutes since the previous write. The
+buffer's hour-long idle TTL was refreshed by writes only, so a session that
+engaged every turn but reflected less than hourly lost its buffer -- and a
+consolidate arriving just after that refused the agent-written summary.
+
+- `KUMIHO_WORKING_MEMORY_TTL` sets the idle TTL (seconds) of the Redis
+  session buffer. The `RedisMemoryBuffer(default_ttl=...)` argument still
+  wins, the default stays 3600, and an unusable value falls back with a
+  warning. The Claude plugin sets it to 86400 in CE mode.
+- Reads refresh the TTL like writes do: `get_messages` (so `kumiho_chat_get`
+  and every recall that consults the buffer) re-arms a live bucket for another
+  full TTL. A missing bucket stays missing.
+- `consolidate_session(summary=...)`, the keyless path, stores the summary
+  even when the buffer is empty and reports `buffer_was_empty: true`; the
+  local artifact then carries the summary alone. The LLM path still answers
+  "No messages to consolidate", since it has nothing to summarize.
+
 ## v1.3.1
 
 **Release Date:** 2026-09-02
