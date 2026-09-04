@@ -27,6 +27,38 @@ from kumiho_memory._request_context import current_request, hosted_mode, is_host
 
 logger = logging.getLogger(__name__)
 
+#: Idle TTL (seconds) of a session's working-memory buffer when neither the
+#: constructor nor ``KUMIHO_WORKING_MEMORY_TTL`` says otherwise.  An hour is the
+#: shared-Upstash figure; a self-hosted Redis can afford far more, and the
+#: Claude plugin sets a day in CE mode.
+DEFAULT_WORKING_MEMORY_TTL = 3600
+WORKING_MEMORY_TTL_ENV = "KUMIHO_WORKING_MEMORY_TTL"
+
+
+def resolve_working_memory_ttl(explicit: Optional[int] = None) -> int:
+    """The buffer TTL to use: explicit argument, else the env knob, else 3600.
+
+    A value that is not a positive integer is ignored with a warning rather
+    than raised: a mistyped knob must not take the whole buffer down, and the
+    hour it falls back to is the behaviour every earlier release had.
+    """
+    if explicit is not None:
+        return int(explicit)
+    raw = (os.getenv(WORKING_MEMORY_TTL_ENV, "") or "").strip()
+    if not raw:
+        return DEFAULT_WORKING_MEMORY_TTL
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.warning(
+            "%s=%r is not a positive integer; using %d s",
+            WORKING_MEMORY_TTL_ENV, raw, DEFAULT_WORKING_MEMORY_TTL,
+        )
+        return DEFAULT_WORKING_MEMORY_TTL
+    return value
+
 # Context variable for per-request token override.
 # When set (e.g. by kumiho-FastAPI), _get_fresh_token() uses this
 # instead of the local filesystem cache.
@@ -127,7 +159,7 @@ class RedisMemoryBuffer:
         self,
         *,
         redis_url: Optional[str] = None,
-        default_ttl: int = 3600,
+        default_ttl: Optional[int] = None,
         tenant_hint: Optional[str] = None,
         tenant_id: Optional[str] = None,
         control_plane_url: Optional[str] = None,
@@ -137,7 +169,7 @@ class RedisMemoryBuffer:
         proxy_url: Optional[str] = None,
         client: Optional[Any] = None,
     ) -> None:
-        self.default_ttl = int(default_ttl)
+        self.default_ttl = resolve_working_memory_ttl(default_ttl)
         self.tenant_hint = tenant_hint
         self.tenant_id = tenant_id
         # Hosted mode is decided ONCE, at construction, and remembered: a
@@ -467,8 +499,20 @@ class RedisMemoryBuffer:
         end = -1 - offset if offset > 0 else -1
         messages = await self.client.lrange(key, start, end)
         parsed = [json.loads(msg) for msg in messages]
-        ttl = await self.client.ttl(key)
         total = await self.client.llen(key)
+        if total > 0:
+            # SLIDING ON READ, not only on write.  Only add_message refreshed
+            # the TTL, so a session that engaged (a read) every turn but
+            # reflected (a write) less than once an hour lost its buffer and
+            # the next reflect minted a fresh one -- every mid-session
+            # ``created_bucket`` in four days of Claude Code transcripts was
+            # exactly that gap or a consolidate.  A read of a live bucket now
+            # keeps it alive for another full TTL; a missing bucket is left
+            # missing (EXPIRE would be a no-op anyway).
+            await self.client.expire(key, self.default_ttl)
+            ttl = self.default_ttl
+        else:
+            ttl = await self.client.ttl(key)
 
         return {
             "messages": parsed,
