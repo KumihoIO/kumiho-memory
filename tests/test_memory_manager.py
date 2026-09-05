@@ -323,7 +323,8 @@ def test_memory_manager_consolidation_calls_store():
         asyncio.run(run())
 
 
-def test_handle_user_message_flags_consolidation():
+def test_handle_user_message_flags_consolidation(monkeypatch):
+    monkeypatch.setattr("kumiho_memory.memory_manager._load_default_retrieve", lambda: None)
     fake = FakeRedis()
     buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
 
@@ -468,9 +469,10 @@ def test_recall_memories_with_list_result():
     asyncio.run(run())
 
 
-def test_recall_memories_with_no_retriever():
+def test_recall_memories_with_no_retriever(monkeypatch):
     """When memory_retrieve is None, recall_memories should return an empty
-    list without errors."""
+    list without errors. None in the constructor otherwise auto-loads the SDK."""
+    monkeypatch.setattr("kumiho_memory.memory_manager._load_default_retrieve", lambda: None)
     fake = FakeRedis()
     buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
 

@@ -6,6 +6,9 @@ import pytest
 from kumiho_memory.summarization import MemorySummarizer
 
 
+pytestmark = pytest.mark.live
+
+
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 

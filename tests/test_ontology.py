@@ -33,6 +33,19 @@ class _Rev:
     def create_edge(self, target, edge_type, metadata=None):
         self.edges.append((target.kref.uri, edge_type, metadata or {}))
 
+    def get_edges(self, edge_type_filter=None, direction=0):
+        # This fixture models outgoing edges only. Implement the real SDK
+        # read contract; a missing method must not rely on an unsafe fallback.
+        if direction == 1:
+            return []
+        return [types.SimpleNamespace(
+            source_kref=self.kref, target_kref=types.SimpleNamespace(uri=target), edge_type=kind,
+        ) for target, kind, _ in self.edges if not edge_type_filter or kind == edge_type_filter]
+
+    def set_attribute(self, key, value):
+        self.metadata[key] = value
+        return True
+
 
 class _Item:
     def __init__(self, kref):
@@ -181,6 +194,12 @@ def test_supersedes_uses_token_overlap_not_score(monkeypatch):
     assert new_anchor.edges and new_anchor.edges[0][1] == "SUPERSEDES"
     # Heuristic provenance is labeled (vs agent-declared basis: agent).
     assert new_anchor.edges[0][2] == {"reason": "belief update", "basis": "lexical-overlap"}
+    assert prior.get_latest_revision().metadata["status"] == "superseded"
+    assert link_supersedes(
+        _MaterializerStub(), "decision", "decisions", "use-redis", new_anchor,
+        "Use Redis for the event bus streams", "Proj",
+    ) == 0
+    assert len(new_anchor.edges) == 1
 
 
 def test_supersedes_skips_low_overlap(monkeypatch):

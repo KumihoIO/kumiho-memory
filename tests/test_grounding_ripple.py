@@ -77,6 +77,10 @@ class _Rev:
         self.set_metadata_calls += 1
         return self
 
+    def set_attribute(self, key, value):
+        self.metadata[key] = value
+        return True
+
     def tag(self, t):
         # Append unconditionally so a double-tag would be observable (the
         # ripple's idempotency must prevent that, not the fake).
@@ -291,15 +295,15 @@ def test_heuristic_fact_supersede_ripples(monkeypatch):
     )
 
     assert n == 1                                       # SUPERSEDES landed
+    assert prior.metadata["status"] == "superseded"
     assert dep.metadata[GROUNDING_STALE_META] == "true"
     assert dep.metadata[GROUNDING_STALE_SUPERSEDED_BY_META] == new_anchor.kref.uri
     assert dep.tags == [GROUNDING_STALE_TAG]
 
 
-def test_heuristic_decision_supersede_does_not_ripple(monkeypatch):
-    # Decisions carry no incoming DEPENDS_ON; a decision->decision supersede must
-    # not even attempt the ripple (kind gate). Prior decision rev has no
-    # get_edges-relevant grounding; the dependent must stay untouched.
+def test_heuristic_decision_without_dependents_has_no_ripple(monkeypatch):
+    # All belief replacements use the same protocol. Without incoming
+    # DEPENDS_ON edges there is no dependent to invalidate.
     prior_uri = "kref:/Proj/decisions/use-upstash.decision?r=1"
     prior = _Rev(prior_uri, metadata={"decision": "Use Upstash for the event bus streams"})
     prior_item = _FactItem("kref:/Proj/decisions/use-upstash.decision", rev=prior)
@@ -313,7 +317,7 @@ def test_heuristic_decision_supersede_does_not_ripple(monkeypatch):
     )
 
     assert n == 1
-    # prior rev never gets a get_edges/ripple call — no stamping anywhere.
+    assert prior.metadata["status"] == "superseded"
     assert not is_grounding_stale(prior.metadata)
 
 
@@ -344,6 +348,7 @@ def test_agent_declared_supersede_ripples(monkeypatch):
     stats = _sync_decompose_agent(_CONV, decomp, "proj", OntologySchema())
 
     assert stats["supersedes"] == 1
+    assert prior_rev.metadata["status"] == "superseded"
     # The prior fact's dependent decision is now flagged grounding-stale.
     assert dep.metadata[GROUNDING_STALE_META] == "true"
     # ... pointing at the NEW fact that superseded its grounding.
@@ -374,4 +379,5 @@ def test_agent_contradicts_does_not_ripple(monkeypatch):
     stats = _sync_decompose_agent(_CONV, decomp, "proj", OntologySchema())
 
     assert stats["contradicts"] == 1
+    assert prior_rev.metadata.get("status") != "superseded"
     assert not is_grounding_stale(dep.metadata)   # contested != grounding-stale

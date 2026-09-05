@@ -114,6 +114,14 @@ def link_supersedes(
     """
     import kumiho
 
+    # Re-decomposing a historical node must not let it choose today's winner
+    # as a new loser. Existing anchors retain their original status on replay.
+    # Explicit, revision-pinned declarations still use the shared protocol.
+    if edge_type == "SUPERSEDES" and str(
+        (getattr(anchor, "metadata", {}) or {}).get("status", "")
+    ).strip().casefold() in {"superseded", "deprecated"}:
+        return 0
+
     new_tokens = _tokens(text)
     if not new_tokens:
         return 0
@@ -156,21 +164,18 @@ def link_supersedes(
     if best_rev is not None and best_overlap >= _SUPERSEDE_JACCARD:
         # basis labels the heuristic provenance (vs agent-declared belief edges,
         # which record basis: agent); trigger logic + threshold unchanged.
-        if m.edge(anchor, best_rev, edge_type,
-                  {"reason": "belief update", "basis": "lexical-overlap"}):
+        from .supersession import supersede_revision
+        metadata = {"reason": "belief update", "basis": "lexical-overlap"}
+        if edge_type == "SUPERSEDES":
+            result = supersede_revision(anchor, best_rev, metadata)
+            created = result.created
+            if result.error:
+                m.supersession_failures = getattr(m, "supersession_failures", 0) + 1
+        else:
+            created = m.edge(anchor, best_rev, edge_type, metadata)
+        if created:
             logger.debug("SUPERSEDES: %s replaces %s (overlap=%.2f)",
                          self_slug, getattr(best_item, "kref", "?"), best_overlap)
-            # Grounding-staleness ripple (#95): a fact F (best_rev) just got
-            # superseded by `anchor` — flag the decisions grounded in F so recall
-            # marks them and Dream State can clear them. Only facts carry an
-            # incoming DEPENDS_ON (decision->fact), so a decision->decision
-            # supersede skips the ripple's wasted get_edges. Best-effort +
-            # bounded; see grounding.ripple_grounding_stale.
-            if kind == "fact":
-                from .grounding import ripple_grounding_stale
-                ripple_grounding_stale(
-                    best_rev, getattr(getattr(anchor, "kref", None), "uri", ""),
-                )
             return 1
     return 0
 

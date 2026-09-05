@@ -1018,16 +1018,11 @@ class GraphMaintainer:
         if self.dry_run:
             stats.decisions_deduped += 1
             return True
-        ok = self._edge_once(keeper["rev"], loser["rev"], EDGE_SUPERSEDES, {"reason": "dedup"})
-        try:
-            loser["rev"].set_attribute("status", "superseded")
-        except Exception as exc:  # noqa: BLE001
-            stats.errors.append(f"sink {loser['slug']}: {exc}")
+        from .supersession import supersede_revision
+        result = supersede_revision(keeper["rev"], loser["rev"], {"reason": "dedup"})
+        if result.error:
+            stats.errors.append(f"sink {loser['slug']}: {result.error}")
             return False
-        if ok:
-            stats.decisions_deduped += 1
-            return True
-        # Edge already existed but status now demoted — still progress.
         stats.decisions_deduped += 1
         return True
 

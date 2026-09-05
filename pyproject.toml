@@ -88,6 +88,10 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+markers = [
+    "live: explicitly enabled tests against external provider or Kumiho Cloud services",
+    "cloud: Kumiho Cloud integration tests using synthetic, isolated data",
+]
 
 [tool.coverage.run]
 source = ["kumiho_memory"]
