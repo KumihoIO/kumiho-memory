@@ -156,3 +156,48 @@ def test_store_manager_recall_space_isolation_and_belief_replacement(cloud):
 class _NoLLM:
     async def chat(self, **kwargs):
         raise AssertionError("Cloud contract tests must not call an LLM provider")
+
+
+def test_declared_contradiction_and_historical_replay_do_not_pick_a_winner(cloud):
+    import kumiho
+    from kumiho._text import slugify
+    from kumiho.mcp_server import tool_memory_store
+    from kumiho_memory.ontology import OntologySchema, _sync_decompose_agent
+
+    project = cloud.project
+    stored = tool_memory_store(
+        project=project.name, space_path="review", title="Synthetic disputed bus choice",
+        summary="Synthetic conflicting Redis and Upstash choices; no winner declared",
+        user_text="Synthetic conflicting choices", memory_type="fact", stack_revisions=False,
+    )
+    assert not stored.get("error"), stored
+    source = stored["revision_kref"]
+    statements = ["Use Upstash for the synthetic event bus streams",
+                  "Use Redis for the synthetic event bus streams"]
+    declaration = {
+        "facts": [{"statement": t} for t in statements],
+        "contradicts": [{"statement": statements[1], "conflicts_with": statements[0]}],
+    }
+    schema = OntologySchema()
+    first = _sync_decompose_agent(source, declaration, project.name, schema)
+    assert first["contradicts"] == 1 and first.get("supersession_failures", 0) == 0
+    refs = [f"kref://{project.name}/{schema.facts_space}/{slugify(t, hash_on_truncate=True)}.fact?r=1"
+            for t in statements]
+    for uri in refs:
+        rev = kumiho.get_revision(uri)
+        assert rev.metadata.get("status") != "superseded"
+        assert rev.get_edges(edge_type_filter="SUPERSEDES", direction=0) == []
+    replay = _sync_decompose_agent(source, declaration, project.name, schema)
+    assert replay["contradicts"] == 0 and replay.get("supersession_failures", 0) == 0
+
+    # Once the caller explicitly chooses a replacement, replaying the older
+    # fact by itself must not invalidate the new winner or create a reverse edge.
+    replacement = {"facts": [{"statement": statements[1]}], "supersedes": [
+        {"statement": statements[1], "replaces": statements[0]},
+    ]}
+    result = _sync_decompose_agent(source, replacement, project.name, schema)
+    assert result["supersedes"] == 1 and result.get("supersession_failures", 0) == 0
+    _sync_decompose_agent(source, {"facts": [{"statement": statements[0]}]}, project.name, schema)
+    assert kumiho.get_revision(refs[0]).metadata["status"] == "superseded"
+    assert kumiho.get_revision(refs[1]).metadata.get("status") != "superseded"
+    assert kumiho.get_revision(refs[0]).get_edges(edge_type_filter="SUPERSEDES", direction=0) == []

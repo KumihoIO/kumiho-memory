@@ -866,7 +866,7 @@ def _sync_decompose_agent(
             pass
         return None
 
-    agent_superseded_slugs: set = set()  # facts the agent explicitly re-based
+    agent_belief_slugs: set = set()  # facts with an explicit belief declaration
 
     def _write_belief_edges(entries, target_key, edge_type, stat_key, track) -> None:
         for entry in (entries or [])[: schema.max_per_kind]:
@@ -881,7 +881,7 @@ def _sync_decompose_agent(
             if track:
                 # The agent's explicit declaration wins over the lexical
                 # heuristic for this fact (below), even if the target drops.
-                agent_superseded_slugs.add(src_slug)
+                agent_belief_slugs.add(src_slug)
             target_rev = _resolve_belief_target(str(entry.get(target_key, "")))
             # Self-guard on BOTH identity and kref uri: the kref-path resolver
             # (c) can return a fresh object for the fact's own revision, which
@@ -893,6 +893,14 @@ def _sync_decompose_agent(
                 logger.debug("ontology(agent): %s target unresolved/self: %r",
                              edge_type, entry.get(target_key))
                 continue
+            if track:
+                # A declaration also owns its target when both facts occur in
+                # this call. Otherwise the target's lexical fallback can pick
+                # the opposite winner (particularly for symmetric CONTRADICTS).
+                agent_belief_slugs.update(
+                    slug for slug, rev in fact_anchors_by_slug.items()
+                    if getattr(getattr(rev, "kref", None), "uri", "") == tgt_uri
+                )
             md = {"basis": "agent"}
             reason = str(entry.get("reason", "")).strip()
             if reason:
@@ -913,16 +921,16 @@ def _sync_decompose_agent(
     _write_belief_edges(decomposition.get("supersedes"), "replaces",
                         "SUPERSEDES", "supersedes", track=True)
     _write_belief_edges(decomposition.get("contradicts"), "conflicts_with",
-                        "CONTRADICTS", "contradicts", track=False)
+                        "CONTRADICTS", "contradicts", track=True)
 
     # --- Lexical SUPERSEDES fallback (basis: lexical-overlap) ---
-    # Runs only for facts the agent did NOT explicitly re-base; the agent's own
-    # declaration wins for the rest, avoiding duplicate/conflicting belief edges.
+    # Runs only for facts without an explicit belief declaration. CONTRADICTS
+    # also suppresses the fallback: disagreement cannot authorize a winner.
     # Mirrors the summarizer path's fallback.
     from .relations import link_supersedes
 
     for anchor, slug, statement in fact_call_entries:
-        if slug in agent_superseded_slugs:
+        if slug in agent_belief_slugs:
             continue
         stats["edges"] += link_supersedes(
             m, "fact", schema.facts_space, slug, anchor, statement, project_name,

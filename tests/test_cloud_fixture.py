@@ -1,6 +1,9 @@
 """No SDK/network: exercise the exact-identity Cloud cleanup safety boundary."""
 from types import SimpleNamespace
 from unittest.mock import Mock
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -39,7 +42,7 @@ def test_exact_receipt_archives_with_or_without_project_metadata(metadata):
 ])
 def test_invalid_receipt_never_mutates(changes):
     client = Mock()
-    with pytest.raises((AssertionError, ValueError)):
+    with pytest.raises(ValueError):
         archive(client, **changes)
     client.delete_project.assert_not_called()
 
@@ -51,7 +54,7 @@ def test_invalid_receipt_never_mutates(changes):
 def test_unverified_or_conflicting_identity_never_mutates(owned):
     client = Mock()
     client.get_project.return_value = owned
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError):
         archive(client)
     client.delete_project.assert_not_called()
 
@@ -60,7 +63,7 @@ def test_archive_failure_is_not_reported_as_cleanup_success():
     client = Mock()
     client.get_project.return_value = project()
     client.delete_project.return_value = SimpleNamespace(success=False)
-    with pytest.raises(AssertionError, match="cleanup failed"):
+    with pytest.raises(RuntimeError, match="cleanup failed"):
         archive(client)
 
 
@@ -69,7 +72,7 @@ def test_archive_requires_fresh_server_confirmation(reread):
     client = Mock()
     client.get_project.side_effect = [project(), reread]
     client.delete_project.return_value = SimpleNamespace(success=True)
-    with pytest.raises(AssertionError, match="not archived"):
+    with pytest.raises(RuntimeError, match="not archived"):
         archive(client)
 
 
@@ -78,3 +81,26 @@ def test_recovery_of_already_archived_project_is_idempotent():
     client.get_project.return_value = project(deprecated=True)
     archive(client)
     client.delete_project.assert_not_called()
+
+
+def test_cleanup_safety_checks_survive_python_optimization():
+    # An SDK/network-free subprocess proves these are runtime guards, not
+    # assertions silently removed by python -O / PYTHONOPTIMIZE.
+    script = '''
+from types import SimpleNamespace
+from integration.cloud_fixture import archive_owned_project
+class Client:
+    def get_project(self, *a, **kw):
+        return SimpleNamespace(name="production", project_id="prod-id", metadata={}, deprecated=False)
+    def delete_project(self, *a, **kw):
+        raise SystemExit("UNSAFE: cleanup attempted an unowned project")
+try:
+    archive_owned_project(Client(), name="production", project_id="prod-id", run_id="a" * 32)
+except (ValueError, RuntimeError):
+    pass
+else:
+    raise SystemExit("UNSAFE: invalid receipt was accepted")
+'''
+    result = subprocess.run([sys.executable, "-O", "-c", script],
+                            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

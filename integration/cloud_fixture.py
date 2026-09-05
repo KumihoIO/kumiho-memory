@@ -9,18 +9,28 @@ def archive_owned_project(client, *, name, project_id, run_id):
     server-assigned ID plus fresh UUID name from CreateProject is the ownership
     receipt; metadata, when present, is an additional consistency check.
     """
-    assert UUID(run_id).hex == run_id, "Invalid synthetic run ID"
-    assert name == "memory-ci-" + run_id, "Not this run's synthetic project"
-    assert project_id, "Missing CreateProject receipt"
+    # These are destructive-operation guards, not test assertions: they must
+    # remain active under python -O / PYTHONOPTIMIZE as well.
+    if UUID(run_id).hex != run_id:
+        raise ValueError("Invalid synthetic run ID")
+    if name != "memory-ci-" + run_id:
+        raise ValueError("Not this run's synthetic project")
+    if not project_id:
+        raise ValueError("Missing CreateProject receipt")
     owned = client.get_project(name, include_deprecated=True)
-    assert owned is not None, "Receipt project could not be verified"
-    assert owned.name == name and owned.project_id == project_id, "Project identity mismatch"
+    if owned is None:
+        raise RuntimeError("Receipt project could not be verified")
+    if owned.name != name or owned.project_id != project_id:
+        raise RuntimeError("Project identity mismatch")
     marker = owned.metadata.get("memory_ci_owner")
-    assert marker is None or marker == run_id, "Conflicting project ownership marker"
+    if marker is not None and marker != run_id:
+        raise RuntimeError("Conflicting project ownership marker")
     if not owned.deprecated:
         result = client.delete_project(project_id, force=False)
-        assert result.success, "Synthetic project cleanup failed"
+        if not result.success:
+            raise RuntimeError("Synthetic project cleanup failed")
     archived = client.get_project(name, include_deprecated=True)
-    assert archived is None or (
+    if archived is not None and not (
         archived.project_id == project_id and archived.name == name and archived.deprecated
-    ), "Synthetic project was not archived"
+    ):
+        raise RuntimeError("Synthetic project was not archived")

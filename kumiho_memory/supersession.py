@@ -39,17 +39,21 @@ grounding ripple. Unrelated metadata and the target's revision identity survive.
         result.error = "Supersession requires two distinct revision references"
         return result
     try:
-        try:
-            result.linked = any(
-                getattr(getattr(edge, "target_kref", None), "uri", "") == dst
-                for edge in source.get_edges(edge_type_filter="SUPERSEDES", direction=0)
-            )
-        except Exception:
-            # Match existing writers: a failed precheck may still create. Only
-            # a successful create (or an observed edge) authorizes demotion.
-            pass
+        # A read outage is NOT an absent edge. Preserve code capture's strict
+        # retry contract: surface uncertainty before any duplicate/destructive
+        # write rather than completing the commit over a guessed graph state.
+        result.linked = any(
+            getattr(getattr(edge, "target_kref", None), "uri", "") == dst
+            for edge in source.get_edges(edge_type_filter="SUPERSEDES", direction=0)
+        )
+        if any(
+            getattr(getattr(edge, "target_kref", None), "uri", "") == src
+            for edge in target.get_edges(edge_type_filter="SUPERSEDES", direction=0)
+        ):
+            raise RuntimeError("reverse SUPERSEDES edge would invalidate both beliefs")
         if not result.linked:
-            source.create_edge(target, "SUPERSEDES", metadata=metadata or {})
+            if source.create_edge(target, "SUPERSEDES", metadata=metadata or {}) is False:
+                raise RuntimeError("edge creation rejected")
             result.created = result.linked = True
     except Exception as exc:
         result.error = f"Supersession edge failed: {exc}"

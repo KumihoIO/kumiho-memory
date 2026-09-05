@@ -73,9 +73,21 @@ stamp a complete commit marker after a reported edge/status failure.
 Ontology decomposition exposes `supersession_failures` when an edge or status
 write is incomplete, so callers can replay the same declaration to repair it.
 
-CONTRADICTS does not demote a belief. Profile-history revision links remain
-separate. Candidate selection is intentionally unchanged: lexical overlap is
-still a heuristic, not semantic proof of a contradiction. Agent-declared
-replacement targets remain preferable. The grounding ripple retains its
+CONTRADICTS does not demote a belief: an explicit declaration suppresses lexical
+replacement for its source and for a target materialized in the same call, even
+when the declaration cannot be written. Heuristic replay of an already
+superseded/deprecated source is a no-op. The shared protocol rejects an observed
+reverse SUPERSEDES edge and fails closed on edge-read errors or a negative
+creation acknowledgment, rather than guessing that an unreadable edge is absent.
+
+Profile-history revision links remain separate. The lexical overlap threshold
+is unchanged and is still a heuristic, not semantic proof of a contradiction.
+Agent-declared replacement targets remain preferable. The grounding ripple retains its
 best-effort fanout cap of 20; this is not a multi-write transaction or an
 unbounded repair of old graphs.
+
+The edge precheck/reverse-edge guard is not a server transaction: concurrent
+writers in separate processes can race between reads and writes. Sequential
+replay is tested; distributed uniqueness and arbitrary-cycle detection are not
+claimed. Runtime cleanup guards use explicit exceptions, so python -O cannot
+remove their ownership checks.

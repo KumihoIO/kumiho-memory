@@ -114,6 +114,14 @@ def link_supersedes(
     """
     import kumiho
 
+    # Re-decomposing a historical node must not let it choose today's winner
+    # as a new loser. Existing anchors retain their original status on replay.
+    # Explicit, revision-pinned declarations still use the shared protocol.
+    if edge_type == "SUPERSEDES" and str(
+        (getattr(anchor, "metadata", {}) or {}).get("status", "")
+    ).strip().casefold() in {"superseded", "deprecated"}:
+        return 0
+
     new_tokens = _tokens(text)
     if not new_tokens:
         return 0
