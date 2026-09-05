@@ -158,8 +158,13 @@ def link_supersedes(
         # which record basis: agent); trigger logic + threshold unchanged.
         from .supersession import supersede_revision
         metadata = {"reason": "belief update", "basis": "lexical-overlap"}
-        created = (supersede_revision(anchor, best_rev, metadata).created
-                   if edge_type == "SUPERSEDES" else m.edge(anchor, best_rev, edge_type, metadata))
+        if edge_type == "SUPERSEDES":
+            result = supersede_revision(anchor, best_rev, metadata)
+            created = result.created
+            if result.error:
+                m.supersession_failures = getattr(m, "supersession_failures", 0) + 1
+        else:
+            created = m.edge(anchor, best_rev, edge_type, metadata)
         if created:
             logger.debug("SUPERSEDES: %s replaces %s (overlap=%.2f)",
                          self_slug, getattr(best_item, "kref", "?"), best_overlap)

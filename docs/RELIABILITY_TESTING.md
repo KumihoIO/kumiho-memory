@@ -11,7 +11,8 @@ python -m pip install -e '.[dev,all]' pytest-timeout
 python -m pytest -m 'not live' --strict-markers --timeout=90
 ```
 
-Unit tests of session resolution explicitly disable the default SDK retriever.
+Unit tests of session resolution explicitly disable default SDK store/retrieve
+and direct artifacts into a temporary directory.
 Passing `None` to the manager constructor means **auto-load**, not disable.
 The CLI preference test restores its environment even when the variables did
 not exist before the test. Legacy HTTP compatibility tests supply their own
@@ -58,6 +59,8 @@ share `supersession.supersede_revision`: confirm/create the edge, demote the
 An edge failure cannot demote the target. Replays repair a prior metadata or
 ripple interruption even when the edge already exists. Code capture does not
 stamp a complete commit marker after a reported edge/status failure.
+Ontology decomposition exposes `supersession_failures` when an edge or status
+write is incomplete, so callers can replay the same declaration to repair it.
 
 CONTRADICTS does not demote a belief. Profile-history revision links remain
 separate. Candidate selection is intentionally unchanged: lexical overlap is

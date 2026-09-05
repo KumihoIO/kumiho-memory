@@ -22,12 +22,17 @@ from kumiho_memory.ontology import (
 class _FakeRev:
     def __init__(self, uri):
         self.kref = type("K", (), {"uri": uri})()
+        self.metadata = {}
         self.edges = []  # (edge_type, target_uri)
         self.edge_meta = []  # (edge_type, target_uri, metadata) — for metadata asserts
 
     def create_edge(self, target, edge_type, metadata=None):
         self.edges.append((edge_type, target.kref.uri))
         self.edge_meta.append((edge_type, target.kref.uri, dict(metadata or {})))
+
+    def set_attribute(self, key, value):
+        self.metadata[key] = value
+        return True
 
     def get_edges(self, edge_type_filter=None, direction=0):
         out = []

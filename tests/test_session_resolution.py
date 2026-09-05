@@ -47,9 +47,11 @@ from test_memory_manager import StubRedactor, StubSummarizer
 
 
 @pytest.fixture(autouse=True)
-def _no_default_cloud_retriever(monkeypatch):
+def _isolated_session_backend(monkeypatch, tmp_path):
     # None in the constructor means auto-load, not disable retrieval.
     monkeypatch.setattr("kumiho_memory.memory_manager._load_default_retrieve", lambda: None)
+    monkeypatch.setattr("kumiho_memory.memory_manager._load_default_store", lambda: None)
+    monkeypatch.setenv("KUMIHO_MEMORY_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
 
 
 class _PointerBuffer:

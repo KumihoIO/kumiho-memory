@@ -118,3 +118,22 @@ def test_code_capture_ripples_decision_dependencies(graph):
     assert dep.metadata["grounding_stale"] == "true"
     _supersede_pass(None, CodeMemoryConfig(), new, meta, [anchor], "", stats)
     assert stats.superseded == 1 and stats.edges == 1
+
+
+def test_agent_decompose_reports_partial_status_failure_and_repairs(monkeypatch):
+    from kumiho._text import slugify
+    from kumiho_memory.ontology import _sync_decompose_agent, OntologySchema
+    from test_grounding_ripple import _Project, _install, _CONV
+    project = _Project("proj")
+    old = Revision("kref://proj/facts/prior.fact?r=1", {"status": "active"})
+    project.preload(slugify("Prior belief", hash_on_truncate=True), "fact", old)
+    _install(monkeypatch, {}, project=project, conv_rev=Revision(_CONV))
+    declaration = {"facts": [{"statement": "New belief"}],
+                   "supersedes": [{"statement": "New belief", "replaces": "Prior belief"}]}
+    old.fail_status = True
+    first = _sync_decompose_agent(_CONV, declaration, "proj", OntologySchema())
+    assert first["supersession_failures"] == 1 and first["supersedes"] == 1
+    old.fail_status = False
+    second = _sync_decompose_agent(_CONV, declaration, "proj", OntologySchema())
+    assert second.get("supersession_failures", 0) == 0 and second["supersedes"] == 0
+    assert old.metadata["status"] == "superseded"

@@ -139,6 +139,7 @@ class _Materializer:
         self.schema = schema
         self._ensured_spaces: set = set()
         self._node_cache: Dict[Tuple[str, str], Any] = {}  # (space, slug) -> anchor rev
+        self.supersession_failures = 0
 
     def _ensure_space(self, space: str) -> str:
         import grpc
@@ -609,6 +610,8 @@ def _sync_decompose(
             m, "fact", schema.facts_space, slug, anchor, claim, project_name,
         )
 
+    if m.supersession_failures:
+        stats["supersession_failures"] = m.supersession_failures
     return stats
 
 
@@ -898,7 +901,9 @@ def _sync_decompose_agent(
             # edge (source -> target), like SUPERSEDES — never both directions.
             if edge_type == "SUPERSEDES":
                 from .supersession import supersede_revision
-                created = supersede_revision(src_anchor, target_rev, md).created
+                result = supersede_revision(src_anchor, target_rev, md)
+                created = result.created
+                m.supersession_failures += int(bool(result.error))
             else:
                 created = m.edge(src_anchor, target_rev, edge_type, md)
             if created:
@@ -923,6 +928,8 @@ def _sync_decompose_agent(
             m, "fact", schema.facts_space, slug, anchor, statement, project_name,
         )
 
+    if m.supersession_failures:
+        stats["supersession_failures"] = m.supersession_failures
     return stats
 
 
