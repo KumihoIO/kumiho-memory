@@ -1,0 +1,26 @@
+name: Recover one verified Cloud test fixture
+on:
+  push:
+    branches: ["test/recover-cloud-fixture-20260905"]
+permissions:
+  contents: read
+concurrency:
+  group: cloud-contract-tests
+  cancel-in-progress: false
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install SDK without credentials
+        run: python -m pip install "kumiho>=0.13.0"
+      - name: Verify and archive the exact fixture from run 33945706066
+        env:
+          KUMIHO_AUTH_TOKEN: ${{ secrets.KUMIHO_AUTH_TOKEN }}
+        run: python -m integration.recover_cloud_fixture_once
