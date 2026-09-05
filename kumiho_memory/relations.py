@@ -156,21 +156,13 @@ def link_supersedes(
     if best_rev is not None and best_overlap >= _SUPERSEDE_JACCARD:
         # basis labels the heuristic provenance (vs agent-declared belief edges,
         # which record basis: agent); trigger logic + threshold unchanged.
-        if m.edge(anchor, best_rev, edge_type,
-                  {"reason": "belief update", "basis": "lexical-overlap"}):
+        from .supersession import supersede_revision
+        metadata = {"reason": "belief update", "basis": "lexical-overlap"}
+        created = (supersede_revision(anchor, best_rev, metadata).created
+                   if edge_type == "SUPERSEDES" else m.edge(anchor, best_rev, edge_type, metadata))
+        if created:
             logger.debug("SUPERSEDES: %s replaces %s (overlap=%.2f)",
                          self_slug, getattr(best_item, "kref", "?"), best_overlap)
-            # Grounding-staleness ripple (#95): a fact F (best_rev) just got
-            # superseded by `anchor` — flag the decisions grounded in F so recall
-            # marks them and Dream State can clear them. Only facts carry an
-            # incoming DEPENDS_ON (decision->fact), so a decision->decision
-            # supersede skips the ripple's wasted get_edges. Best-effort +
-            # bounded; see grounding.ripple_grounding_stale.
-            if kind == "fact":
-                from .grounding import ripple_grounding_stale
-                ripple_grounding_stale(
-                    best_rev, getattr(getattr(anchor, "kref", None), "uri", ""),
-                )
             return 1
     return 0
 

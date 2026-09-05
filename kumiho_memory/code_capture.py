@@ -757,24 +757,16 @@ def _supersede_pass(
             old_date = parse_decided_at(old_meta.get("decided_at", ""))
             if old_date is None or my_date is None or not old_date < my_date:
                 continue  # ingest order must not matter
-            _create_edge_once(
-                decision_rev, old_rev, EDGE_SUPERSEDES,
+            from .supersession import supersede_revision
+            result = supersede_revision(
+                decision_rev, old_rev,
                 {"reason": "belief update", "overlap": f"{overlap:.2f}"},
-                stats,
             )
-            # Demote the old decision IN PLACE (set_attribute on the SAME
-            # revision the edges are pinned to).  Writing a new revision
-            # here was the reviewed-and-confirmed critical: edges are
-            # revision-scoped, so a new revision splits the decision's
-            # identity — the anchor leg keeps seeing 'active' on the old
-            # revision while the semantic leg surfaces an edgeless copy
-            # whose superseded_by can never resolve.
-            if old_meta.get("status") != "superseded":
-                try:
-                    old_rev.set_attribute("status", "superseded")
-                    stats.superseded += 1
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("code capture: status demotion failed: %s", exc)
+            stats.edges += int(result.created)
+            stats.superseded += int(result.demoted)
+            if result.error:
+                # Do not stamp a completed commit marker over a partial write.
+                raise RuntimeError(result.error)
 
 
 #: Evidence atoms that empirically substantiate a decision (vs a bare stated

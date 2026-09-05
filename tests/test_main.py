@@ -1,10 +1,12 @@
 """Tests for the kumiho-memory CLI preference loading helpers."""
 
 import os
+from unittest.mock import patch
 
 from kumiho_memory.__main__ import _configure_llm_from_prefs
 
 
+@patch.dict(os.environ, {}, clear=True)
 def test_configure_llm_from_prefs_merges_shared_llm_and_section_model(monkeypatch):
     monkeypatch.delenv("KUMIHO_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("KUMIHO_LLM_MODEL", raising=False)

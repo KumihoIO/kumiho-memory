@@ -1,0 +1,52 @@
+name: Cloud contract tests
+
+on:
+  workflow_dispatch:
+  # Deliberate opt-in branch allows pre-merge verification of a new workflow.
+  # Never run privileged tests on fork PRs or pull_request_target.
+  push:
+    branches: ["test/cloud-*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-contract-tests
+  cancel-in-progress: false
+
+jobs:
+  cloud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies without Cloud credentials
+        run: python -m pip install -e ".[dev]" "kumiho>=0.13.0" pytest-timeout
+      - name: Verify existing secret is available
+        env:
+          KUMIHO_AUTH_TOKEN: ${{ secrets.KUMIHO_AUTH_TOKEN }}
+        run: |
+          if [ -z "$KUMIHO_AUTH_TOKEN" ]; then
+            echo '::error::KUMIHO_AUTH_TOKEN is not available to this repository. Share the existing secret before retrying.'
+            exit 1
+          fi
+      - name: Run isolated live Cloud contracts
+        env:
+          KUMIHO_AUTH_TOKEN: ${{ secrets.KUMIHO_AUTH_TOKEN }}
+          KUMIHO_RUN_CLOUD_TESTS: "1"
+        run: >-
+          python -m pytest integration/test_cloud_memory.py -v --strict-markers
+          --timeout=180 --tb=short --junitxml=cloud-results.xml
+      - name: Upload test report only (never auth cache)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-contract-results
+          path: cloud-results.xml
+          if-no-files-found: ignore
+          retention-days: 7

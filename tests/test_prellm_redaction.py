@@ -327,6 +327,7 @@ def test_auto_assess_also_receives_the_redacted_copy():
         pii_redactor=PIIRedactor(),
         auto_assess_fn=assess_fn,
         auto_assess_min_messages=1,
+        memory_retrieve=lambda **kwargs: {},
     )
 
     async def drive():

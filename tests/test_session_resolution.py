@@ -46,6 +46,12 @@ from test_memory_manager import StubRedactor, StubSummarizer
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_default_cloud_retriever(monkeypatch):
+    # None in the constructor means auto-load, not disable retrieval.
+    monkeypatch.setattr("kumiho_memory.memory_manager._load_default_retrieve", lambda: None)
+
+
 class _PointerBuffer:
     """In-memory stand-in for the pointer/sequence surface of the buffer."""
 

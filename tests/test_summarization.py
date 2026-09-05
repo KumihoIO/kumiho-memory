@@ -596,13 +596,17 @@ def test_openai_compat_adapter_create_falls_back_to_explicit_http_client_on_prox
 
 def test_openai_compat_adapter_detects_httpx_without_proxies_support():
     from kumiho_memory.summarization import OpenAICompatAdapter
+    from types import SimpleNamespace
 
     fake_signature = inspect.Signature(parameters=[
         inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
         inspect.Parameter("timeout", inspect.Parameter.KEYWORD_ONLY, default=None),
     ])
-    with patch("inspect.signature", return_value=fake_signature):
-        assert OpenAICompatAdapter._needs_explicit_http_client() is True
+    # Exercise legacy httpx compatibility even if the provider SDK no longer
+    # installs httpx (newer SDKs use httpx2).
+    with patch.dict("sys.modules", {"httpx": SimpleNamespace(AsyncClient=object)}):
+        with patch("inspect.signature", return_value=fake_signature):
+            assert OpenAICompatAdapter._needs_explicit_http_client() is True
 
 
 def test_openai_compat_adapter_detects_reasoning_effort_support():
