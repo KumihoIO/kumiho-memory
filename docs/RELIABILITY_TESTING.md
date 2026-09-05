@@ -36,8 +36,10 @@ project. They verify:
 - Graph memory storage and manager recall, including space-boundary filtering.
 - Revision-pinned SUPERSEDES edges, target demotion, dependent staleness and
   idempotent replay, all checked with fresh server reads.
-- Ownership-checked project cleanup in a finalizer. Cleanup archives the exact
-  synthetic project with `force=False`; it never force-deletes real data.
+- Ownership-checked project cleanup in a finalizer. Cleanup binds the fresh UUID
+  name to the exact server-assigned ID returned by creation, re-reads both, and
+  archives with `force=False`; it never force-deletes real data or scans a prefix
+  for deletion. A conflicting ownership marker always fails closed.
 
 For a deliberate local live run, supply `KUMIHO_AUTH_TOKEN` securely in the
 process environment, set `KUMIHO_RUN_CLOUD_TESTS=1`, and run:
@@ -47,8 +49,17 @@ python -m pytest integration/test_cloud_memory.py -v --timeout=180 --tb=short
 ```
 
 Do not enable traceback locals or upload authentication caches. Interrupted
-runner/process termination can prevent finalizers: inspect any leftover
-`memory-ci-*` project and its `memory_ci_owner` marker before cleaning up.
+runner/process termination can prevent finalizers. The JUnit report records the
+non-secret creation receipt (project name, project ID, run UUID) and confirmed
+archive outcome. Inspect that exact receipt and project before recovery; never
+clean up projects just because their names match `memory-ci-*`.
+
+The 2026-09-05 live run 33945706066 passed both memory contracts but failed its
+original finalizer because Cloud GetProjects returned empty project metadata.
+Cleanup therefore uses the creation receipt, with the metadata marker as an
+additional consistency check when returned. This does not claim that Cloud
+project metadata round-tripping works; that server/SDK compatibility gap remains
+separate from memory storage, revision metadata, and replacement contracts.
 These tests are a contract check, not a load test or a claim of retrieval quality.
 
 ## Belief replacement protocol

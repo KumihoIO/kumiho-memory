@@ -12,11 +12,13 @@ from urllib.parse import urlparse
 
 import pytest
 
+from integration.cloud_fixture import archive_owned_project
+
 pytestmark = [pytest.mark.live, pytest.mark.cloud]
 
 
 @pytest.fixture(scope="module")
-def cloud(tmp_path_factory):
+def cloud(tmp_path_factory, record_testsuite_property):
     if os.getenv("KUMIHO_RUN_CLOUD_TESTS") != "1":
         pytest.skip("Cloud tests require explicit KUMIHO_RUN_CLOUD_TESTS=1")
     token = os.getenv("KUMIHO_AUTH_TOKEN", "").strip()
@@ -52,19 +54,21 @@ def cloud(tmp_path_factory):
             auth_token=token, context="cloud-contract-test",
         )
         with kumiho.use_client(client), request_context(ctx):
+            assert client.get_project(name, include_deprecated=True) is None, "Never adopt an existing project"
             project = client.create_project(name, metadata={"memory_ci_owner": run_id})
             try:
+                # Record only non-secret ownership evidence for interrupted-run
+                # recovery, including when a server omits project metadata.
+                assert project.name == name and project.project_id
+                record_testsuite_property("cloud_project_name", name)
+                record_testsuite_property("cloud_project_id", project.project_id)
+                record_testsuite_property("cloud_run_id", run_id)
+                print(f"Cloud fixture created: {name} ({project.project_id})")
                 yield SimpleNamespace(project=project, client=client, run_id=run_id)
             finally:
-                # Re-read and validate exact ownership before cleanup. Archive
-                # only; never force-delete a protected/referenced project.
-                owned = client.get_project(name)
-                assert owned is not None and owned.project_id == project.project_id
-                assert owned.metadata.get("memory_ci_owner") == run_id
-                result = client.delete_project(project.project_id, force=False)
-                assert result.success, "Synthetic project cleanup failed"
-                archived = client.get_project(name, include_deprecated=True)
-                assert archived is None or archived.deprecated
+                archive_owned_project(client, name=name, project_id=project.project_id, run_id=run_id)
+                record_testsuite_property("cloud_project_cleanup", "archived")
+                print(f"Cloud fixture archived: {name} ({project.project_id})")
 
 
 def test_working_memory_session_isolation_and_cleanup(cloud):
