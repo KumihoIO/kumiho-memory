@@ -1,5 +1,45 @@
 # Release Notes — kumiho-memory
 
+## v1.4.1
+
+**Release Date:** 2026-09-05
+
+**Reliable belief replacement, adversarial failure guards, and live Cloud verification.**
+
+Patch release for the fixes reviewed in [PR #24](https://github.com/KumihoIO/kumiho-memory/pull/24).
+No breaking public API changes.
+
+- Facts, ontology decisions, code capture and graph maintenance now share one
+  revision-scoped replacement protocol: confirm/create SUPERSEDES, demote the
+  exact target revision in place, and flag its dependent grounding as stale.
+  Replaying an existing edge repairs incomplete status/ripple writes without
+  splitting revision identity. Partial edge/status failures are reported;
+  code capture does not stamp a completed commit over a failed replacement stage.
+- Explicit CONTRADICTS declarations suppress lexical replacement for both
+  endpoints materialized in the same call. Disagreement cannot silently pick a
+  winner. Historical replay skips superseded/deprecated heuristic sources;
+  observed reverse SUPERSEDES edges are rejected before demotion.
+- Unreadable replacement edges and explicit negative creation acknowledgments
+  fail closed instead of producing guessed duplicate writes or false success.
+- The full non-live suite runs in CI on Python 3.10, 3.11 and 3.12, separately
+  from package checks. Unit tests isolate ambient SDK store/retrieve and restore
+  environment state; live provider tests are explicitly marked and excluded.
+- Opt-in Cloud contracts verify working-memory/session clearing, graph store
+  and space-scoped recall, belief replacement and replay, and explicit
+  contradiction semantics. Synthetic-project cleanup checks the exact creation
+  receipt, archives with force=False, and verifies the server result. Runtime
+  ownership guards remain active under python -O.
+
+**Validation:** the reviewed implementation passed 1,302 non-live tests on
+Windows/Python 3.13 and each CI Python version (2 skipped, 2 live-provider tests
+deselected), plus 3 live Cloud contracts and confirmed synthetic-project cleanup.
+
+**Limits:** lexical overlap remains a heuristic, not semantic proof. Grounding
+ripple is best-effort/capped at 20; distributed write atomicity, cross-process
+uniqueness and arbitrary-cycle detection are not claimed. Cloud project-metadata
+round-tripping remains a separate compatibility gap. See
+[Reliability checks](docs/RELIABILITY_TESTING.md).
+
 ## v1.4.0
 
 **Release Date:** 2026-09-04

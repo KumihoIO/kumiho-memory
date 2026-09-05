@@ -14,32 +14,12 @@
 **Privacy invariant:** every write path — session mining, commit mining,
 skill ingestion — and every LLM-bound packet passes the same per-atom
 PII/credential boundary. Credential-bearing atoms are dropped, never stored.
-> **Stable (1.0.x)**
-> First stable release; follows semantic versioning — the documented public
-> API is stable and breaking changes bump the major version. New capabilities
-> ship flag-gated and default-OFF, so upgrades within 1.x are drop-in.
-> Latest release: `1.0.0` (2026-07-22) — **First stable release from the
-> standalone repo**: conversation- and span-level credential screening moved
-> ahead of the LLM (#138, #139), cross-project decompose targeting with
-> `DERIVED_FROM` / `ABOUT` provenance (#136), a negation/weekday asymmetry
-> guard on embedding fact dedup (#135), and the Decision Memory surface
-> renamed to `decisions` with legacy `*_CODE_*` names still honored (#143).
-> Previous: `0.20.0` (2026-07-19) — **Ontology Phase 3 + reliability**:
-> write-time entity alias resolution, embedding-assisted fact dedup in Dream
-> State, valid-time intervals with opt-in as-of recall, a source-corroborated
-> confidence marker on `event_date`, and a 3-way LLM failure classification
-> with a cross-run parking ledger.
-> See `RELEASE_NOTES.md` for the full version-by-version history — this
-> status block names only the latest release.
-> Earlier highlights: `0.16` Dream State graph maintenance · `0.11-0.13`
-> **Decision Memory** (git-anchored why-layer, `KUMIHO_MEMORY_DECISIONS=1`) ·
-> `0.10.1` moved the cross-encoder rerank off the event
-> loop (pure perf; recall byte-identical) · `0.10.0` made the **write-time
-> ontology** the default — typed decomposition into facts/entities/
-> decisions/events plus entity-bridge and fact-recall legs (+0.042 overall /
-> +0.054 fact leg on paired LoCoMo evidence) · `0.9.0` consolidated the
-> full cognitive-recall pipeline into the SDK (graph-augmented recall,
-> hybrid sibling ranking, `compose_context`).
+> **Stable (1.x)**
+> Follows semantic versioning — the documented public API is stable and
+> breaking changes bump the major version.
+> Latest release: `1.4.1` (2026-09-05) — **Reliable belief replacement**:
+> revision-pinned demotion and replay repair, explicit contradiction protection,
+> fail-closed write guards, full regression CI, and isolated live Cloud contracts.
 > See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the full history.
 
 ---
