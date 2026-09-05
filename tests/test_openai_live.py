@@ -6,6 +6,9 @@ import pytest
 from kumiho_memory.summarization import MemorySummarizer
 
 
+pytestmark = pytest.mark.live
+
+
 def _live_openai_config():
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("KUMIHO_LLM_API_KEY")
     enabled = os.getenv("KUMIHO_RUN_LIVE_TESTS", "").strip().lower() in {
