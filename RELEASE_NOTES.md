@@ -1,6 +1,6 @@
 # Release Notes — kumiho-memory
 
-## v1.4.2
+## v1.4.3
 
 **Release Date:** 2026-09-06
 
