@@ -72,3 +72,27 @@ grounding ripple. Unrelated metadata and the target's revision identity survive.
     # between edge creation and ripple. Decisions can ground other decisions.
     result.stale = ripple_grounding_stale(target, src)
     return result
+
+
+SUPERSEDED_STATUS = "superseded"
+
+
+def apply_supersession_marker(entry: dict, meta) -> None:
+    """Surface a revision's belief ``status`` onto a recall *entry* (additive).
+
+    ``supersede_revision`` demotes the replaced revision to
+    ``status=superseded`` in the graph, but the server's search does not filter
+    on that field, so a superseded belief can still come back from retrieve.
+    Without this marker the recall entry is indistinguishable from a current
+    one and an answering agent reuses the replaced belief as if it were still
+    settled (kumiho-memory#26, "reuse of superseded facts"). Mirrors
+    ``grounding.apply_grounding_marker``: sets ``status`` when the metadata
+    carries one and ``superseded=True`` for the demoted state; never removes
+    or reorders anything, and legacy revisions without a status are untouched.
+    """
+    status = str((meta or {}).get("status", "") or "").strip()
+    if not status:
+        return
+    entry["status"] = status
+    if status.casefold() == SUPERSEDED_STATUS:
+        entry["superseded"] = True

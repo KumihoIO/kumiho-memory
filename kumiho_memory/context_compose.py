@@ -206,6 +206,32 @@ def collect_top_revisions(
     return candidates[:limit]
 
 
+
+def qualifier_notes(mem: Dict[str, Any]) -> str:
+    """The terse notes that qualify one rendered memory block.
+
+    Shared by both context assemblers (this module's ``compose_context`` and
+    ``UniversalMemoryManager.build_recalled_context``, the MCP ``engage``
+    path) so a marker the recall layer stamps is rendered the same way on
+    every path an answering model reads (#26): a contested memory is
+    "disputed", a dependent whose grounding fact was replaced is "grounding
+    stale", and a superseded belief is never presented as current.
+    """
+    notes = ""
+    contested = mem.get("contested_by")
+    if contested:
+        n = len(contested)
+        notes += (
+            f"\n[contested: disputed by {n} other stored "
+            f"memor{'y' if n == 1 else 'ies'}]"
+        )
+    if mem.get("grounding_stale"):
+        notes += "\n[grounding stale: a fact this was based on was superseded]"
+    if mem.get("superseded"):
+        notes += "\n[superseded: a later memory replaced this]"
+    return notes
+
+
 def compose_context(
     memories: List[Dict[str, Any]],
     query: str = "",
@@ -277,6 +303,7 @@ def compose_context(
                     # stacked contested memory must not lose its note.
                     "contested_by": mem.get("contested_by") or [],
                     "grounding_stale": bool(mem.get("grounding_stale")),
+                    "superseded": bool(mem.get("superseded")),
                 })
         else:
             # No siblings (non-stacked item or single revision) — use the
@@ -301,6 +328,10 @@ def compose_context(
                 # grounding fact was superseded gets a terse "grounding stale"
                 # note, so the answering model weighs it as possibly outdated.
                 "grounding_stale": bool(mem.get("grounding_stale")),
+                # Supersession marker (#26): a demoted belief the server still
+                # returned is rendered with a terse note, never as a current
+                # fact, so a correction made in an earlier session holds.
+                "superseded": bool(mem.get("superseded")),
             })
 
     # --- Global ranking by score (best revisions first) ---
@@ -358,21 +389,8 @@ def compose_context(
             entry_text = f"{title}: {summary}" if title else summary
         else:
             continue
-        # Contested memories carry a terse "disputed" note on the same block,
-        # so the marker travels with the fact it qualifies.
-        contested = rev.get("contested_by")
-        if contested:
-            n = len(contested)
-            entry_text += (
-                f"\n[contested: disputed by {n} other stored "
-                f"memor{'y' if n == 1 else 'ies'}]"
-            )
-        # Grounding-stale dependents carry a terse note on the same block, so
-        # the answering model knows a fact this was based on has been superseded.
-        if rev.get("grounding_stale"):
-            entry_text += (
-                "\n[grounding stale: a fact this was based on was superseded]"
-            )
+        # Qualifier notes travel on the same block as the fact they qualify.
+        entry_text += qualifier_notes(rev)
         texts.append(entry_text)
 
     return "\n\n".join(texts) if texts else ""

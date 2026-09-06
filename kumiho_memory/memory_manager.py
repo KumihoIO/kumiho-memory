@@ -23,6 +23,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from kumiho_memory._request_context import current_request, is_hosted
 from kumiho_memory.evidence import EVIDENCE_LEVELS, evidence_tag
 from kumiho_memory.grounding import apply_grounding_marker
+from kumiho_memory.supersession import apply_supersession_marker
 from kumiho_memory.privacy import PIIRedactor
 from kumiho_memory.valid_time import (
     apply_as_of_recall,
@@ -2719,16 +2720,21 @@ class UniversalMemoryManager:
                 )
             facts_suffix = f"\nFacts: {facts}" if facts else ""
 
+            # Dispute / staleness / supersession markers stamped at recall
+            # render here too — the engage path was the one assembler that
+            # dropped them, so an agent reading engage context saw a replaced
+            # or contested belief as an unqualified current fact (#26).
+            notes = context_compose.qualifier_notes(mem)
             if mode == "full" and content:
                 texts.append(
                     badge + context_compose.truncate_section(content)
-                    + facts_suffix
+                    + facts_suffix + notes
                 )
             elif summary:
                 texts.append(
                     (f"{badge}{date_prefix}{title}: {summary}"
                      if title
-                     else f"{badge}{date_prefix}{summary}") + facts_suffix
+                     else f"{badge}{date_prefix}{summary}") + facts_suffix + notes
                 )
 
             # Unfold sibling revisions only in full mode.  In summarized
@@ -3115,6 +3121,10 @@ class UniversalMemoryManager:
             # whose grounding fact was superseded carries the flag in the
             # metadata already fetched here — additive, zero extra round-trip.
             apply_grounding_marker(entry, meta)
+            # Supersession marker (#26): a demoted belief the server search
+            # still returns is qualified here instead of surfacing as a
+            # current fact — same additive shape as the grounding marker.
+            apply_supersession_marker(entry, meta)
             # Semantic event date (valid-time). Surfaced BEFORE the
             # load_artifacts branch so it reaches summarized recall too —
             # the one mode that is otherwise date-blind (no content loaded).
