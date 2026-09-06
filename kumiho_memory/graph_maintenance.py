@@ -72,10 +72,13 @@ from kumiho_memory.evidence import (
     parse_evidence,
 )
 from kumiho_memory.grounding import (
+    GROUNDING_RIPPLE_PENDING_META,
     GROUNDING_STALE_META,
     GROUNDING_STALE_SUPERSEDED_BY_META,
     GROUNDING_STALE_TAG,
+    has_pending_ripple,
     is_grounding_stale,
+    resume_grounding_ripple,
 )
 from kumiho_memory.ontology import OntologySchema, _mentions, _word_tokens
 from kumiho_memory.relations import _jaccard, _tokens
@@ -202,6 +205,11 @@ class MaintenanceStats:
     #: grounding was re-confirmed (flag cleared) vs. still stale (flag kept).
     dependents_cleared: int = 0
     dependents_kept: int = 0
+    #: Deferred grounding ripples (kumiho-memory#27) resumed this run: dependents
+    #: newly flagged by finishing a truncated write-time ripple, and facts whose
+    #: pending marker still could not be fully drained (remain discoverable).
+    ripple_dependents_resumed: int = 0
+    ripples_still_pending: int = 0
     llm_merges: int = 0
     #: LLM-suggested, referentially-valid merges that couldn't run because the
     #: entity deprecation budget was exhausted this run — lets an operator
@@ -229,6 +237,8 @@ class MaintenanceStats:
             "edges_repointed": self.edges_repointed,
             "dependents_cleared": self.dependents_cleared,
             "dependents_kept": self.dependents_kept,
+            "ripple_dependents_resumed": self.ripple_dependents_resumed,
+            "ripples_still_pending": self.ripples_still_pending,
             "llm_merges": self.llm_merges,
             "llm_merges_skipped": self.llm_merges_skipped,
             "embed_fact_candidates": self.embed_fact_candidates,
@@ -362,6 +372,15 @@ class GraphMaintainer:
         # away reads as "gone" and clears its dependents. Non-destructive
         # (un-flag only), so it takes no deprecation budget and needs no
         # code_project.
+        # Resume deferred grounding ripples (#27) BEFORE the clear pass, so a
+        # dependent flagged only now can still be considered for clearing in the
+        # same run. A truncated write-time ripple left a durable pending marker
+        # on the superseded fact; this drains it from durable state, surviving
+        # the process death that truncation implies.
+        try:
+            self._resume_pending_ripples(stats)
+        except Exception as exc:  # noqa: BLE001
+            stats.errors.append(f"resume_pending_ripples: {exc}")
         try:
             self._clear_stale_grounding(stats)
         except Exception as exc:  # noqa: BLE001
@@ -796,6 +815,46 @@ class GraphMaintainer:
     # ------------------------------------------------------------------
     # (A) Ontology — grounding-staleness clear (#95)
     # ------------------------------------------------------------------
+
+    def _resume_pending_ripples(self, stats: MaintenanceStats) -> None:
+        """Finish grounding ripples a write-time truncation left pending (#27).
+
+        Scans the project's ``fact`` nodes for the durable
+        :data:`GROUNDING_RIPPLE_PENDING_META` marker a truncated
+        :func:`grounding.ripple_grounding_stale` wrote, and calls
+        :func:`grounding.resume_grounding_ripple` on each. The resume is
+        idempotent and bounded (one ``cap`` batch per fact per run), so a very
+        large fan-in drains over successive maintenance runs rather than in one
+        unbounded pass; a fact still carrying the marker afterward is counted in
+        ``ripples_still_pending`` so the backlog stays visible, never silently
+        dropped. Skips the write in ``dry_run``.
+        """
+        scanned = 0
+        for item in self._search(self.project, "fact"):
+            if _is_deprecated(item):
+                continue
+            rev = _latest(item)
+            if rev is None:
+                continue
+            if not has_pending_ripple(_meta(rev)):
+                continue
+            if scanned >= _MAX_DEDUP_NODES:
+                logger.info("maintenance: pending-ripple scan hit cap %d", _MAX_DEDUP_NODES)
+                break
+            scanned += 1
+            if self.dry_run:
+                stats.ripples_still_pending += 1
+                continue
+            try:
+                stats.ripple_dependents_resumed += resume_grounding_ripple(rev, get_revision=self.sdk.get_revision)
+            except Exception as exc:  # noqa: BLE001
+                stats.errors.append(f"resume ripple {_uri(item)}: {exc}")
+                continue
+            # Re-read the marker off the same rev object (the ripple clears it in
+            # place when nothing remains); a marker still set means the fan-in
+            # exceeded one batch and the backlog carries to the next run.
+            if has_pending_ripple(_meta(rev)):
+                stats.ripples_still_pending += 1
 
     def _clear_stale_grounding(self, stats: MaintenanceStats) -> None:
         """Re-examine flagged DEPENDS_ON dependents; clear when re-grounded.
