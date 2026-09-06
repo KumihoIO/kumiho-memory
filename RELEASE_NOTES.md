@@ -1,5 +1,43 @@
 # Release Notes — kumiho-memory
 
+## v1.4.4
+
+**Release Date:** 2026-09-06
+
+**Applicability, origin, and uncertainty preserved across recall.**
+
+Additive changes; no breaking public API. Implements KumihoIO/kumiho-memory#28.
+Stacks on #26 (superseded recall marker + the shared `qualifier_notes` renderer).
+Audit + contract: `docs/RECALL_APPLICABILITY_AUDIT.md`.
+
+- Two applicability axes are now defined and surfaced (`kumiho_memory.applicability`),
+  separate from the existing provenance grade and self-reported strength:
+  - **claim origin / actor** (`origin`: user / agent / imported / observed /
+    unknown) — an agent asserting a claim is not the same as it being verified;
+    recall flags `origin=agent` as self-asserted, and host-attested origins
+    (user / imported / observed) stay distinguishable.
+  - **decision acceptance state** (`decision_state`: proposal / accepted /
+    contested / superseded / unknown) — a floated proposal is never rendered as
+    an accepted decision, and nothing on the read/consolidate/decompose path
+    promotes it (repetition or self-citation cannot).
+- The axes are stamped on the write path (`tool_memory_reflect` reads and
+  normalises capture-level `origin` / `decision_state`), surfaced additively at
+  recall (`_fetch_revision_metadata`, the graph-augmented fact-recall leg), and
+  rendered by the one shared `context_compose.qualifier_notes`, so both the
+  composed-context and MCP `engage` paths carry them. An absent value reads as
+  unknown; a legacy revision is neither stamped nor rewritten.
+- Every qualifier note (contested, grounding-stale, superseded, proposal,
+  agent-origin) is appended after content truncation and rides on stacked/sibling
+  revisions, so a tight per-section budget or `limit=1` cannot silently drop a
+  material qualification.
+- Provenance-grade separation is unchanged: high self-reported certainty still
+  does not lift `evidence_level`, and the applicability marker never touches it.
+- Deliberate follow-up (documented, not silently defaulted): stamping an origin
+  on agent-decomposed typed facts / consolidated decisions, which would otherwise
+  flag effectively all typed knowledge and drown the signal.
+- Tests: `tests/test_recall_applicability.py`.
+
+
 ## v1.4.2
 
 **Release Date:** 2026-09-06

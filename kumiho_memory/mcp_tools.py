@@ -1317,6 +1317,25 @@ def _capture_space(cap: Dict[str, Any], space_path: str) -> str:
     return (cap.get("space_hint") or "").strip() or (space_path or "").strip()
 
 
+def _normalize_capture_origin(value: Any) -> str:
+    """A capture's declared claim origin, or "" to leave it unstamped (#28).
+
+    A recognised, non-unknown origin is stored; anything else (including an
+    explicit "unknown") leaves the field absent, which recall reads as unknown
+    without stamping every capture.
+    """
+    from kumiho_memory.applicability import ORIGIN_UNKNOWN, normalize_origin
+    origin = normalize_origin(value)
+    return "" if origin == ORIGIN_UNKNOWN else origin
+
+
+def _normalize_capture_state(value: Any) -> str:
+    """A capture's declared decision-acceptance state, or "" to leave it unstamped (#28)."""
+    from kumiho_memory.applicability import STATE_UNKNOWN, normalize_decision_state
+    state = normalize_decision_state(value)
+    return "" if state == STATE_UNKNOWN else state
+
+
 def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
     """Capture what matters after responding — buffers response + stores facts.
 
@@ -1374,6 +1393,20 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                         "title": cap.get("title", ""),
                         "event_date": raw_event_date,
                     })
+            # Applicability axes (#28): a capture may declare its claim origin
+            # (who asserted it) and, for a decision, its acceptance state
+            # (e.g. a floated `proposal` vs an `accepted` decision). Stored as
+            # additive metadata and normalised on the way in so recall can
+            # surface them and never present a proposal as settled or an
+            # agent's self-assertion as verified. Absent -> unstamped (unknown).
+            _origin = _normalize_capture_origin(cap.get("origin"))
+            _state = _normalize_capture_state(cap.get("decision_state"))
+            if _origin or _state:
+                cap_metadata = dict(cap_metadata or {})
+                if _origin:
+                    cap_metadata["origin"] = _origin
+                if _state:
+                    cap_metadata["decision_state"] = _state
             prepared.append({"cap": cap, "metadata": cap_metadata})
 
         def _discover(rev_kref: str, cap: Dict[str, Any]) -> None:

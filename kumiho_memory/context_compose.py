@@ -229,6 +229,9 @@ def qualifier_notes(mem: Dict[str, Any]) -> str:
         notes += "\n[grounding stale: a fact this was based on was superseded]"
     if mem.get("superseded"):
         notes += "\n[superseded: a later memory replaced this]"
+    # Applicability axes (#28): proposal-not-accepted, agent-asserted origin.
+    from kumiho_memory.applicability import applicability_notes
+    notes += applicability_notes(mem)
     return notes
 
 
@@ -304,6 +307,8 @@ def compose_context(
                     "contested_by": mem.get("contested_by") or [],
                     "grounding_stale": bool(mem.get("grounding_stale")),
                     "superseded": bool(mem.get("superseded")),
+                    "decision_state": mem.get("decision_state"),
+                    "origin": mem.get("origin"),
                 })
         else:
             # No siblings (non-stacked item or single revision) — use the
@@ -332,6 +337,11 @@ def compose_context(
                 # returned is rendered with a terse note, never as a current
                 # fact, so a correction made in an earlier session holds.
                 "superseded": bool(mem.get("superseded")),
+                # Applicability axes (#28): a proposal must not render as an
+                # accepted decision, and an agent-asserted claim must not render
+                # as verified — carried so the qualifier survives truncation.
+                "decision_state": mem.get("decision_state"),
+                "origin": mem.get("origin"),
             })
 
     # --- Global ranking by score (best revisions first) ---
