@@ -101,6 +101,38 @@ client-side, no server changes required.
 
 ---
 
+### Belief-grounded insight brief (opt-in, unreleased)
+
+For a question involving earlier decisions, request a bounded insight brief on
+that turn's first engage call:
+
+```json
+{
+  "query": "Should we revisit the deployment choice given our new constraints?",
+  "limit": 5,
+  "recall_mode": "summarized",
+  "include_insights": true
+}
+```
+
+The additional `insight_brief` gives the answering agent source-backed review
+prompts for changed premises, stored conflicts and prior decisions. It includes
+revision references, bounded evidence snippets and questions to check before
+applying a past belief. These are **hypothesis prompts**, not verified insights
+or accepted decisions. An answer can still be direct when no connection helps.
+
+The flag adds no retrieval, model call or memory write. Existing recall settings
+still apply; `context` and default behavior are unchanged. Missing related
+sources stay explicitly missing, and no hypothesis is automatically persisted.
+Set the flag on the first recall: engage's existing duplicate guard still
+applies. Python callers with already-retrieved, authorized results can use
+`from kumiho_memory.insight import build_insight_brief` directly.
+
+See [the development plan](docs/BELIEF_INSIGHT_PLAN.md) for the current contract,
+answer-quality evaluation, outcome tracking and Dream State follow-up phases.
+
+---
+
 ### Typical use cases
 
 * Production memory backend for AI agents and MCP-compatible runtimes
