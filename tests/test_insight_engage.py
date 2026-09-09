@@ -216,3 +216,74 @@ def test_incomplete_status_is_inside_serialized_brief_budget(manager):
     result = engage(query="Q" * 485)
     assert result["insight_brief"]["status"] == "retrieval_incomplete"
     assert len(json.dumps(result["insight_brief"])) <= MAX_BRIEF_CHARS
+
+
+def test_synthesis_uses_current_context_without_changing_recall(manager):
+    result = engage(current_context="A new operator joined", goals=["Reduce operations load"])
+    request = result["synthesis_request"]
+    assert request["current_context"] == "A new operator joined"
+    assert request["goals"] == ["Reduce operations load"]
+    assert request["review_brief"] == result["insight_brief"]
+    assert request["source_krefs"] == [KREF]
+    assert manager.recall_memories.await_count == 1
+    assert "current_context" not in manager.recall_memories.call_args.kwargs
+
+
+def test_synthesis_and_brief_screen_full_credential_atom(manager):
+    manager.rows[0]["summary"] = "safe prefix " * 1000 + " sk-proj-" + "A" * 24
+    result = engage()
+    for key in ("synthesis_request", "insight_brief"):
+        assert "sk-proj-" not in json.dumps(result[key])
+    assert result["synthesis_request"]["budget"]["credential_atoms_dropped"] > 0
+
+
+def test_learned_sources_require_explicit_synthesis_before_recall(manager):
+    with pytest.raises(ValueError, match="requires include_insights"):
+        engage(include_insights=False, include_learned_sources=True)
+    manager.recall_memories.assert_not_called()
+
+
+def test_extra_learned_sources_feed_only_opt_in_synthesis(manager, monkeypatch):
+    import kumiho_memory.insight_recall as learned_module
+    extra = decision(kref="kref://CognitiveMemory/experiences/pilot.experience?r=1",
+                     title="Pilot observation", type="experience", grounding_stale=False)
+    recall = AsyncMock(return_value={"status": "ready", "results": [extra],
+                                    "retrieval_calls": 2, "source_reads": 1, "health_source_reads": 0})
+    monkeypatch.setattr(learned_module, "recall_learned_sources", recall)
+    baseline = engage()
+    recall.assert_not_called()
+    mcp_tools._recall_recent.clear()
+    result = engage(include_learned_sources=True, space_paths=["CognitiveMemory/experiences"])
+    assert extra["kref"] in result["synthesis_request"]["source_krefs"]
+    assert result["context"] == baseline["context"]
+    assert result["results"] == baseline["results"]
+    assert result["source_krefs"] == baseline["source_krefs"]
+    assert result["learned_source_status"]["source_krefs"] == [extra["kref"]]
+    recall.assert_awaited_once_with(manager, "Should we revisit deployment with our new team?",
+                                   space_paths=["CognitiveMemory/experiences"], memory_types=None, min_score=None)
+
+
+def test_learned_failure_is_incomplete_not_no_knowledge(manager, monkeypatch):
+    import kumiho_memory.insight_recall as learned_module
+    monkeypatch.setattr(learned_module, "recall_learned_sources", AsyncMock(return_value={
+        "status": "partial", "results": [], "backend_error": "discovery failed"}))
+    result = engage(include_learned_sources=True)
+    assert result["synthesis_request"]["status"] == "retrieval_incomplete"
+    assert result["insight_brief"]["status"] == "retrieval_incomplete"
+    assert result["learned_source_status"]["backend_error"] == "discovery failed"
+
+
+def test_canonical_learned_health_wins_over_duplicate_ordinary_snippet(manager, monkeypatch):
+    import kumiho_memory.insight_recall as learned_module
+    ref = "kref://CognitiveMemory/patterns/old.pattern_candidate?r=1"
+    manager.rows = [decision(kref=ref, type="pattern_candidate", grounding_stale=False,
+                             summary="Old seemingly healthy proposal")]
+    fresh = decision(kref=ref, type="pattern_candidate", grounding_stale=True,
+                     summary="Current source_health: stale; review premises")
+    monkeypatch.setattr(learned_module, "recall_learned_sources", AsyncMock(return_value={
+        "status": "ready", "results": [fresh]}))
+    result = engage(include_learned_sources=True)
+    source = next(s for s in result["synthesis_request"]["sources"] if s["kref"] == ref)
+    assert source["grounding_stale"] is True
+    assert "Current source_health" in source["summary"]
+    assert result["results"][0]["grounding_stale"] is False

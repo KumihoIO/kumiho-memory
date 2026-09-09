@@ -1,5 +1,17 @@
 # Release Notes — kumiho-memory
 
+## Unreleased
+
+- Add opt-in belief-grounded insight synthesis packets to engage, with exact
+  source references, conditional hypotheses and structural response validation.
+  Optional learned-source discovery includes saved experiences and pattern proposals.
+- Add keyless explicit experience/outcome capture and Dream State pattern
+  prepare/store/check tools. Proposals remain unverified; current revision/item
+  state checks surface stale or missing premises without automatic publishing.
+- Include a paired live-memory feasibility report and a second-paper research
+  outline. The small host pilot does not establish general insight improvement.
+  See [workflow](docs/BELIEF_INSIGHT_PLAN.md) and [evaluation](docs/INSIGHT_EVALUATION.md).
+
 ## v1.4.1
 
 **Release Date:** 2026-09-05

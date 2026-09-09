@@ -550,6 +550,27 @@ class DreamState:
         omitted).  Ignored unless *verifier* is set.
     """
 
+    @staticmethod
+    async def prepare_patterns(manager, source_krefs, *, space_paths):
+        """Read explicit scoped snapshots without constructing a provider cycle.
+
+        This entrypoint does not construct DreamState or call its assessment
+        cycle. The returned request is for host-authored proposals, not beliefs.
+        """
+        from .experience import scoped_space, validate_source_refs
+        from .insight_patterns import MAX_SOURCES, prepare_pattern_request
+
+        if not isinstance(source_krefs, list) or not 1 <= len(source_krefs) <= MAX_SOURCES:
+            raise ValueError("Provide 1 to 12 explicit pinned source_krefs")
+        if not isinstance(space_paths, list) or not 1 <= len(space_paths) <= 8:
+            raise ValueError("Provide 1 to 8 explicit absolute space_paths")
+        for path in space_paths:
+            if (not isinstance(path, str) or not path.startswith("/")
+                    or scoped_space(manager, path) != path or "%" in path):
+                raise ValueError("Canonical absolute project space_paths are required")
+        rows = await validate_source_refs(manager, source_krefs, space_paths=space_paths)
+        return prepare_pattern_request(rows, space_paths=space_paths)
+
     def __init__(
         self,
         *,

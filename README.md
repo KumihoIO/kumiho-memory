@@ -101,7 +101,7 @@ client-side, no server changes required.
 
 ---
 
-### Belief-grounded insight brief (opt-in, unreleased)
+### Belief-grounded insight (opt-in, unreleased)
 
 For a question involving earlier decisions, request a bounded insight brief on
 that turn's first engage call:
@@ -127,6 +127,26 @@ sources stay explicitly missing, and no hypothesis is automatically persisted.
 Set the flag on the first recall: engage's existing duplicate guard still
 applies. Python callers with already-retrieved, authorized results can use
 `from kumiho_memory.insight import build_insight_brief` directly.
+
+The same call also returns `synthesis_request`: bounded source summaries,
+current context/goals, and a JSON answer contract for the host model. Use
+`kumiho_memory_validate_insight_response` to check structure and citation
+membership; semantic correctness still needs review. No additional provider API
+is required. Include the flag on the first engage call because dedup is shared.
+
+For learning across decisions, explicitly record `record_experience` and separate
+`record_outcome` observations. The keyless Dream State workflow is
+`prepare_patterns` -> host proposal -> `store_pattern` -> `check_pattern` before
+reuse (all tool names carry the `kumiho_memory_` prefix). Proposals retain sources,
+conditions and counterexamples; changed premises trigger a stale review result.
+No automatic publishing or belief promotion occurs. Add
+`include_learned_sources: true` alongside `include_insights: true` to discover
+those separately stored experiences/patterns for the current answer; this adds
+bounded searches and current-source checks. See the
+[workflow and limits](docs/BELIEF_INSIGHT_PLAN.md),
+[real-memory pilot](docs/INSIGHT_EVALUATION.md), and
+[second-paper research outline](docs/INSIGHT_RESEARCH_OUTLINE.md).
+
 
 See [the development plan](docs/BELIEF_INSIGHT_PLAN.md) for the current contract,
 answer-quality evaluation, outcome tracking and Dream State follow-up phases.

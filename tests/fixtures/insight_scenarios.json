@@ -1,0 +1,120 @@
+{
+  "synthetic": true,
+  "purpose": "Expected behaviors for human/host evaluation, not automatically measured semantic quality.",
+  "cases": [
+    {
+      "id": "changed_premise",
+      "query": "Should we reconsider the managed queue?",
+      "memories": [
+        {
+          "kref": "kref://synthetic/test/choice.fact?r=1",
+          "title": "choice",
+          "summary": "We rejected the managed queue because only one engineer could operate integrations.",
+          "type": "decision",
+          "grounding_stale": true
+        },
+        {
+          "kref": "kref://synthetic/test/staff.fact?r=1",
+          "title": "staff",
+          "summary": "Three engineers are now trained on queue operations."
+        }
+      ],
+      "expected_behavior": "Treat the old staffing premise as changed; reconsider feasibility without claiming the managed queue is automatically best."
+    },
+    {
+      "id": "conflict",
+      "query": "Can we depend on the six-hour backup?",
+      "memories": [
+        {
+          "kref": "kref://synthetic/test/backup.fact?r=1",
+          "title": "backup",
+          "summary": "Backups run every six hours.",
+          "contested_by": [
+            "kref://synthetic/test/audit.fact?r=1"
+          ]
+        },
+        {
+          "kref": "kref://synthetic/test/audit.fact?r=1",
+          "title": "audit",
+          "summary": "The latest operator report says backup scheduling is disabled."
+        }
+      ],
+      "expected_behavior": "Expose the unresolved conflict and ask for/check current operational evidence before asserting a backup interval."
+    },
+    {
+      "id": "preference_change",
+      "query": "How should I plan this prototype?",
+      "current_context": "For this prototype I want rapid experiments and accept replacing code later.",
+      "memories": [
+        {
+          "kref": "kref://synthetic/test/preference.fact?r=1",
+          "title": "preference",
+          "summary": "The user previously preferred stable architecture and minimal rewrites."
+        }
+      ],
+      "expected_behavior": "Honor current explicit experiment preference; do not freeze the user in the old preference."
+    },
+    {
+      "id": "duplicate_evidence",
+      "query": "Does the migration reliably reduce cost?",
+      "memories": [
+        {
+          "kref": "kref://synthetic/test/cost.fact?r=1",
+          "title": "cost",
+          "summary": "An agent summarized one trial as possibly 10% cheaper.",
+          "source": "single-trial",
+          "origin": "agent"
+        },
+        {
+          "kref": "kref://synthetic/test/cost_copy.fact?r=1",
+          "title": "cost_copy",
+          "summary": "Copy of the same trial: possibly 10% cheaper.",
+          "source": "single-trial",
+          "origin": "agent"
+        }
+      ],
+      "expected_behavior": "Treat the two records as one uncertain origin, not independent corroboration or proof of reliable savings."
+    },
+    {
+      "id": "agent_proposal",
+      "query": "What queue did we decide to adopt?",
+      "memories": [
+        {
+          "kref": "kref://synthetic/test/proposal.fact?r=1",
+          "title": "proposal",
+          "summary": "The assistant proposed switching to Kafka; the user has not accepted.",
+          "origin": "agent",
+          "decision_state": "proposed",
+          "type": "decision"
+        }
+      ],
+      "expected_behavior": "Say the memory is a proposal and no accepted choice is evidenced; never report Kafka as a settled decision."
+    },
+    {
+      "id": "missing_outcome",
+      "query": "Should we repeat the indexing approach?",
+      "memories": [
+        {
+          "kref": "kref://synthetic/test/index.fact?r=1",
+          "title": "index",
+          "summary": "We chose an index expecting faster lookups. No measurements after deployment have been recorded.",
+          "type": "decision"
+        }
+      ],
+      "expected_behavior": "Distinguish expected benefit from observed result and propose checking latency measurements before repeating the approach."
+    },
+    {
+      "id": "irrelevant_no_insight",
+      "query": "What is 2 plus 2?",
+      "memories": [
+        {
+          "kref": "kref://synthetic/test/queue.fact?r=1",
+          "title": "queue",
+          "summary": "We chose Redis to reduce maintenance.",
+          "type": "decision"
+        }
+      ],
+      "expected_behavior": "Answer 4 directly; do not force unrelated personal/project insight."
+    }
+  ]
+}
