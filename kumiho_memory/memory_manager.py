@@ -24,6 +24,7 @@ from kumiho_memory._request_context import current_request, is_hosted
 from kumiho_memory.evidence import EVIDENCE_LEVELS, evidence_tag
 from kumiho_memory.grounding import apply_grounding_marker
 from kumiho_memory.supersession import apply_supersession_marker
+from kumiho_memory.applicability import apply_applicability_marker
 from kumiho_memory.privacy import PIIRedactor
 from kumiho_memory.valid_time import (
     apply_as_of_recall,
@@ -3125,6 +3126,11 @@ class UniversalMemoryManager:
             # still returns is qualified here instead of surfacing as a
             # current fact — same additive shape as the grounding marker.
             apply_supersession_marker(entry, meta)
+            # Applicability axes (#28): claim origin/actor and decision
+            # acceptance state, surfaced additively like the markers above so a
+            # proposal is never read as settled and an agent's self-assertion is
+            # never read as verified provenance.
+            apply_applicability_marker(entry, meta)
             # Semantic event date (valid-time). Surfaced BEFORE the
             # load_artifacts branch so it reaches summarized recall too —
             # the one mode that is otherwise date-blind (no content loaded).
