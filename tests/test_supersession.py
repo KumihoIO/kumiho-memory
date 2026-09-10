@@ -44,7 +44,9 @@ def test_revision_identity_metadata_ripple_and_replay(graph):
     new, old, dep = graph
     first = supersede_revision(new, old, {"basis": "agent"})
     assert first.created and first.demoted and first.stale == 1 and not first.error
-    assert old.metadata == {"status": "superseded", "keep": "provenance"}
+    assert old.metadata["status"] == "superseded"
+    assert old.metadata["keep"] == "provenance"
+    assert not old.metadata.get("grounding_ripple_pending")
     assert old.kref.uri.endswith("old.fact?r=1")
     assert dep.metadata["grounding_stale_superseded_by"] == new.kref.uri
     again = supersede_revision(new, old)

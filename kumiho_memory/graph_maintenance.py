@@ -817,44 +817,61 @@ class GraphMaintainer:
     # ------------------------------------------------------------------
 
     def _resume_pending_ripples(self, stats: MaintenanceStats) -> None:
-        """Finish grounding ripples a write-time truncation left pending (#27).
+        """Resume bounded pending work on exact fact/decision revisions.
 
-        Scans the project's ``fact`` nodes for the durable
-        :data:`GROUNDING_RIPPLE_PENDING_META` marker a truncated
-        :func:`grounding.ripple_grounding_stale` wrote, and calls
-        :func:`grounding.resume_grounding_ripple` on each. The resume is
-        idempotent and bounded (one ``cap`` batch per fact per run), so a very
-        large fan-in drains over successive maintenance runs rather than in one
-        unbounded pass; a fact still carrying the marker afterward is counted in
-        ``ripples_still_pending`` so the backlog stays visible, never silently
-        dropped. Skips the write in ``dry_run``.
+        Supersession can target historical revisions and code decisions. Neither
+        a newer revision nor item deprecation cancels their dependent invalidation.
+        SDK enumeration is not paginated; cap inspected items/revisions and report
+        an incomplete scan instead of claiming that an unseen backlog is empty.
         """
-        scanned = 0
-        for item in self._search(self.project, "fact"):
-            if _is_deprecated(item):
-                continue
-            rev = _latest(item)
-            if rev is None:
-                continue
-            if not has_pending_ripple(_meta(rev)):
-                continue
-            if scanned >= _MAX_DEDUP_NODES:
-                logger.info("maintenance: pending-ripple scan hit cap %d", _MAX_DEDUP_NODES)
-                break
-            scanned += 1
-            if self.dry_run:
-                stats.ripples_still_pending += 1
-                continue
+        scopes = [(self.project, "fact"), (self.project, "decision")]
+        if self.code_project:
+            scopes.append((self.code_project, KIND_DECISION))
+        items_seen = revisions_seen = 0
+        for project, kind in scopes:
             try:
-                stats.ripple_dependents_resumed += resume_grounding_ripple(rev, get_revision=self.sdk.get_revision)
+                get_client = getattr(self.sdk, "get_client", None)
+                client = get_client() if callable(get_client) else None
+                search = getattr(client, "item_search", None)
+                if callable(search):
+                    # The module convenience wrapper cannot request deprecated
+                    # items; the supported client API can include pending history.
+                    items = search(context_filter=project, item_name_filter="",
+                                   kind_filter=kind, include_deprecated=True)
+                else:
+                    items = self.sdk.item_search(context_filter=project, name_filter="", kind_filter=kind)
+                for item in items:
+                    if items_seen >= _MAX_DEDUP_NODES:
+                        stats.errors.append("pending-ripple item scan incomplete: cap reached")
+                        return
+                    items_seen += 1
+                    try:
+                        get_revisions = getattr(item, "get_revisions", None)
+                        revisions = get_revisions() if callable(get_revisions) else [_latest(item)]
+                        for rev in revisions:
+                            if rev is None:
+                                continue
+                            if revisions_seen >= _MAX_DEDUP_NODES:
+                                stats.errors.append("pending-ripple revision scan incomplete: cap reached")
+                                return
+                            revisions_seen += 1
+                            if not has_pending_ripple(_meta(rev)):
+                                continue
+                            if self.dry_run:
+                                stats.ripples_still_pending += 1
+                                continue
+                            try:
+                                stats.ripple_dependents_resumed += resume_grounding_ripple(
+                                    rev, get_revision=self.sdk.get_revision,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                stats.errors.append(f"resume ripple {_uri(rev)}: {exc}")
+                            if has_pending_ripple(_meta(rev)):
+                                stats.ripples_still_pending += 1
+                    except Exception as exc:  # noqa: BLE001
+                        stats.errors.append(f"pending-ripple revisions {_uri(item)}: {exc}")
             except Exception as exc:  # noqa: BLE001
-                stats.errors.append(f"resume ripple {_uri(item)}: {exc}")
-                continue
-            # Re-read the marker off the same rev object (the ripple clears it in
-            # place when nothing remains); a marker still set means the fan-in
-            # exceeded one batch and the backlog carries to the next run.
-            if has_pending_ripple(_meta(rev)):
-                stats.ripples_still_pending += 1
+                stats.errors.append(f"pending-ripple search {project}/{kind}: {exc}")
 
     def _clear_stale_grounding(self, stats: MaintenanceStats) -> None:
         """Re-examine flagged DEPENDS_ON dependents; clear when re-grounded.

@@ -9,9 +9,10 @@ Concurrency and recovery contract (kumiho-memory#27; see
 ``docs/BELIEF_REVISION_CONCURRENCY.md`` for the full statement):
 
 * **Convergent replay.** Repeating the same operation converges: the edge is
-  created at most once (existence pre-check), the target is demoted at most once
-  (status pre-check), and the grounding ripple is idempotent. Two processes
-  replaying the same replacement therefore leave one edge, one demotion.
+  not recreated on a sequential replay (existence pre-check), the target status
+  is checked before demotion, and grounding stamps are idempotent. Concurrent
+  writers can pass the same pre-check; these checks do not guarantee one write
+  across processes without server conditional writes or uniqueness.
 * **Conflict is preserved, never resolved by arrival order.** A pre-existing
   reverse ``SUPERSEDES`` (target already supersedes source) and a bounded
   ``SUPERSEDES`` cycle are rejected before any write; a reverse edge that
@@ -231,7 +232,9 @@ def supersede_revision(
             logger.warning("belief-revision conflict: %s <-> %s both supersede", src, dst)
             return result
     except Exception as exc:  # noqa: BLE001
-        logger.debug("supersession: reverse re-check failed (%s); proceeding", exc)
+        result.error = f"Supersession reverse re-check failed: {exc}"
+        logger.warning("%s", result.error)
+        return result
 
     try:
         if (getattr(target, "metadata", {}) or {}).get("status") != "superseded":
@@ -244,7 +247,13 @@ def supersede_revision(
         logger.warning("%s", result.error)
     # Also retry on an existing edge: a previous process may have stopped
     # between edge creation and ripple. Decisions can ground other decisions.
-    result.stale = ripple_grounding_stale(target, src)
+    try:
+        result.stale = ripple_grounding_stale(target, src)
+    except Exception as exc:
+        # A missing durable progress acknowledgement requires caller replay.
+        result.error = result.error or f"Supersession grounding progress failed: {exc}"
+        logger.warning("%s", result.error)
+        return result
     if result.stale:
         result.events.append(f"grounding_rippled:{result.stale}")
     # Truncation leaves a durable pending marker on the fact (grounding module);
@@ -256,3 +265,27 @@ def supersede_revision(
         result.ripple_pending = True
         result.events.append("ripple_pending")
     return result
+
+
+SUPERSEDED_STATUS = "superseded"
+
+
+def apply_supersession_marker(entry: dict, meta) -> None:
+    """Surface a revision's belief ``status`` onto a recall *entry* (additive).
+
+    ``supersede_revision`` demotes the replaced revision to
+    ``status=superseded`` in the graph, but the server's search does not filter
+    on that field, so a superseded belief can still come back from retrieve.
+    Without this marker the recall entry is indistinguishable from a current
+    one and an answering agent reuses the replaced belief as if it were still
+    settled (kumiho-memory#26, "reuse of superseded facts"). Mirrors
+    ``grounding.apply_grounding_marker``: sets ``status`` when the metadata
+    carries one and ``superseded=True`` for the demoted state; never removes
+    or reorders anything, and legacy revisions without a status are untouched.
+    """
+    status = str((meta or {}).get("status", "") or "").strip()
+    if not status:
+        return
+    entry["status"] = status
+    if status.casefold() == SUPERSEDED_STATUS:
+        entry["superseded"] = True

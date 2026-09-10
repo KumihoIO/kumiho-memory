@@ -9,6 +9,8 @@ The live end-to-end proof is scripts/dogfood_dream_maintenance.py.
 import asyncio
 import types
 
+import pytest
+
 from kumiho._text import slugify
 from kumiho_memory.dream_state import DreamState
 from kumiho_memory.graph_maintenance import GraphMaintainer, MaintenanceStats, _node_slug
@@ -104,6 +106,11 @@ class FakeClient:
         self.metadata_updates = []
         self.tags = []
         self.untags = []
+
+    def item_search(self, context_filter="", item_name_filter="", kind_filter="", include_deprecated=False):
+        return [it for it in self._graph.items
+                if it.project == context_filter and it.kind == kind_filter
+                and (include_deprecated or not it.deprecated)]
 
     def update_revision_metadata(self, kref, metadata):
         rev = self._graph.rev_by_uri(kref.uri)
@@ -1042,3 +1049,41 @@ def test_maintenance_ignores_facts_without_a_pending_marker():
     _maintainer(g).run_keyless(stats)
     assert stats.ripple_dependents_resumed == 0
     assert stats.ripples_still_pending == 0
+
+
+@pytest.mark.parametrize("project,kind", [("Mem", "decision"), ("Code", "code_decision")])
+def test_pending_decision_ripple_is_discovered(project, kind):
+    g = FakeGraph()
+    source = g.add(project, kind, "old", {"grounding_ripple_pending": f"kref://{project}/facts/new.fact?r=1"})
+    dependent = g.add(project, "decision", "dependent", {})
+    g.link(dependent, source, "DEPENDS_ON")
+    stats = MaintenanceStats()
+    GraphMaintainer(g.sdk(), project="Mem", code_project="Code")._resume_pending_ripples(stats)
+    assert dependent.get_latest_revision().metadata.get("grounding_stale") == "true"
+    assert not source.get_latest_revision().metadata["grounding_ripple_pending"]
+
+
+def test_pending_historical_revision_survives_item_deprecation():
+    g = FakeGraph()
+    fact, deps = _pending_fact(g, "old", "kref://Mem/facts/new.fact?r=1", ["d"], 0)
+    old = fact.get_latest_revision()
+    latest = FakeRev(g, fact, fact.kref.uri + "?r=2", {})
+    fact._rev = latest
+    fact.deprecated = True
+    fact.get_revisions = lambda: [old, latest]
+    stats = MaintenanceStats()
+    _maintainer(g)._resume_pending_ripples(stats)
+    assert deps[0].get_latest_revision().metadata.get("grounding_stale") == "true"
+    assert not old.metadata["grounding_ripple_pending"]
+    assert latest.metadata == {}
+
+
+def test_pending_scan_limit_is_reported_as_incomplete(monkeypatch):
+    import kumiho_memory.graph_maintenance as maintenance
+    g = FakeGraph()
+    g.fact("Mem", "first")
+    g.fact("Mem", "second")
+    monkeypatch.setattr(maintenance, "_MAX_DEDUP_NODES", 1)
+    stats = MaintenanceStats()
+    _maintainer(g)._resume_pending_ripples(stats)
+    assert any("scan incomplete" in error for error in stats.errors)

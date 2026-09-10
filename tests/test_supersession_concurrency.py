@@ -301,7 +301,7 @@ def test_untruncated_ripple_leaves_no_pending_marker(monkeypatch):
 
     ripple_grounding_stale(fact, "kref://p/facts/new.fact?r=1", cap=20)
     assert has_pending_ripple(fact.metadata) == ""
-    assert fact.set_metadata_calls == 0  # common path pays nothing extra
+    assert fact.set_metadata_calls == 2  # pending before processing, cleared after success
 
 
 def test_resume_is_noop_without_a_pending_marker(monkeypatch):
@@ -333,3 +333,151 @@ def test_result_distinguishes_complete_from_pending():
 
 def test_cycle_depth_constant_is_documented_and_bounded():
     assert 1 <= SUPERSEDE_CYCLE_MAX_DEPTH <= 32
+
+
+@pytest.mark.parametrize("existing_edge", [False, True])
+def test_reverse_recheck_outage_withholds_demotion_and_repairs_on_replay(monkeypatch, existing_edge):
+    src = _Rev("kref://p/facts/new.fact?r=1")
+    old = _Rev("kref://p/facts/old.fact?r=1", {"status": "active"})
+    _install(monkeypatch, [src, old])
+    if existing_edge:
+        src.create_edge(old, "SUPERSEDES")
+    original = old.get_edges
+    reads = 0
+
+    def outage(**kwargs):
+        nonlocal reads
+        reads += 1
+        if existing_edge or reads == 2:
+            raise RuntimeError("reverse read unavailable")
+        return original(**kwargs)
+
+    monkeypatch.setattr(old, "get_edges", outage)
+    result = supersede_revision(src, old)
+    assert result.linked and result.error and not result.demoted and not result.complete
+    assert old.metadata["status"] == "active"
+    monkeypatch.setattr(old, "get_edges", original)
+    assert supersede_revision(src, old).complete
+    assert len(src._outgoing) == 1
+
+
+@pytest.mark.parametrize("failure", ["fetch", "missing", "metadata", "negative_ack"])
+def test_failed_dependent_is_not_skipped_by_durable_cursor(monkeypatch, failure):
+    reg = {}
+    fact, deps = _fact_with_n_dependents(3, reg)
+    _install(monkeypatch, [fact, *deps])
+    original = deps[0].set_metadata
+    def fetch(uri):
+        if uri == deps[0].kref.uri:
+            if failure == "fetch":
+                raise RuntimeError("temporary read failure")
+            if failure == "missing":
+                return None
+        return reg[uri]
+    if failure == "metadata":
+        monkeypatch.setattr(deps[0], "set_metadata", lambda md: (_ for _ in ()).throw(RuntimeError("write failed")))
+    if failure == "negative_ack":
+        monkeypatch.setattr(deps[0], "set_metadata", lambda md: False)
+    assert ripple_grounding_stale(fact, "kref://p/facts/new.fact?r=1", cap=2, get_revision=fetch) == 1
+    assert has_pending_ripple(fact.metadata)
+    assert fact.metadata["grounding_ripple_cursor"] == "0"
+    monkeypatch.setattr(deps[0], "set_metadata", original)
+    for _ in range(2):
+        resume_grounding_ripple(fact, cap=2, get_revision=reg.__getitem__)
+    assert all(d.metadata.get(GROUNDING_STALE_META) == "true" for d in deps)
+    assert not has_pending_ripple(fact.metadata)
+
+
+@pytest.mark.parametrize("change", ["reorder", "insert", "remove"])
+def test_changed_dependency_snapshot_cannot_skip_remaining_work(monkeypatch, change):
+    reg = {}
+    fact, deps = _fact_with_n_dependents(3, reg)
+    _install(monkeypatch, [fact, *deps])
+    ripple_grounding_stale(fact, "kref://p/facts/new.fact?r=1", cap=2, get_revision=reg.__getitem__)
+    if change == "reorder":
+        fact._incoming.reverse()
+    elif change == "insert":
+        added = _Rev("kref://p/decisions/a.decision?r=1")
+        reg[added.kref.uri] = added
+        deps.append(added)
+        fact._incoming.insert(0, _Edge(added.kref.uri, fact.kref.uri, "DEPENDS_ON"))
+    else:
+        fact._incoming.pop(0)
+    reads = []
+    def fetch(uri):
+        reads.append(uri)
+        return reg[uri]
+    for _ in range(3):
+        before = len(reads)
+        resume_grounding_ripple(fact, cap=2, get_revision=fetch)
+        assert len(reads) - before <= 2
+    assert all(d.metadata.get(GROUNDING_STALE_META) == "true" for d in deps)
+    assert not has_pending_ripple(fact.metadata)
+
+
+def test_crash_during_first_batch_leaves_durable_resume_marker(monkeypatch):
+    reg = {}
+    fact, deps = _fact_with_n_dependents(2, reg)
+    _install(monkeypatch, [fact, *deps])
+    def crash(uri):
+        raise KeyboardInterrupt("process stopped")
+    with pytest.raises(KeyboardInterrupt):
+        ripple_grounding_stale(fact, "kref://p/facts/new.fact?r=1", get_revision=crash)
+    assert has_pending_ripple(fact.metadata)
+    assert resume_grounding_ripple(fact, get_revision=reg.__getitem__) == 2
+    assert not has_pending_ripple(fact.metadata)
+
+
+@pytest.mark.parametrize("stage", ["initial", "clear"])
+def test_progress_write_failure_requires_supersession_replay(monkeypatch, stage):
+    reg = {}
+    old, deps = _fact_with_n_dependents(1, reg)
+    new = _Rev("kref://p/facts/new.fact?r=1")
+    _install(monkeypatch, [old, new, *deps])
+    original = old.set_metadata
+    def reject(md):
+        if bool(md[GROUNDING_RIPPLE_PENDING_META]) == (stage == "initial"):
+            return False
+        return original(md)
+    monkeypatch.setattr(old, "set_metadata", reject)
+    result = supersede_revision(new, old)
+    assert result.error and not result.complete
+    if stage == "clear":
+        assert has_pending_ripple(old.metadata)
+    monkeypatch.setattr(old, "set_metadata", original)
+    assert supersede_revision(new, old).complete
+    assert deps[0].metadata[GROUNDING_STALE_META] == "true"
+    assert len(new._outgoing) == 1
+
+
+def test_grounding_edge_outage_remains_discoverable(monkeypatch):
+    reg = {}
+    old, deps = _fact_with_n_dependents(1, reg)
+    new = _Rev("kref://p/facts/new.fact?r=1")
+    _install(monkeypatch, [old, new, *deps])
+    original = old.get_edges
+    def outage(**kwargs):
+        if kwargs.get("edge_type_filter") == "DEPENDS_ON":
+            raise RuntimeError("grounding read unavailable")
+        return original(**kwargs)
+    monkeypatch.setattr(old, "get_edges", outage)
+    result = supersede_revision(new, old)
+    assert result.ripple_pending and not result.complete
+    monkeypatch.setattr(old, "get_edges", original)
+    assert resume_grounding_ripple(old) == 1
+
+
+def test_progress_tracks_sdk_fresh_returned_revision(monkeypatch):
+    reg = {}
+    fact, deps = _fact_with_n_dependents(3, reg)
+    _install(monkeypatch, [fact, *deps])
+    persisted = dict(fact.metadata)
+    def fresh_update(md):
+        persisted.update(md)
+        return _Rev(fact.kref.uri, persisted)
+    monkeypatch.setattr(fact, "set_metadata", fresh_update)
+    assert ripple_grounding_stale(fact, "kref://p/facts/new.fact?r=1", cap=2) == 2
+    assert fact.metadata["grounding_ripple_cursor"] == "2"
+    assert has_pending_ripple(fact.metadata) == has_pending_ripple(persisted)
+    assert resume_grounding_ripple(fact, cap=2) == 1
+    assert not has_pending_ripple(fact.metadata) and not has_pending_ripple(persisted)

@@ -20,8 +20,8 @@ Conventions (strict):
   source of truth; the ``grounding:stale`` graph tag is applied best-effort and
   a per-tag failure is tolerated (a reader consults metadata first).
 * **gRPC metadata values are strings** — the flag is the literal ``"true"``.
-* **Deterministic, keyless, best-effort** — no LLM, every failure is logged and
-  swallowed, the ripple never breaks the write it rides on.
+* **Deterministic and keyless** - failed dependents retain pending work;
+  failed progress writes are surfaced so callers can replay the partial write.
 * **Bounded fan-out** — at most :data:`RIPPLE_FANOUT_CAP` dependents per
   supersede (a decision-grounding fan-in is normally 0-2; the cap only guards a
   pathological hub). Truncation is logged, never silent.
@@ -31,12 +31,15 @@ Conventions (strict):
 The ripple runs on the WRITE path (inside the bounded decompose worker), NOT on
 recall: it costs, per supersede, one ``get_edges`` on the fact plus, per
 dependent, one ``get_revision`` and (only when newly stamped) one
-``set_metadata`` + one ``tag``. The recall marker reuses already-fetched
+``set_metadata`` + one ``tag``. Nonempty batches also acknowledge durable
+progress before processing and after advancing/clearing the cursor. The recall marker reuses already-fetched
 metadata and adds zero round-trips.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from typing import Any, Dict, Optional
 
@@ -55,13 +58,11 @@ GROUNDING_STALE_SUPERSEDED_BY_META = "grounding_stale_superseded_by"
 #: dependent remains. Never silently dropped: a truncated ripple that leaves
 #: this set is discoverable, not a swallowed failure reported as zero.
 GROUNDING_RIPPLE_PENDING_META = "grounding_ripple_pending"
-#: Companion durable cursor: how many distinct DEPENDS_ON dependents of this
-#: fact have already been processed, so a resume continues through the fan-in
-#: instead of re-scanning the head. Advances monotonically within one drain;
-#: cleared with the pending marker when the fan-in is fully processed. Assumes
-#: the server returns this fact's DEPENDS_ON edges in a stable order within a
-#: drain (idempotent stamping makes a reprocess harmless if it is not).
+#: Cursor counts a successfully processed prefix of a sorted dependency snapshot.
+#: Its fingerprint binds both membership and the superseding revision. Changed
+#: membership resets the cursor; backend edge ordering cannot skip work.
 GROUNDING_RIPPLE_CURSOR_META = "grounding_ripple_cursor"
+GROUNDING_RIPPLE_SNAPSHOT_META = "grounding_ripple_snapshot"
 #: Mirrored graph tag (metadata is canonical; the tag is best-effort per-tag).
 GROUNDING_STALE_TAG = "grounding:stale"
 #: The cleared value written by maintenance (metadata is never deleted, so a
@@ -130,7 +131,8 @@ def ripple_grounding_stale(
 
     Best-effort, keyless, deterministic, bounded (``cap``), idempotent (an
     already-stale dependent is skipped, so no re-stamp / duplicate tag). Returns
-    the count of dependents newly stamped (0 on any failure).
+    the count of dependents newly stamped. Progress-write failures raise so the
+    caller cannot report an undiscoverable partial write as complete.
 
     ``get_revision`` overrides how a dependent revision is fetched; it defaults
     to the ambient ``kumiho`` SDK (the write path), and the maintenance resume
@@ -148,10 +150,12 @@ def ripple_grounding_stale(
     """
     if superseded_rev is None:
         return 0
+    cap = max(1, min(int(cap), RIPPLE_FANOUT_CAP))
     if get_revision is None:
         try:
             import kumiho  # noqa: F401 — availability gate for the default path
         except Exception:  # noqa: BLE001
+            _persist_ripple_progress(superseded_rev, superseding_kref, 0)
             return 0
         get_revision = _default_get_revision
 
@@ -161,6 +165,7 @@ def ripple_grounding_stale(
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("grounding ripple: get_edges failed: %s", exc)
+        _persist_ripple_progress(superseded_rev, superseding_kref, 0)
         return 0
 
     superseded_uri = getattr(getattr(superseded_rev, "kref", None), "uri", "") or ""
@@ -180,82 +185,85 @@ def ripple_grounding_stale(
         seen_src.add(src_uri)
         candidates.append(src_uri)
 
-    # Resume from the durable cursor so a truncated drain continues through the
-    # fan-in instead of re-scanning the head. First call (no cursor) starts at 0.
+    # Persist a stable snapshot identity, not an unbounded list of references.
+    # Insertion/removal/reordering must never turn an ordinal cursor into a skip.
+    candidates.sort()
+    snapshot = hashlib.sha256(json.dumps(
+        [superseding_kref, candidates], ensure_ascii=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    meta = getattr(superseded_rev, "metadata", {}) or {}
     try:
-        cursor = int(str((getattr(superseded_rev, "metadata", {}) or {}).get(
-            GROUNDING_RIPPLE_CURSOR_META, "") or "0"))
+        cursor = int(str(meta.get(GROUNDING_RIPPLE_CURSOR_META, "") or "0"))
     except (TypeError, ValueError):
+        cursor = 0
+    if meta.get(GROUNDING_RIPPLE_SNAPSHOT_META) != snapshot:
         cursor = 0
     cursor = max(0, min(cursor, len(candidates)))
 
+    # Record pending work BEFORE touching dependents. A crash or failed read
+    # leaves a retryable prefix; a progress-write failure must reach the caller.
+    if candidates:
+        _persist_ripple_progress(superseded_rev, superseding_kref, cursor, snapshot)
     stamped = 0
     processed = cursor
+    failed_prefix = False
     for src_uri in candidates[cursor:cursor + cap]:
-        processed += 1
         try:
             dep_rev = get_revision(src_uri)
+            if dep_rev is None:
+                raise RuntimeError("dependent revision unavailable")
+            if not is_grounding_stale(getattr(dep_rev, "metadata", {}) or {}):
+                if dep_rev.set_metadata({
+                    GROUNDING_STALE_META: _TRUE,
+                    GROUNDING_STALE_SUPERSEDED_BY_META: superseding_kref or "",
+                }) is False:
+                    raise RuntimeError("dependent metadata update rejected")
+                stamped += 1
+                try:
+                    dep_rev.tag(GROUNDING_STALE_TAG)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("grounding ripple: tag %s failed: %s", src_uri, exc)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("grounding ripple: get_revision %s failed: %s", src_uri, exc)
+            # Do not advance past failed work. Later successful replays may
+            # re-read an already stamped prefix, at most cap revisions per run.
+            logger.debug("grounding ripple: dependent %s failed: %s", src_uri, exc)
+            failed_prefix = True
             continue
-        if dep_rev is None:
-            continue
-        # Idempotent: a dependent already flagged (canonical metadata) is not
-        # re-stamped, so a re-decompose never doubles the tag.
-        if is_grounding_stale(getattr(dep_rev, "metadata", {}) or {}):
-            continue
-        try:
-            dep_rev.set_metadata({
-                GROUNDING_STALE_META: _TRUE,
-                GROUNDING_STALE_SUPERSEDED_BY_META: superseding_kref or "",
-            })
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("grounding ripple: set_metadata %s failed: %s", src_uri, exc)
-            continue
-        try:
-            dep_rev.tag(GROUNDING_STALE_TAG)
-        except Exception as exc:  # noqa: BLE001
-            # Metadata is canonical; a missing mirrored tag is tolerated.
-            logger.debug("grounding ripple: tag %s failed: %s", src_uri, exc)
-        stamped += 1
+        if not failed_prefix:
+            processed += 1
 
     remaining = processed < len(candidates)
     if remaining:
-        logger.info(
-            "grounding ripple: DEPENDS_ON dependents (%d) exceed cap %d for %s — "
-            "%d/%d processed, remainder deferred to a resume pass",
-            len(candidates), cap, superseded_uri, processed, len(candidates),
-        )
+        logger.info("grounding ripple: %d/%d dependents processed for %s; pending",
+                    processed, len(candidates), superseded_uri)
     _persist_ripple_progress(
-        superseded_rev, superseding_kref if remaining else "", processed if remaining else 0,
+        superseded_rev, superseding_kref if remaining else "",
+        processed if remaining else 0, snapshot if remaining else "",
     )
     return stamped
 
 
-def _persist_ripple_progress(superseded_rev: Any, superseding_kref: str, cursor: int) -> None:
-    """Set (remaining) or clear (drained) the durable pending marker + cursor.
+def _persist_ripple_progress(
+    superseded_rev: Any, superseding_kref: str, cursor: int, snapshot: str = "",
+) -> None:
+    """Persist or clear bounded progress; never hide a missing acknowledgement.
 
-    Only writes when the state actually changes, so the common non-truncated
-    ripple pays nothing. Best-effort: a write failure leaves the previous marker
-    and the next pass re-evaluates -- it never breaks the ripple it rides on.
+    The supersession caller surfaces failure for replay. An earlier durable
+    marker remains discoverable if updating or clearing it fails.
     """
-    try:
-        meta = getattr(superseded_rev, "metadata", {}) or {}
-        cur_pending = str(meta.get(GROUNDING_RIPPLE_PENDING_META, "") or "")
-        cur_cursor = str(meta.get(GROUNDING_RIPPLE_CURSOR_META, "") or "")
-    except Exception:  # noqa: BLE001
+    meta = getattr(superseded_rev, "metadata", {}) or {}
+    wanted = {
+        GROUNDING_RIPPLE_PENDING_META: superseding_kref or "",
+        GROUNDING_RIPPLE_CURSOR_META: str(cursor) if superseding_kref else "",
+        GROUNDING_RIPPLE_SNAPSHOT_META: snapshot if superseding_kref else "",
+    }
+    if all(str(meta.get(key, "") or "") == value for key, value in wanted.items()):
         return
-    want_pending = superseding_kref or ""
-    want_cursor = str(cursor) if superseding_kref else ""
-    if cur_pending == want_pending and cur_cursor == want_cursor:
-        return
-    try:
-        superseded_rev.set_metadata({
-            GROUNDING_RIPPLE_PENDING_META: want_pending,
-            GROUNDING_RIPPLE_CURSOR_META: want_cursor,
-        })
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("grounding ripple: progress-marker write failed: %s", exc)
+    if superseded_rev.set_metadata(wanted) is False:
+        raise RuntimeError("grounding progress metadata update rejected")
+    # The SDK returns a fresh Revision, leaving this object's metadata unchanged.
+    # Reflect only the acknowledged keys locally for the result/resume observer.
+    superseded_rev.metadata.update(wanted)
 
 
 def has_pending_ripple(meta: Optional[Dict[str, Any]]) -> str:
@@ -272,9 +280,8 @@ def resume_grounding_ripple(
     set, re-runs :func:`ripple_grounding_stale` for it. Because the ripple is
     idempotent (already-stale dependents skipped) each call flags up to ``cap``
     more and re-evaluates truncation, clearing the marker once none remain. A
-    fact with no pending marker is a no-op returning 0. Safe to call repeatedly
-    and from more than one process; convergent under the same replay contract as
-    the write path.
+    fact with no pending marker is a no-op returning 0. Replays are idempotent;
+    cross-process progress updates remain best-effort without server CAS.
     """
     if superseded_rev is None:
         return 0
