@@ -1,0 +1,1992 @@
+{
+  "meta": {
+    "name": "decision_continuity",
+    "version": "1.0.0",
+    "frozen_at": "2026-09-06",
+    "issue": "KumihoIO/kumiho-memory#26",
+    "tier": "deterministic-keyless",
+    "not_evidence_of_model_quality": true,
+    "purpose": "Synthetic multi-session scenarios for the cross-session decision continuity contract: establish a decision, later correct/challenge it, restart, then perform a task that depends on it. Every scenario is driven through the real kumiho_memory MCP tool handlers over an in-memory SDK fake; no LLM key, no network.",
+    "split_rule": "`dev` scenarios were authored while the harness was written and may have shaped it. `heldout` scenarios were authored afterwards, with different subject matter, and were not looked at while implementing checks; they are frozen with this file and must not be edited to make a candidate pass. New held-out cases go into a new fixture version.",
+    "scoring_rule": "Outcomes are structured labels read from `option:*` tags (or the scenario's declared per-language `option_signals`), never free-text keyword matching. A scenario passes when every named check passes; checks are deterministic assertions on the tool results and the graph state. Item counts and trial counts are reported separately; this tier runs one trial per scenario because it is deterministic.",
+    "boundaries": {
+      "new_host_session": "a new session id, a fresh working-memory (Redis) instance and a fresh manager process; only the long-term graph is shared in the memory arm",
+      "process_restart": "the same session id and working memory, but a fresh manager process (module singleton reset, recall dedup cache cleared)"
+    },
+    "arms": {
+      "B": "memory: sessions share one long-term graph",
+      "A": "no memory: every session gets an empty graph and an empty working memory; the final task sees nothing",
+      "Bprime": "decoy: agent tier only (a generic authoritative brief cannot change a scripted agent); `decoy_brief` is carried for that tier and is not executed here"
+    },
+    "option_signals_note": "typed facts carry no tags; scenarios that read typed facts declare `option_signals` per language so the structured outcome is still a declared mapping, not English keyword matching"
+  },
+  "scenarios": [
+    {
+      "id": "settled_decision_survives_restart_en",
+      "family": "settled_decision_survives_restart",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "We need to settle the session store for the API. Redis or Postgres?"
+            },
+            {
+              "op": "reflect",
+              "response": "Settled: the API session store is Postgres.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API session store is Postgres",
+                  "content": "The API session store is Postgres. Redis was rejected for durability reasons.",
+                  "tags": [
+                    "option:postgres"
+                  ]
+                }
+              ],
+              "bind": "k_decision"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "process_restart",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "Unrelated: rename the CI job."
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "which session store does the API use",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] Prior decision: the team standardized the API's session store on a widely used, well-supported technology after weighing the usual trade-offs.",
+      "expect": {
+        "B": {
+          "outcome": "postgres"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "working_memory_survives_restart",
+          "no_superseded_reuse",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "settled_decision_survives_restart_ko",
+      "family": "settled_decision_survives_restart",
+      "lang": "ko",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "API 세션 저장소를 정해야 해. 레디스로 갈까 포스트그레스로 갈까?"
+            },
+            {
+              "op": "reflect",
+              "response": "결정: API 세션 저장소는 포스트그레스로 확정합니다.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API 세션 저장소는 포스트그레스",
+                  "content": "API 세션 저장소는 포스트그레스로 확정. 레디스는 내구성 문제로 제외.",
+                  "tags": [
+                    "option:postgres"
+                  ]
+                }
+              ],
+              "bind": "k_decision"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "process_restart",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "무관한 얘기: CI 잡 이름을 바꾸자."
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "API 세션 저장소는 무엇으로 정했지",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] 이전 결정: 팀은 일반적인 트레이드오프를 검토한 뒤 널리 쓰이는 기술로 API 세션 저장소를 표준화했다.",
+      "expect": {
+        "B": {
+          "outcome": "postgres"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "working_memory_survives_restart",
+          "no_superseded_reuse",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "explicit_correction_replaces_en",
+      "family": "explicit_correction_replaces",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "Let's use Redis as the API session store for now."
+            },
+            {
+              "op": "reflect",
+              "response": "Noted: API session store is Redis.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API session store is Redis",
+                  "content": "The API session store is Redis.",
+                  "tags": [
+                    "option:redis"
+                  ]
+                }
+              ],
+              "bind": "k_old"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "Correction: we moved the API session store to Postgres last week. Redis is no longer used for sessions."
+            },
+            {
+              "op": "reflect",
+              "response": "Understood, correcting the record: the API session store is Postgres, not Redis.",
+              "captures": [
+                {
+                  "type": "correction",
+                  "title": "API session store is Postgres, not Redis",
+                  "content": "Correction: the API session store is Postgres. Redis is no longer used for sessions.",
+                  "tags": [
+                    "option:postgres"
+                  ]
+                }
+              ],
+              "bind": "k_new"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_new}",
+              "facts": [
+                {
+                  "statement": "The API session store is Postgres"
+                }
+              ],
+              "supersedes": [
+                {
+                  "statement": "The API session store is Postgres",
+                  "replaces": "{k_old}",
+                  "reason": "user correction"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "process_restart",
+          "steps": []
+        },
+        {
+          "name": "s4",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "which session store does the API use",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] Prior decision: the session store was re-evaluated recently and the team aligned on the option that best fit operational needs.",
+      "expect": {
+        "B": {
+          "outcome": "postgres"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "correction": "k_new",
+        "replaced": "k_old",
+        "checks": [
+          "outcome_matches",
+          "correction_retained",
+          "old_decision_demoted",
+          "superseded_marked",
+          "no_superseded_reuse",
+          "context_has_superseded_note",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "explicit_correction_replaces_ko",
+      "family": "explicit_correction_replaces",
+      "lang": "ko",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "일단 API 세션 저장소는 레디스로 가자."
+            },
+            {
+              "op": "reflect",
+              "response": "기록: API 세션 저장소는 레디스.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API 세션 저장소는 레디스",
+                  "content": "API 세션 저장소는 레디스로 한다.",
+                  "tags": [
+                    "option:redis"
+                  ]
+                }
+              ],
+              "bind": "k_old"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "정정: 지난주에 API 세션 저장소를 포스트그레스로 옮겼어. 세션에 레디스는 더 이상 안 써."
+            },
+            {
+              "op": "reflect",
+              "response": "알겠습니다. 기록을 정정합니다: API 세션 저장소는 레디스가 아니라 포스트그레스입니다.",
+              "captures": [
+                {
+                  "type": "correction",
+                  "title": "API 세션 저장소는 레디스가 아니라 포스트그레스",
+                  "content": "정정: API 세션 저장소는 포스트그레스. 세션에 레디스는 더 이상 쓰지 않는다.",
+                  "tags": [
+                    "option:postgres"
+                  ]
+                }
+              ],
+              "bind": "k_new"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_new}",
+              "facts": [
+                {
+                  "statement": "API 세션 저장소는 포스트그레스이다"
+                }
+              ],
+              "supersedes": [
+                {
+                  "statement": "API 세션 저장소는 포스트그레스이다",
+                  "replaces": "{k_old}",
+                  "reason": "사용자 정정"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "process_restart",
+          "steps": []
+        },
+        {
+          "name": "s4",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "API 세션 저장소는 무엇을 쓰지",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] 이전 결정: 세션 저장소는 최근 재검토되었고 팀은 운영 요구에 가장 맞는 선택지로 정렬했다.",
+      "expect": {
+        "B": {
+          "outcome": "postgres"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "correction": "k_new",
+        "replaced": "k_old",
+        "checks": [
+          "outcome_matches",
+          "correction_retained",
+          "old_decision_demoted",
+          "superseded_marked",
+          "no_superseded_reuse",
+          "context_has_superseded_note",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "unaccepted_proposal_not_promoted_en",
+      "family": "unaccepted_proposal_not_promoted",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "What should the event bus be? We run RabbitMQ today."
+            },
+            {
+              "op": "reflect",
+              "response": "Proposal (not decided): I would consider Kafka for the event bus because of replay. Your call.",
+              "captures": []
+            },
+            {
+              "op": "ingest",
+              "message": "No. Keep RabbitMQ for the event bus for now; revisit next quarter."
+            },
+            {
+              "op": "reflect",
+              "response": "Decision recorded: the event bus stays RabbitMQ for now.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "Event bus stays RabbitMQ for now",
+                  "content": "The event bus stays RabbitMQ for now; revisit next quarter.",
+                  "tags": [
+                    "option:rabbitmq"
+                  ]
+                }
+              ],
+              "bind": "k_decision"
+            },
+            {
+              "op": "consolidate",
+              "summary": {
+                "type": "conversation",
+                "title": "Event bus discussion",
+                "summary": "The assistant proposed Kafka for the event bus; the user declined and kept RabbitMQ for now, to revisit next quarter.",
+                "knowledge": {
+                  "facts": [
+                    {
+                      "claim": "The event bus runs RabbitMQ today",
+                      "certainty": "high"
+                    }
+                  ],
+                  "decisions": [
+                    {
+                      "decision": "The event bus stays RabbitMQ for now",
+                      "reason": "user decision; revisit next quarter"
+                    }
+                  ],
+                  "actions": [],
+                  "open_questions": [
+                    "Revisit the event bus choice next quarter"
+                  ]
+                },
+                "classification": {
+                  "topics": [
+                    "event bus"
+                  ],
+                  "entities": [
+                    "RabbitMQ",
+                    "Kafka"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "what is the event bus decision",
+        "graph_augmented": false
+      },
+      "proposal_option": "kafka",
+      "proposal_markers": [
+        "kafka",
+        "Kafka"
+      ],
+      "decoy_brief": "[D1] Prior decision: the event bus choice was discussed and a modern streaming platform was considered alongside the incumbent.",
+      "expect": {
+        "B": {
+          "outcome": "rabbitmq"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "proposal_not_promoted",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "unaccepted_proposal_not_promoted_ko",
+      "family": "unaccepted_proposal_not_promoted",
+      "lang": "ko",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "이벤트 버스는 뭘로 할까? 지금은 래빗엠큐를 쓰고 있어."
+            },
+            {
+              "op": "reflect",
+              "response": "제안(미결정): 리플레이 때문에 카프카를 검토해볼 만합니다. 결정은 사용자 몫입니다.",
+              "captures": []
+            },
+            {
+              "op": "ingest",
+              "message": "아니. 이벤트 버스는 당분간 래빗엠큐 유지. 다음 분기에 다시 보자."
+            },
+            {
+              "op": "reflect",
+              "response": "결정 기록: 이벤트 버스는 당분간 래빗엠큐를 유지합니다.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "이벤트 버스는 당분간 래빗엠큐 유지",
+                  "content": "이벤트 버스는 당분간 래빗엠큐를 유지한다. 다음 분기에 재검토.",
+                  "tags": [
+                    "option:rabbitmq"
+                  ]
+                }
+              ],
+              "bind": "k_decision"
+            },
+            {
+              "op": "consolidate",
+              "summary": {
+                "type": "conversation",
+                "title": "이벤트 버스 논의",
+                "summary": "어시스턴트가 이벤트 버스로 카프카를 제안했으나 사용자가 거절하고 당분간 래빗엠큐를 유지하기로 했다. 다음 분기 재검토.",
+                "knowledge": {
+                  "facts": [
+                    {
+                      "claim": "이벤트 버스는 현재 래빗엠큐로 운영된다",
+                      "certainty": "high"
+                    }
+                  ],
+                  "decisions": [
+                    {
+                      "decision": "이벤트 버스는 당분간 래빗엠큐를 유지한다",
+                      "reason": "사용자 결정; 다음 분기 재검토"
+                    }
+                  ],
+                  "actions": [],
+                  "open_questions": [
+                    "다음 분기에 이벤트 버스 선택 재검토"
+                  ]
+                },
+                "classification": {
+                  "topics": [
+                    "이벤트 버스"
+                  ],
+                  "entities": [
+                    "래빗엠큐",
+                    "카프카"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "이벤트 버스 결정은 어떻게 됐지",
+        "graph_augmented": false
+      },
+      "proposal_option": "kafka",
+      "proposal_markers": [
+        "카프카",
+        "kafka",
+        "Kafka"
+      ],
+      "decoy_brief": "[D1] 이전 결정: 이벤트 버스 선택이 논의되었고 기존 시스템과 함께 최신 스트리밍 플랫폼이 검토되었다.",
+      "expect": {
+        "B": {
+          "outcome": "rabbitmq"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "proposal_not_promoted",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "unresolved_contradiction_stays_en",
+      "family": "unresolved_contradiction_stays",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "The nightly batch window is 30 minutes."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded: nightly batch window is 30 minutes.",
+              "captures": [
+                {
+                  "type": "fact",
+                  "title": "Nightly batch window is 30 minutes",
+                  "content": "The nightly batch window is 30 minutes.",
+                  "tags": [
+                    "option:30m"
+                  ]
+                }
+              ],
+              "bind": "k_a"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "Ops says the nightly batch window is 45 minutes. That conflicts with what platform told us; nobody has confirmed which is right."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded as a conflicting claim, not a correction: ops reports 45 minutes; platform said 30. Unresolved.",
+              "captures": [
+                {
+                  "type": "fact",
+                  "title": "Ops reports nightly batch window is 45 minutes",
+                  "content": "Ops reports the nightly batch window is 45 minutes. Conflicts with the 30-minute figure; unresolved.",
+                  "tags": [
+                    "option:45m"
+                  ]
+                }
+              ],
+              "bind": "k_b"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_b}",
+              "facts": [
+                {
+                  "statement": "The nightly batch window is 45 minutes"
+                }
+              ],
+              "contradicts": [
+                {
+                  "statement": "The nightly batch window is 45 minutes",
+                  "conflicts_with": "{k_a}",
+                  "reason": "two teams disagree; unconfirmed"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "how long is the nightly batch window",
+        "graph_augmented": true
+      },
+      "decoy_brief": "[D1] Prior decision: the batch window was documented after consulting the responsible teams.",
+      "expect": {
+        "B": {
+          "outcome": "contested"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "pair": [
+          "k_a",
+          "k_b"
+        ],
+        "checks": [
+          "outcome_matches",
+          "contradiction_unresolved",
+          "newer_did_not_win",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "unresolved_contradiction_stays_ko",
+      "family": "unresolved_contradiction_stays",
+      "lang": "ko",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "야간 배치 윈도우는 30분이야."
+            },
+            {
+              "op": "reflect",
+              "response": "기록: 야간 배치 윈도우는 30분.",
+              "captures": [
+                {
+                  "type": "fact",
+                  "title": "야간 배치 윈도우는 30분",
+                  "content": "야간 배치 윈도우는 30분이다.",
+                  "tags": [
+                    "option:30m"
+                  ]
+                }
+              ],
+              "bind": "k_a"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "운영팀은 야간 배치 윈도우가 45분이라고 해. 플랫폼팀 얘기랑 충돌하는데 아직 아무도 확인 안 했어."
+            },
+            {
+              "op": "reflect",
+              "response": "정정이 아니라 상충 주장으로 기록합니다: 운영팀 45분, 플랫폼팀 30분. 미해결.",
+              "captures": [
+                {
+                  "type": "fact",
+                  "title": "운영팀 보고 야간 배치 윈도우 45분",
+                  "content": "운영팀은 야간 배치 윈도우가 45분이라고 보고. 30분 수치와 충돌; 미해결.",
+                  "tags": [
+                    "option:45m"
+                  ]
+                }
+              ],
+              "bind": "k_b"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_b}",
+              "facts": [
+                {
+                  "statement": "야간 배치 윈도우는 45분이다"
+                }
+              ],
+              "contradicts": [
+                {
+                  "statement": "야간 배치 윈도우는 45분이다",
+                  "conflicts_with": "{k_a}",
+                  "reason": "두 팀 의견 불일치; 미확인"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "야간 배치 윈도우는 얼마나 되지",
+        "graph_augmented": true
+      },
+      "decoy_brief": "[D1] 이전 결정: 배치 윈도우는 담당 팀들과 협의한 뒤 문서화되었다.",
+      "expect": {
+        "B": {
+          "outcome": "contested"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "pair": [
+          "k_a",
+          "k_b"
+        ],
+        "checks": [
+          "outcome_matches",
+          "contradiction_unresolved",
+          "newer_did_not_win",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "dependent_flagged_on_grounding_change_en",
+      "family": "dependent_flagged_on_grounding_change",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "Peak load measured at 2k requests per second. Size the worker pool for that."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded the measurement and the sizing decision.",
+              "captures": [
+                {
+                  "type": "fact",
+                  "title": "Peak load is 2k rps",
+                  "content": "Measured peak load is 2k requests per second.",
+                  "tags": [
+                    "option:2k"
+                  ]
+                },
+                {
+                  "type": "decision",
+                  "title": "Worker pool is 4 workers",
+                  "content": "The worker pool is 4 workers, sized for the measured 2k rps peak.",
+                  "tags": [
+                    "option:4workers"
+                  ]
+                }
+              ],
+              "bind": [
+                "k_fact",
+                "k_decision"
+              ]
+            },
+            {
+              "op": "link_depends_on",
+              "source": "{k_decision}",
+              "target": "{k_fact}"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "New measurement: peak load is now 8k requests per second."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded: peak load is now 8k rps, replacing the 2k figure.",
+              "captures": [
+                {
+                  "type": "fact",
+                  "title": "Peak load is 8k rps",
+                  "content": "Measured peak load is now 8k requests per second.",
+                  "tags": [
+                    "option:8k"
+                  ]
+                }
+              ],
+              "bind": "k_fact2"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_fact2}",
+              "facts": [
+                {
+                  "statement": "Peak load is 8k requests per second"
+                }
+              ],
+              "supersedes": [
+                {
+                  "statement": "Peak load is 8k requests per second",
+                  "replaces": "{k_fact}",
+                  "reason": "new measurement"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "how many workers should the worker pool have",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] Prior decision: the worker pool was sized from a load measurement taken at the time.",
+      "expect": {
+        "B": {
+          "outcome": "4workers",
+          "reconsider": true
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "dependent": "k_decision",
+        "replaced": "k_fact",
+        "checks": [
+          "outcome_matches",
+          "dependent_flagged",
+          "old_decision_demoted",
+          "context_has_grounding_note",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "dependent_flagged_on_grounding_change_ko",
+      "family": "dependent_flagged_on_grounding_change",
+      "lang": "ko",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "피크 부하가 초당 2천 요청으로 측정됐어. 워커 풀은 거기에 맞춰 잡자."
+            },
+            {
+              "op": "reflect",
+              "response": "측정값과 사이징 결정을 기록했습니다.",
+              "captures": [
+                {
+                  "type": "fact",
+                  "title": "피크 부하는 초당 2천 요청",
+                  "content": "측정된 피크 부하는 초당 2천 요청이다.",
+                  "tags": [
+                    "option:2k"
+                  ]
+                },
+                {
+                  "type": "decision",
+                  "title": "워커 풀은 워커 4개",
+                  "content": "워커 풀은 워커 4개로 한다. 측정된 초당 2천 요청 피크 기준.",
+                  "tags": [
+                    "option:4workers"
+                  ]
+                }
+              ],
+              "bind": [
+                "k_fact",
+                "k_decision"
+              ]
+            },
+            {
+              "op": "link_depends_on",
+              "source": "{k_decision}",
+              "target": "{k_fact}"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "새 측정: 피크 부하가 이제 초당 8천 요청이야."
+            },
+            {
+              "op": "reflect",
+              "response": "기록: 피크 부하는 이제 초당 8천 요청. 2천 수치를 대체합니다.",
+              "captures": [
+                {
+                  "type": "fact",
+                  "title": "피크 부하는 초당 8천 요청",
+                  "content": "측정된 피크 부하는 이제 초당 8천 요청이다.",
+                  "tags": [
+                    "option:8k"
+                  ]
+                }
+              ],
+              "bind": "k_fact2"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_fact2}",
+              "facts": [
+                {
+                  "statement": "피크 부하는 초당 8천 요청이다"
+                }
+              ],
+              "supersedes": [
+                {
+                  "statement": "피크 부하는 초당 8천 요청이다",
+                  "replaces": "{k_fact}",
+                  "reason": "새 측정"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "워커 풀은 워커 몇 개로 해야 하지",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] 이전 결정: 워커 풀은 당시의 부하 측정값을 기준으로 사이징되었다.",
+      "expect": {
+        "B": {
+          "outcome": "4workers",
+          "reconsider": true
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "dependent": "k_decision",
+        "replaced": "k_fact",
+        "checks": [
+          "outcome_matches",
+          "dependent_flagged",
+          "old_decision_demoted",
+          "context_has_grounding_note",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "as_of_vs_current_en",
+      "family": "as_of_vs_current",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "option_signals": {
+        "redis": [
+          "Redis"
+        ],
+        "postgres": [
+          "Postgres"
+        ]
+      },
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "History of the API session store: Redis from January through June 2025, Postgres from July 2025 onward."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded the session store history with valid-time bounds.",
+              "captures": [
+                {
+                  "type": "summary",
+                  "title": "API session store history",
+                  "content": "API session store history: Redis Jan-Jun 2025, Postgres from Jul 2025.",
+                  "tags": []
+                }
+              ],
+              "bind": "k_anchor"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_anchor}",
+              "facts": [
+                {
+                  "statement": "Session store was Redis until June 2025",
+                  "valid_from": "2025-01-01",
+                  "valid_to": "2025-06-30"
+                },
+                {
+                  "statement": "Session store is Postgres since July 2025",
+                  "valid_from": "2025-07-01"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "API session store",
+        "graph_augmented": true,
+        "fact_recall": true,
+        "as_of": "2025-03-15",
+        "current_as_of": "2025-09-01"
+      },
+      "decoy_brief": "[D1] Prior decision: the session store changed once; the current choice reflects the later decision.",
+      "expect": {
+        "B": {
+          "outcome": "postgres",
+          "outcome_as_of": "redis"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "as_of_differs",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "as_of_vs_current_ko",
+      "family": "as_of_vs_current",
+      "lang": "ko",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "option_signals": {
+        "redis": [
+          "레디스"
+        ],
+        "postgres": [
+          "포스트그레스"
+        ]
+      },
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "API 세션 저장소 이력: 2025년 1월부터 6월까지 레디스, 2025년 7월부터 포스트그레스."
+            },
+            {
+              "op": "reflect",
+              "response": "세션 저장소 이력을 유효기간과 함께 기록했습니다.",
+              "captures": [
+                {
+                  "type": "summary",
+                  "title": "API 세션 저장소 이력",
+                  "content": "API 세션 저장소 이력: 2025년 1~6월 레디스, 2025년 7월부터 포스트그레스.",
+                  "tags": []
+                }
+              ],
+              "bind": "k_anchor"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_anchor}",
+              "facts": [
+                {
+                  "statement": "API 세션 저장소는 2025년 6월까지 레디스였다",
+                  "valid_from": "2025-01-01",
+                  "valid_to": "2025-06-30"
+                },
+                {
+                  "statement": "API 세션 저장소는 2025년 7월부터 포스트그레스이다",
+                  "valid_from": "2025-07-01"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "API 세션 저장소",
+        "graph_augmented": true,
+        "fact_recall": true,
+        "as_of": "2025-03-15",
+        "current_as_of": "2025-09-01"
+      },
+      "decoy_brief": "[D1] 이전 결정: 세션 저장소는 한 번 바뀌었고 현재 선택은 나중 결정을 반영한다.",
+      "expect": {
+        "B": {
+          "outcome": "postgres",
+          "outcome_as_of": "redis"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "as_of_differs",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "scope_isolation_similar_projects_en",
+      "family": "scope_isolation_similar_projects",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "other_project": "ContinuityBench-Alpha2",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "This project's API session store is Postgres."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded for this project.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API session store is Postgres",
+                  "content": "The API session store is Postgres.",
+                  "tags": [
+                    "option:postgres"
+                  ]
+                }
+              ],
+              "bind": "k_here"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "project": "ContinuityBench-Alpha2",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "This project's API session store is MySQL."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded for this project.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API session store is MySQL",
+                  "content": "The API session store is MySQL.",
+                  "tags": [
+                    "option:mysql"
+                  ]
+                }
+              ],
+              "bind": "k_there"
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "which session store does the API use",
+        "graph_augmented": false,
+        "also_in_other_project": {
+          "outcome": "mysql"
+        }
+      },
+      "decoy_brief": "[D1] Prior decision: each project documents its own session store choice.",
+      "expect": {
+        "B": {
+          "outcome": "postgres"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "no_scope_leak",
+          "other_project_isolated",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "scope_isolation_similar_projects_ko",
+      "family": "scope_isolation_similar_projects",
+      "lang": "ko",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "other_project": "ContinuityBench-Alpha2",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "이 프로젝트의 API 세션 저장소는 포스트그레스야."
+            },
+            {
+              "op": "reflect",
+              "response": "이 프로젝트에 기록했습니다.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API 세션 저장소는 포스트그레스",
+                  "content": "API 세션 저장소는 포스트그레스이다.",
+                  "tags": [
+                    "option:postgres"
+                  ]
+                }
+              ],
+              "bind": "k_here"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "project": "ContinuityBench-Alpha2",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "이 프로젝트의 API 세션 저장소는 마이에스큐엘이야."
+            },
+            {
+              "op": "reflect",
+              "response": "이 프로젝트에 기록했습니다.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API 세션 저장소는 마이에스큐엘",
+                  "content": "API 세션 저장소는 마이에스큐엘이다.",
+                  "tags": [
+                    "option:mysql"
+                  ]
+                }
+              ],
+              "bind": "k_there"
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "API 세션 저장소는 무엇을 쓰지",
+        "graph_augmented": false,
+        "also_in_other_project": {
+          "outcome": "mysql"
+        }
+      },
+      "decoy_brief": "[D1] 이전 결정: 각 프로젝트는 자기 세션 저장소 선택을 따로 문서화한다.",
+      "expect": {
+        "B": {
+          "outcome": "postgres"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "no_scope_leak",
+          "other_project_isolated",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "negative_irrelevant_memory_en",
+      "family": "negative_controls",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "The logo color is blue."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded: logo color blue.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "Logo color is blue",
+                  "content": "The logo color is blue.",
+                  "tags": [
+                    "option:blue"
+                  ]
+                }
+              ],
+              "bind": "k_other"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "which session store does the API use",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] Prior decision: an unrelated branding decision was recorded.",
+      "expect": {
+        "B": {
+          "outcome": "unknown"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "no_fabrication",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "negative_irrelevant_memory_ko",
+      "family": "negative_controls",
+      "lang": "ko",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "로고 색상은 파란색이야."
+            },
+            {
+              "op": "reflect",
+              "response": "기록: 로고 색상 파란색.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "로고 색상은 파란색",
+                  "content": "로고 색상은 파란색이다.",
+                  "tags": [
+                    "option:blue"
+                  ]
+                }
+              ],
+              "bind": "k_other"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "API 세션 저장소는 무엇을 쓰지",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] 이전 결정: 무관한 브랜딩 결정이 기록되었다.",
+      "expect": {
+        "B": {
+          "outcome": "unknown"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "no_fabrication",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "negative_missing_memory_en",
+      "family": "negative_controls",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "which session store does the API use",
+        "graph_augmented": false
+      },
+      "decoy_brief": "",
+      "expect": {
+        "B": {
+          "outcome": "unknown"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "no_fabrication",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "negative_backend_unavailable_en",
+      "family": "negative_controls",
+      "lang": "en",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "The API session store is Postgres."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API session store is Postgres",
+                  "content": "The API session store is Postgres.",
+                  "tags": [
+                    "option:postgres"
+                  ]
+                }
+              ],
+              "bind": "k_decision"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "backend",
+              "retrieve_error": "connection refused: graph backend unavailable"
+            }
+          ]
+        }
+      ],
+      "final": {
+        "query": "which session store does the API use",
+        "graph_augmented": false
+      },
+      "decoy_brief": "",
+      "expect": {
+        "B": {
+          "outcome": "unknown"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "no_fabrication",
+          "backend_error_reported",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "negative_backend_unavailable_ko",
+      "family": "negative_controls",
+      "lang": "ko",
+      "split": "dev",
+      "project": "ContinuityBench-Alpha",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "API 세션 저장소는 포스트그레스야."
+            },
+            {
+              "op": "reflect",
+              "response": "기록했습니다.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "API 세션 저장소는 포스트그레스",
+                  "content": "API 세션 저장소는 포스트그레스이다.",
+                  "tags": [
+                    "option:postgres"
+                  ]
+                }
+              ],
+              "bind": "k_decision"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "backend",
+              "retrieve_error": "connection refused: graph backend unavailable"
+            }
+          ]
+        }
+      ],
+      "final": {
+        "query": "API 세션 저장소는 무엇을 쓰지",
+        "graph_augmented": false
+      },
+      "decoy_brief": "",
+      "expect": {
+        "B": {
+          "outcome": "unknown"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "no_fabrication",
+          "backend_error_reported",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "heldout_settled_cache_ttl_en",
+      "family": "settled_decision_survives_restart",
+      "lang": "en",
+      "split": "heldout",
+      "project": "ContinuityBench-Gamma",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "Pick the product cache TTL: 5 minutes or 1 hour?"
+            },
+            {
+              "op": "reflect",
+              "response": "Settled: product cache TTL is 5 minutes.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "Product cache TTL is 5 minutes",
+                  "content": "The product cache TTL is 5 minutes; 1 hour was rejected because prices change intraday.",
+                  "tags": [
+                    "option:5m"
+                  ]
+                }
+              ],
+              "bind": "k_decision"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "process_restart",
+          "steps": []
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "what is the product cache TTL",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] Prior decision: a cache TTL was chosen to balance freshness and load.",
+      "expect": {
+        "B": {
+          "outcome": "5m"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "working_memory_survives_restart",
+          "no_superseded_reuse",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "heldout_settled_cache_ttl_ko",
+      "family": "settled_decision_survives_restart",
+      "lang": "ko",
+      "split": "heldout",
+      "project": "ContinuityBench-Gamma",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "상품 캐시 TTL을 정하자. 5분이야 1시간이야?"
+            },
+            {
+              "op": "reflect",
+              "response": "결정: 상품 캐시 TTL은 5분으로 확정합니다.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "상품 캐시 TTL은 5분",
+                  "content": "상품 캐시 TTL은 5분. 가격이 장중에 바뀌므로 1시간은 제외.",
+                  "tags": [
+                    "option:5m"
+                  ]
+                }
+              ],
+              "bind": "k_decision"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "process_restart",
+          "steps": []
+        },
+        {
+          "name": "s3",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "상품 캐시 TTL은 얼마로 정했지",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] 이전 결정: 신선도와 부하의 균형을 위해 캐시 TTL이 선택되었다.",
+      "expect": {
+        "B": {
+          "outcome": "5m"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "checks": [
+          "outcome_matches",
+          "working_memory_survives_restart",
+          "no_superseded_reuse",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "heldout_correction_deploy_region_en",
+      "family": "explicit_correction_replaces",
+      "lang": "en",
+      "split": "heldout",
+      "project": "ContinuityBench-Gamma",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "Primary deploy region is us-east-1."
+            },
+            {
+              "op": "reflect",
+              "response": "Recorded: primary deploy region us-east-1.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "Primary deploy region is us-east-1",
+                  "content": "The primary deploy region is us-east-1.",
+                  "tags": [
+                    "option:us-east-1"
+                  ]
+                }
+              ],
+              "bind": "k_old"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "Correction: after the migration the primary deploy region is eu-central-1, not us-east-1."
+            },
+            {
+              "op": "reflect",
+              "response": "Correcting the record: primary deploy region is eu-central-1.",
+              "captures": [
+                {
+                  "type": "correction",
+                  "title": "Primary deploy region is eu-central-1, not us-east-1",
+                  "content": "Correction: the primary deploy region is eu-central-1 after the migration.",
+                  "tags": [
+                    "option:eu-central-1"
+                  ]
+                }
+              ],
+              "bind": "k_new"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_new}",
+              "facts": [
+                {
+                  "statement": "The primary deploy region is eu-central-1"
+                }
+              ],
+              "supersedes": [
+                {
+                  "statement": "The primary deploy region is eu-central-1",
+                  "replaces": "{k_old}",
+                  "reason": "user correction after migration"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "process_restart",
+          "steps": []
+        },
+        {
+          "name": "s4",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "what is the primary deploy region",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] Prior decision: the deploy region was chosen and later reviewed during a migration.",
+      "expect": {
+        "B": {
+          "outcome": "eu-central-1"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "correction": "k_new",
+        "replaced": "k_old",
+        "checks": [
+          "outcome_matches",
+          "correction_retained",
+          "old_decision_demoted",
+          "superseded_marked",
+          "no_superseded_reuse",
+          "context_has_superseded_note",
+          "no_fabrication_in_A"
+        ]
+      }
+    },
+    {
+      "id": "heldout_correction_deploy_region_ko",
+      "family": "explicit_correction_replaces",
+      "lang": "ko",
+      "split": "heldout",
+      "project": "ContinuityBench-Gamma",
+      "sessions": [
+        {
+          "name": "s1",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "기본 배포 리전은 us-east-1이야."
+            },
+            {
+              "op": "reflect",
+              "response": "기록: 기본 배포 리전 us-east-1.",
+              "captures": [
+                {
+                  "type": "decision",
+                  "title": "기본 배포 리전은 us-east-1",
+                  "content": "기본 배포 리전은 us-east-1이다.",
+                  "tags": [
+                    "option:us-east-1"
+                  ]
+                }
+              ],
+              "bind": "k_old"
+            }
+          ]
+        },
+        {
+          "name": "s2",
+          "boundary": "new_host_session",
+          "steps": [
+            {
+              "op": "ingest",
+              "message": "정정: 마이그레이션 이후 기본 배포 리전은 us-east-1이 아니라 eu-central-1이야."
+            },
+            {
+              "op": "reflect",
+              "response": "기록을 정정합니다: 기본 배포 리전은 eu-central-1.",
+              "captures": [
+                {
+                  "type": "correction",
+                  "title": "기본 배포 리전은 us-east-1이 아니라 eu-central-1",
+                  "content": "정정: 마이그레이션 이후 기본 배포 리전은 eu-central-1이다.",
+                  "tags": [
+                    "option:eu-central-1"
+                  ]
+                }
+              ],
+              "bind": "k_new"
+            },
+            {
+              "op": "decompose",
+              "anchor": "{k_new}",
+              "facts": [
+                {
+                  "statement": "기본 배포 리전은 eu-central-1이다"
+                }
+              ],
+              "supersedes": [
+                {
+                  "statement": "기본 배포 리전은 eu-central-1이다",
+                  "replaces": "{k_old}",
+                  "reason": "마이그레이션 후 사용자 정정"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "s3",
+          "boundary": "process_restart",
+          "steps": []
+        },
+        {
+          "name": "s4",
+          "boundary": "new_host_session",
+          "steps": []
+        }
+      ],
+      "final": {
+        "query": "기본 배포 리전은 어디지",
+        "graph_augmented": false
+      },
+      "decoy_brief": "[D1] 이전 결정: 배포 리전이 선택되었고 마이그레이션 중에 다시 검토되었다.",
+      "expect": {
+        "B": {
+          "outcome": "eu-central-1"
+        },
+        "A": {
+          "outcome": "unknown"
+        },
+        "correction": "k_new",
+        "replaced": "k_old",
+        "checks": [
+          "outcome_matches",
+          "correction_retained",
+          "old_decision_demoted",
+          "superseded_marked",
+          "no_superseded_reuse",
+          "context_has_superseded_note",
+          "no_fabrication_in_A"
+        ]
+      }
+    }
+  ]
+}

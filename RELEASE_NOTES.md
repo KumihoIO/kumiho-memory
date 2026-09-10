@@ -1,5 +1,46 @@
 # Release Notes — kumiho-memory
 
+## v1.4.2
+
+**Release Date:** 2026-09-06
+
+**Superseded beliefs are qualified at recall, and a cross-session decision-continuity evaluation.**
+
+Additive changes; no breaking public API changes. Implements KumihoIO/kumiho-memory#26.
+
+- Recall now surfaces a revision's belief `status`. `supersede_revision` already
+  demotes the replaced revision to `status=superseded` in the graph, but the
+  server's search does not filter on that field, so a superseded belief could
+  still be returned and reused as if current. A new additive marker
+  (`supersession.apply_supersession_marker`, mirroring the grounding marker)
+  stamps `superseded=True` on such recall entries; both context assemblers
+  (`context_compose.compose_context` and the MCP `engage` path in
+  `UniversalMemoryManager.build_recalled_context`, now sharing one
+  `context_compose.qualifier_notes` renderer) append a terse
+  `[superseded: a later memory replaced this]` note. The typed fact-recall leg
+  carries the same qualifiers (superseded / grounding-stale / valid-time).
+  Nothing is deleted or reordered; history stays inspectable.
+- New deterministic, keyless evaluation of cross-session decision continuity
+  (`tests/test_decision_continuity.py`, `tests/continuity_harness.py`,
+  `tests/fixtures/decision_continuity_v1.json`, and the offline emitter
+  `scripts/decision_continuity_report.py`). It drives the real MCP tool
+  handlers across genuinely separate sessions and a process restart, over an
+  in-memory SDK fake, in paired memory-on and memory-off arms, and asserts the
+  protocol: a settled decision survives a restart, an explicit correction
+  replaces and demotes the prior decision, an unaccepted proposal is not
+  promoted, an unresolved contradiction stays contested (a newer timestamp
+  does not pick a winner), a dependent decision is flagged when its grounding
+  changes, an as-of query differs from a current one, similar project names do
+  not leak scope, and negative controls (irrelevant / missing memory,
+  unavailable backend) yield uncertainty rather than fabricated continuity.
+  Korean and English variants of every family are checked for the same
+  structured outcome. The suite runs in the existing non-live CI job with no
+  workflow change; it is a protocol measurement, explicitly not evidence that a
+  model decides better. The agent tier and the three-arm behavioral effect
+  (A / B-prime / B) live in kumihoclouds/kumiho-benchmarks `decision_bench`,
+  which this suite maps to and reuses rather than duplicating.
+
+
 ## v1.4.1
 
 **Release Date:** 2026-09-05
