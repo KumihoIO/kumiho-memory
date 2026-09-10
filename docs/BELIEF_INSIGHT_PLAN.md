@@ -1,7 +1,7 @@
 # Belief-grounded insight: development plan
 
 Status: phases 1-4 implemented as explicit host-driven workflows in PR #32;
-opt-in and unreleased. Automated provider execution and broad rollout remain out of scope.
+available through explicit API flags in 1.5.0. Automated provider execution and broad rollout remain out of scope.
 Date: 2026-09-09.
 
 ## Product goal

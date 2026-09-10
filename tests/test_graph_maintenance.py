@@ -9,6 +9,8 @@ The live end-to-end proof is scripts/dogfood_dream_maintenance.py.
 import asyncio
 import types
 
+import pytest
+
 from kumiho._text import slugify
 from kumiho_memory.dream_state import DreamState
 from kumiho_memory.graph_maintenance import GraphMaintainer, MaintenanceStats, _node_slug
@@ -67,6 +69,16 @@ class FakeRev:
     def set_attribute(self, key, value):
         self.metadata[key] = value
 
+    def set_metadata(self, md):
+        # The real SDK revision exposes both set_attribute and set_metadata;
+        # the grounding ripple (and its resume pass) writes via set_metadata.
+        self.metadata.update(md)
+        return self
+
+    def tag(self, t):
+        if t not in self.tags:
+            self.tags.append(t)
+
     def get_item(self):
         return self.item
 
@@ -94,6 +106,11 @@ class FakeClient:
         self.metadata_updates = []
         self.tags = []
         self.untags = []
+
+    def item_search(self, context_filter="", item_name_filter="", kind_filter="", include_deprecated=False):
+        return [it for it in self._graph.items
+                if it.project == context_filter and it.kind == kind_filter
+                and (include_deprecated or not it.deprecated)]
 
     def update_revision_metadata(self, kref, metadata):
         rev = self._graph.rev_by_uri(kref.uri)
@@ -967,3 +984,106 @@ def _stub_summarizer():
             return '{"merges": []}'
 
     return types.SimpleNamespace(adapter=_Adapter(), model="stub")
+
+
+# ---------------------------------------------------------------------------
+# Resume of a deferred (truncated) grounding ripple (kumiho-memory#27)
+# ---------------------------------------------------------------------------
+
+
+def _pending_fact(g, slug, superseding_kref, dep_slugs, cursor):
+    """A fact carrying the durable pending-ripple marker + cursor, with a
+    DEPENDS_ON edge from each dependent decision (the state a write-time
+    truncation leaves behind before the process dies)."""
+    fact = g.fact("Mem", slug)
+    fact.get_latest_revision().set_metadata({
+        "grounding_ripple_pending": superseding_kref,
+        "grounding_ripple_cursor": str(cursor),
+    })
+    deps = []
+    for ds in dep_slugs:
+        dec = g.add("Mem", "decision", ds, {"title": ds, "decision": ds})
+        g.link(dec, fact, "DEPENDS_ON")
+        deps.append(dec)
+    return fact, deps
+
+
+def test_maintenance_resumes_a_deferred_ripple_and_clears_the_marker():
+    g = FakeGraph()
+    # The superseding fact is live (so the clear pass, which runs after resume,
+    # keeps the freshly flagged dependents rather than reading it as "gone").
+    sup = g.fact("Mem", "the new belief").get_latest_revision().kref.uri
+    # A write-time ripple stamped the first 2 (cursor=2) then truncated; the
+    # remaining 2 dependents are still unflagged and the fact carries the marker.
+    fact, deps = _pending_fact(g, "old-belief", sup,
+                               ["d0", "d1", "d2", "d3"], cursor=2)
+    deps[0].get_latest_revision().set_metadata({"grounding_stale": "true"})
+    deps[1].get_latest_revision().set_metadata({"grounding_stale": "true"})
+
+    stats = MaintenanceStats()
+    _maintainer(g).run_keyless(stats)
+
+    # The two deferred dependents are now flagged and the marker is cleared.
+    assert deps[2].get_latest_revision().metadata.get("grounding_stale") == "true"
+    assert deps[3].get_latest_revision().metadata.get("grounding_stale") == "true"
+    assert stats.ripple_dependents_resumed == 2
+    assert stats.ripples_still_pending == 0
+    assert fact.get_latest_revision().metadata.get("grounding_ripple_pending", "") == ""
+
+
+def test_maintenance_dry_run_leaves_pending_ripple_but_counts_it():
+    g = FakeGraph()
+    fact, deps = _pending_fact(g, "old-belief", "kref://Mem/facts/new.fact?r=1",
+                               ["d0", "d1"], cursor=0)
+    stats = MaintenanceStats()
+    _maintainer(g, dry_run=True).run_keyless(stats)
+    assert stats.ripples_still_pending == 1
+    assert stats.ripple_dependents_resumed == 0
+    assert fact.get_latest_revision().metadata["grounding_ripple_pending"]  # untouched
+
+
+def test_maintenance_ignores_facts_without_a_pending_marker():
+    g = FakeGraph()
+    g.fact("Mem", "settled belief")  # no pending marker
+    stats = MaintenanceStats()
+    _maintainer(g).run_keyless(stats)
+    assert stats.ripple_dependents_resumed == 0
+    assert stats.ripples_still_pending == 0
+
+
+@pytest.mark.parametrize("project,kind", [("Mem", "decision"), ("Code", "code_decision")])
+def test_pending_decision_ripple_is_discovered(project, kind):
+    g = FakeGraph()
+    source = g.add(project, kind, "old", {"grounding_ripple_pending": f"kref://{project}/facts/new.fact?r=1"})
+    dependent = g.add(project, "decision", "dependent", {})
+    g.link(dependent, source, "DEPENDS_ON")
+    stats = MaintenanceStats()
+    GraphMaintainer(g.sdk(), project="Mem", code_project="Code")._resume_pending_ripples(stats)
+    assert dependent.get_latest_revision().metadata.get("grounding_stale") == "true"
+    assert not source.get_latest_revision().metadata["grounding_ripple_pending"]
+
+
+def test_pending_historical_revision_survives_item_deprecation():
+    g = FakeGraph()
+    fact, deps = _pending_fact(g, "old", "kref://Mem/facts/new.fact?r=1", ["d"], 0)
+    old = fact.get_latest_revision()
+    latest = FakeRev(g, fact, fact.kref.uri + "?r=2", {})
+    fact._rev = latest
+    fact.deprecated = True
+    fact.get_revisions = lambda: [old, latest]
+    stats = MaintenanceStats()
+    _maintainer(g)._resume_pending_ripples(stats)
+    assert deps[0].get_latest_revision().metadata.get("grounding_stale") == "true"
+    assert not old.metadata["grounding_ripple_pending"]
+    assert latest.metadata == {}
+
+
+def test_pending_scan_limit_is_reported_as_incomplete(monkeypatch):
+    import kumiho_memory.graph_maintenance as maintenance
+    g = FakeGraph()
+    g.fact("Mem", "first")
+    g.fact("Mem", "second")
+    monkeypatch.setattr(maintenance, "_MAX_DEDUP_NODES", 1)
+    stats = MaintenanceStats()
+    _maintainer(g)._resume_pending_ripples(stats)
+    assert any("scan incomplete" in error for error in stats.errors)

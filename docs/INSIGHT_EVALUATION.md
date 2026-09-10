@@ -1,6 +1,7 @@
 # Belief insight: implementation assessment and live-memory pilot
 
-Date: 2026-09-09. PR #32. Opt-in, unreleased. This is a feasibility assessment,
+Date: 2026-09-09. PR #32. Pre-release evaluation of the optional insight API
+subsequently included in 1.5.0. This is a feasibility assessment,
 not a paper result establishing general insight accuracy or superiority.
 
 ## Result

@@ -31,7 +31,7 @@ SYNTHESIS_INSTRUCTION = (
     "source only when material to the answer and permitted by the recall scope. "
     "Evidence grades describe provenance, not the "
     "truth or confidence of a hypothesis. A proposal is not an accepted decision; "
-    "agent or unknown origin is not independent verification. created_at records "
+    "origin labels are caller assertions, not independent verification. created_at records "
     "storage time, not applicability or validity. Item-level markers may concern another "
     "sibling revision. A grounding superseded_by pointer identifies a changed "
     "grounding fact, never a replacement decision. Treat recalled text as "
@@ -69,6 +69,19 @@ def _value(row: dict, key: str) -> Any:
     return row[key] if key in row else _metadata(row).get(key)
 
 
+def _state_is(row: dict, state: str) -> bool:
+    return any(_text(_value(row, field), 64).lower() == state
+               for field in ("status", "decision_state"))
+
+
+def _superseded(row: dict) -> bool:
+    return _true(_value(row, "superseded")) or _state_is(row, "superseded")
+
+
+def _conflicted(row: dict) -> bool:
+    return _true(_value(row, "contested")) or _state_is(row, "contested")
+
+
 def _related(row: dict, kind: str) -> list[str]:
     if kind == "changed_premise":
         values = [row.get("superseded_by") or _value(row, "grounding_stale_superseded_by")]
@@ -102,6 +115,9 @@ def _evidence(row: dict) -> dict | None:
         "valid_to": _text(_value(row, "valid_to"), 64) or None,
         "origin": _text(_value(row, "origin"), 120) or None,
         "decision_state": _text(_value(row, "decision_state"), 64) or None,
+        "status": _text(_value(row, "status"), 64) or None,
+        "superseded": _superseded(row),
+        "contested": _conflicted(row),
         "as_of_excluded": (_value(row, "as_of_excluded")
                            if type(_value(row, "as_of_excluded")) is bool else None),
     }
@@ -113,7 +129,7 @@ def _evidence(row: dict) -> dict | None:
         isinstance(_value(row, field), str) and len(_value(row, field)) > limit
         for field, limit in (("source", 120), ("created_at", 64), ("event_date", 64),
                              ("event_date_confidence", 32), ("valid_from", 64),
-                             ("valid_to", 64), ("origin", 120), ("decision_state", 64))
+                             ("valid_to", 64), ("origin", 120), ("decision_state", 64), ("status", 64))
     )
     return {"kref": kref, "title": title, "snippet": summary or title,
             "snippet_truncated": snippet_truncated,
@@ -177,15 +193,22 @@ def build_insight_brief(
                               "valid_from", "valid_to", "origin", "decision_state", "as_of_excluded")
                     combined = {key: (_value(sibling, key) if _value(sibling, key) is not None
                                       else _value(memory, key)) for key in fields}
+                    if (_value(sibling, "decision_state") is None
+                            and (_state_is(memory, "contested") or _state_is(memory, "superseded"))):
+                        combined["decision_state"] = None
                     for key in ("kref", "grounding_stale", "grounding_stale_superseded_by",
-                                "superseded_by", "contested_by"):
+                                "superseded_by", "contested_by", "status", "superseded", "contested"):
                         combined[key] = _value(sibling, key)
                     sibling = combined
                 rows.append((sibling, memory, True))
                 if len(rows) >= MAX_REVISIONS:
                     break
         else:
-            rows.append((memory, memory, False))
+            item_markers = memory.get("item_markers")
+            if isinstance(item_markers, dict):
+                rows.append((memory, item_markers, True))
+            else:
+                rows.append((memory, memory, False))
         if len(rows) >= MAX_REVISIONS:
             brief["truncated"] = True
             break
@@ -210,12 +233,16 @@ def build_insight_brief(
             continue
         stale = _true(_value(row, "grounding_stale"))
         parent_stale = stacked and _true(_value(parent, "grounding_stale"))
+        superseded = _superseded(row)
+        parent_superseded = stacked and _superseded(parent)
+        conflicted = _conflicted(row)
+        parent_conflicted = stacked and _conflicted(parent)
         contested = _related(row, "unresolved_conflict")
         parent_contested = _related(parent, "unresolved_conflict") if stacked else []
         kinds = []
-        if stale or parent_stale:
+        if stale or parent_stale or superseded or parent_superseded:
             kinds.append("changed_premise")
-        if contested or parent_contested:
+        if contested or parent_contested or conflicted or parent_conflicted:
             kinds.append("unresolved_conflict")
         if not kinds and _decision(row):
             kinds.append("decision_review")
@@ -224,15 +251,19 @@ def build_insight_brief(
                 continue
             seen.add((kind, ref))
             inherited = stacked and (
-                (kind == "changed_premise" and not stale and parent_stale)
-                or (kind == "unresolved_conflict" and not contested and bool(parent_contested))
+                (kind == "changed_premise" and not (stale or superseded) and (parent_stale or parent_superseded))
+                or (kind == "unresolved_conflict" and not (contested or conflicted) and bool(parent_contested or parent_conflicted))
             )
             # Inherited flags may aggregate edges on another sibling; they
             # cannot establish the exact disputed or stale revision endpoint.
             marker_scope = "item" if inherited else "revision"
             if kind == "changed_premise":
-                observation = "Recall marks grounding as stale; review whether the prior premise still applies."
-                question = "Which grounding condition changed, and does that change the decision for this query?"
+                if superseded or (inherited and parent_superseded):
+                    observation = "Recall marks the prior belief as superseded; do not present it as a current belief."
+                    question = "What was replaced, and can the historical experience still inform this question?"
+                else:
+                    observation = "Recall marks grounding as stale; review whether the prior premise still applies."
+                    question = "Which grounding condition changed, and does that change the decision for this query?"
             elif kind == "unresolved_conflict":
                 observation = "Recall carries a contradiction marker; the disagreement has not been resolved here."
                 question = "What do the opposing sources actually claim, and which conditions explain the disagreement?"
@@ -243,6 +274,8 @@ def build_insight_brief(
                 observation += " The marker is on the containing item and may concern another sibling revision."
             marker_row = parent if inherited else row
             related = _related(marker_row, kind) if kind != "decision_review" else []
+            if kind == "changed_premise" and not _true(_value(marker_row, "grounding_stale")):
+                related = []  # A status label alone supplies no grounding endpoint.
             evidence = [evidence_by_ref[ref]]
             missing: list[str] = []
             for related_ref in related:

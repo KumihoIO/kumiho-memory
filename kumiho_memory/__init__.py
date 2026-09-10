@@ -1,6 +1,6 @@
 """Kumiho Memory - Universal memory provider for AI agents."""
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 from kumiho_memory._request_context import (
     RequestContext,

@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Callable
 
+from .applicability import CLAIM_ORIGINS, DECISION_STATES
+
 
 def _args(args: Any, required: tuple[str, ...], optional: tuple[str, ...] = ()) -> dict:
     if not isinstance(args, dict) or set(args) - set(required + optional):
@@ -130,7 +132,7 @@ def _object(properties, required=()):
     return {"type": "object", "properties": properties, "required": list(required), "additionalProperties": False}
 
 
-ORIGIN = _text(enum=["user", "agent", "external", "unknown"])
+ORIGIN = _text(enum=list(CLAIM_ORIGINS))
 OBSERVATION_FIELDS = {
     "observed_outcome": _text(), "observed_at": _text(64, description="Actual observation time, ISO timestamp with timezone; never infer from recording time."),
     "outcome_status": _text(enum=["success", "failure", "mixed", "unknown"]),
@@ -141,7 +143,7 @@ EXPERIENCE_FIELDS = {
     "title": _text(160), "situation": _text(), "goal": _text(), "decision": _text(),
     "rationale": _text(), "expected_outcome": _text(), "alternatives": _strings(),
     "applicability_conditions": _strings(), "origin": ORIGIN,
-    "decision_state": _text(enum=["proposed", "accepted", "rejected", "unknown"]),
+    "decision_state": _text(enum=list(DECISION_STATES)),
     "source_krefs": _strings(item_limit=512), **OBSERVATION_FIELDS,
 }
 EXPERIENCE_SCHEMA = _object(EXPERIENCE_FIELDS, ("experience_id", "title", "situation", "goal", "decision", "rationale", "expected_outcome"))

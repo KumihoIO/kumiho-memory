@@ -14,6 +14,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from .applicability import CLAIM_ORIGINS, DECISION_STATES
+
 from ._request_context import current_request, is_hosted
 from .privacy import PIIRedactor
 
@@ -130,8 +132,8 @@ def normalize_experience(record: dict) -> dict:
     for key in ("alternatives", "applicability_conditions"):
         result[key] = _texts(record.get(key, []), key)
     result["decision_state"] = _enum(record.get("decision_state", "unknown"), "decision_state",
-                                     ("proposed", "accepted", "rejected", "unknown"))
-    result["origin"] = _enum(record.get("origin", "unknown"), "origin", ("user", "agent", "external", "unknown"))
+                                     DECISION_STATES)
+    result["origin"] = _enum(record.get("origin", "unknown"), "origin", CLAIM_ORIGINS)
     result["source_krefs"] = _refs(record.get("source_krefs", []))
     result.update(_observation(record, required=False))
     return _finish(result)
@@ -232,7 +234,7 @@ async def validate_source_refs(manager: Any, refs: list[str], *, space_paths: li
                 raise ValueError("Invalid item metadata")
             markers = {}
             for key in ("grounding_stale", "grounding_stale_superseded_by", "contested_by",
-                        "superseded_by", "decision_state", "as_of_excluded", "tags", "deprecated"):
+                        "superseded_by", "status", "superseded", "contested", "decision_state", "as_of_excluded", "tags", "deprecated"):
                 if key not in item_meta:
                     continue
                 value = item_meta[key]
@@ -293,7 +295,7 @@ def _normalize_outcome(experience_kref: str, outcome: dict) -> dict:
         raise ValueError("Unknown outcome fields")
     return _finish({"schema": SCHEMA, "record_type": "outcome", "experience_kref": experience_kref,
                     **_observation(outcome, required=True),
-                    "origin": _enum(outcome.get("origin", "unknown"), "origin", ("user", "agent", "external", "unknown")),
+                    "origin": _enum(outcome.get("origin", "unknown"), "origin", CLAIM_ORIGINS),
                     "source_krefs": _refs(outcome.get("source_krefs", []))})
 
 
@@ -312,7 +314,7 @@ async def _store(manager: Any, record: dict, space: str) -> dict:
                             "origin": record["origin"], "evidence_level": "unverified",
                             "decision_state": record.get("decision_state", "unknown")},
                "source_revision_krefs": refs, "edge_type": "DERIVED_FROM",
-               "tags": ["experience", "evidence:unverified"] + (["proposal"] if record.get("decision_state") == "proposed" else []), "stack_revisions": False}
+               "tags": ["experience", "evidence:unverified"] + (["proposal"] if record.get("decision_state") in ("proposal", "proposed") else []), "stack_revisions": False}
     result = await asyncio.to_thread(manager.memory_store, **payload)
     if inspect.isawaitable(result):
         result = await result

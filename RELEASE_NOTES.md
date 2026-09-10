@@ -1,16 +1,70 @@
 # Release Notes — kumiho-memory
 
-## Unreleased
+## v1.5.0
 
-- Add opt-in belief-grounded insight synthesis packets to engage, with exact
-  source references, conditional hypotheses and structural response validation.
-  Optional learned-source discovery includes saved experiences and pattern proposals.
-- Add keyless explicit experience/outcome capture and Dream State pattern
-  prepare/store/check tools. Proposals remain unverified; current revision/item
-  state checks surface stale or missing premises without automatic publishing.
-- Include a paired live-memory feasibility report and a second-paper research
-  outline. The small host pilot does not establish general insight improvement.
-  See [workflow](docs/BELIEF_INSIGHT_PLAN.md) and [evaluation](docs/INSIGHT_EVALUATION.md).
+**Release Date:** 2026-09-10
+
+**Revision-aware insight and experience learning, with retryable belief recovery.**
+
+Combines PR #29, #30, #31, and #32. Versions 1.4.2–1.4.4 were integration
+versions and were not published to PyPI; all changes ship together here.
+
+### Belief replacement and recall
+
+- Deterministic operation identity, project-scope validation, bounded cycle
+  checks, and a post-write reverse check report detected conflicts and withhold
+  demotion when verification fails. Results distinguish errors, pending repair,
+  and foreground completion.
+- Grounding invalidation records pending work before dependent writes. Its
+  cursor tracks a successful prefix of a sorted dependency snapshot; changed
+  membership and read/write failures cannot silently skip an unfinished target.
+  Progress-write failures reach the caller. Maintenance can resume historical
+  fact, decision, and code-decision revisions within explicit scan caps, with
+  incomplete discovery reported. SDK enumeration remains unpaginated.
+- Recall carries superseded, contested, grounding-stale, valid-time, reported
+  origin, and decision-acceptance qualifications through bounded context.
+  Reflect exposes supported origin and decision-state enums in its MCP schema.
+  Reported origin and acceptance labels do not authenticate their author.
+- See [recovery contract](docs/BELIEF_REVISION_CONCURRENCY.md) and
+  [recall applicability](docs/RECALL_APPLICABILITY_AUDIT.md).
+
+### Insight and experience lifecycle
+
+- `engage(include_insights=true)` returns a bounded insight brief and sanitized
+  synthesis request from the existing filtered recall. The answering host
+  produces the insight; the memory layer adds no synthesis model call.
+  `include_learned_sources=true` separately enables bounded searches for stored
+  experiences and pattern candidates plus current-source checks.
+- Six explicit MCP tools record experiences, append observed outcomes,
+  prepare/store/check pattern candidates, and validate insight response
+  structure and reference membership. Expectations, user acceptance, observed
+  outcomes, event time, and source lineage remain distinct.
+- Integration preserves legacy experience hashes, accepts the compatible
+  proposal/origin vocabulary, and retains exact-revision and item health
+  qualifications through source packets and pattern review.
+- Pattern candidates remain inferred and unverified. Nothing automatically
+  promotes a hypothesis, publishes a belief, or establishes causal success.
+  See [workflow and bounds](docs/BELIEF_INSIGHT_PLAN.md).
+
+### Evaluation and limits
+
+- Deterministic cross-session continuity tests cover corrections, unsettled
+  proposals, conflicts, changed grounding, temporal queries, and scope isolation
+  across sessions/restarts. These measure protocol behavior, not model quality.
+- The eight-question live-memory pilot found two usefulness wins and six ties
+  with matched source packets. It is a small same-host-family feasibility
+  demonstration, not independent evidence of general insight improvement.
+  See [pilot and error analysis](docs/INSIGHT_EVALUATION.md) and
+  [research outline](docs/INSIGHT_RESEARCH_OUTLINE.md).
+- Structural citation validation does not prove semantic support. Source checks
+  inspect available explicit markers, not complete graph-wide dependency state.
+  Client-side belief revision is not a distributed transaction and does not
+  guarantee cross-process uniqueness, exactly-once, or complete conflict
+  detection. Lifecycle stores/edges remain best effort; retries may duplicate
+  records. Direct ripple progress persistence errors now propagate for retry.
+- CI covers package/import and all non-live regressions on Python 3.10, 3.11,
+  and 3.12. Companion adaptive host guidance is tracked separately in
+  [kumiho-plugins PR #100](https://github.com/KumihoIO/kumiho-plugins/pull/100).
 
 ## v1.4.1
 

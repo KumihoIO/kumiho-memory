@@ -106,6 +106,8 @@ def _marker_flags(row: dict) -> dict:
     def flagged(value: Any) -> bool:
         return value is True or (isinstance(value, str) and value.lower() == "true")
 
+    state = str(_meta(row, "decision_state") or "").strip().lower()
+    status = str(_meta(row, "status") or "").strip().lower()
     stale = _meta(row, "grounding_stale")
     contested = _meta(row, "contested_by")
     if isinstance(contested, str) and len(contested) <= 4096:
@@ -116,9 +118,10 @@ def _marker_flags(row: dict) -> dict:
     tags = row.get("tags") if isinstance(row.get("tags"), list) else []
     return {
         "grounding_stale": flagged(stale),
-        "contested": isinstance(contested, list) and bool(contested),
+        "contested": (isinstance(contested, list) and bool(contested))
+                     or flagged(_meta(row, "contested")) or state == "contested" or status == "contested",
         "superseded": bool(_meta(row, "superseded_by"))
-                      or _meta(row, "decision_state") == "superseded"
+                      or flagged(_meta(row, "superseded")) or state == "superseded" or status == "superseded"
                       or flagged(_meta(row, "deprecated"))
                       or flagged(row.get("revision_deprecated"))
                       or any(tag in ("superseded", "deprecated") for tag in tags[:30]),

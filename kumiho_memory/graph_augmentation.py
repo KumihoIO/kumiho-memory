@@ -28,7 +28,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Union
 
 from kumiho_memory._bounded import run_bounded_in_thread, start_context_thread
+from kumiho_memory.applicability import apply_applicability_marker
 from kumiho_memory.grounding import apply_grounding_marker
+from kumiho_memory.supersession import apply_supersession_marker
 from kumiho_memory.valid_time import apply_valid_interval_marker
 from kumiho_memory.summarization import (
     LLMAdapter,
@@ -1455,7 +1457,7 @@ class GraphAugmentedRecall:
                     continue
                 meta = getattr(rev, "metadata", {}) or {}
                 known.add(kref)
-                results.append({
+                fact_entry = {
                     "kref": kref,
                     "title": meta.get("title", ""),
                     "summary": meta.get("summary", "") or meta.get("claim", ""),
@@ -1464,7 +1466,16 @@ class GraphAugmentedRecall:
                     "graph_augmented": True,
                     "fact_recall": True,
                     "hop": 1,
-                })
+                }
+                # The same additive qualifiers a conversation entry carries
+                # (memory_manager._fetch_revision_metadata): a typed fact that
+                # was superseded, ripple-flagged, or bounded in valid time must
+                # not surface here as an unqualified current claim (#26).
+                apply_grounding_marker(fact_entry, meta)
+                apply_supersession_marker(fact_entry, meta)
+                apply_valid_interval_marker(fact_entry, meta)
+                apply_applicability_marker(fact_entry, meta)
+                results.append(fact_entry)
                 found += 1
             return found
 

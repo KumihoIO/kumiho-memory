@@ -168,8 +168,15 @@ def test_item_level_stale_warning_survives_synthesis_whitelist(monkeypatch):
     from kumiho_memory.insight_synthesis import prepare_insight_request
     request = prepare_insight_request('pilot', result['results'])
     recalled = next(row for row in request['sources'] if row['type'] == 'pattern_candidate')
-    assert recalled['grounding_stale'] is True
-    assert json.loads(recalled['summary'])['source_health'] == 'stale'
+    assert not recalled.get('grounding_stale')
+    summary = json.loads(recalled['summary'])
+    assert summary['source_health'] == 'stale'
+    assert summary['source_health_details']['stale_sources'] == [
+        {'kref': first['kref'], 'reason': 'grounding_stale', 'marker_scope': 'item'}]
+    # The warning is on the pattern's source item, not the pattern revision.
+    own = next(row for row in request['sources'] if row['type'] == 'experience')
+    assert own['item_markers']['grounding_stale'] is True
+    assert not own.get('grounding_stale')
 
 
 def test_missing_item_state_cannot_become_reviewable_in_synthesis(monkeypatch):

@@ -13,6 +13,7 @@ import math
 import re
 from typing import Any
 
+from .applicability import normalize_decision_state
 from .experience import (
     _refs, _scope_guard, experience_from_memory, sanitize_atoms, scoped_space,
     validate_source_refs,
@@ -197,6 +198,7 @@ async def recall_learned_sources(
             # Health is also in prose: a downstream whitelist must not silently
             # strip the only warning that a recalled proposal is stale/unknown.
             summary = json.dumps({"source_health": health["status"], "applicability": "unknown",
+                                  "source_health_details": health,
                                   "view_truncated": truncated, "record": view},
                                  ensure_ascii=False, separators=(",", ":"))
             packet = {"kref": ref, "title": view.get("title") or "Outcome observation",
@@ -208,8 +210,21 @@ async def recall_learned_sources(
                       "outcome": view.get("observed_outcome", "")}
             if discovered_scores.get(ref) is not None:
                 packet["score"] = discovered_scores[ref]
-            if health["status"] == "stale":
-                packet["grounding_stale"] = True
+            # Current state is separate from the immutable experience snapshot.
+            # An item warning never becomes revision provenance, and a stale
+            # source does not establish that this record's grounding changed.
+            current_state = normalize_decision_state(row.get("metadata", {}).get("decision_state"))
+            if current_state != "unknown":
+                packet["decision_state"] = current_state
+            for warning in own_health.get("stale_sources", []):
+                key = warning["reason"]
+                if key not in ("grounding_stale", "contested", "superseded", "as_of_excluded"):
+                    continue
+                scope = warning.get("marker_scope")
+                if scope in ("revision", "both"):
+                    packet[key] = True
+                if scope in ("item", "both"):
+                    packet.setdefault("item_markers", {})[key] = True
             if len(json.dumps({**result, "results": result["results"] + [packet]}, ensure_ascii=False)) > MAX_RESULT_CHARS:
                 errors.append("Learned source output budget exhausted")
                 break

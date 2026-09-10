@@ -24,7 +24,7 @@ _FIELDS = (
     "source", "origin", "decision_state", "created_at", "event_date",
     "event_date_confidence", "valid_from", "valid_to", "as_of_excluded",
     "grounding_stale", "grounding_stale_superseded_by", "superseded_by",
-    "contested_by", "tags", "outcome", "conditions",
+    "contested_by", "status", "superseded", "contested", "tags", "outcome", "conditions",
 )
 _CONTRACT = {
     "mode": "hypothesis | direct | clarify",
@@ -54,7 +54,7 @@ _INSIGHT_INSTRUCTION = (
     "A rule-based review brief is only a lead, never a gate: no candidates does not "
     "mean source facts/corrections lack relevance. Distinguish proposals from accepted "
     "decisions and unknown outcomes from success. Duplicates are not independent "
-    "corroboration. Storage time is not event time. Current explicit preferences take "
+    "corroboration. Origin labels are caller assertions, not authentication. Storage time is not event time. Current explicit preferences take "
     "precedence over older preferences. A hypothesis needs applicability conditions, "
     "an alternative explanation, and a verification step. Do not invent causal links, "
     "force insight, or promote hypotheses into stored facts."
@@ -148,9 +148,12 @@ def prepare_insight_request(
                 value = _value(row, field)
                 # Only the exact same pinned revision may fill absent prose/provenance.
                 if value is None and row is not parent and ref == parent.get("kref") and field not in (
-                    "grounding_stale", "grounding_stale_superseded_by", "superseded_by", "contested_by"
+                    "grounding_stale", "grounding_stale_superseded_by", "superseded_by", "contested_by",
+                    "status", "superseded", "contested"
                 ):
-                    value = _value(parent, field)
+                    inherited_value = _value(parent, field)
+                    if field != "decision_state" or str(inherited_value or "").strip().lower() not in ("contested", "superseded"):
+                        value = inherited_value
                 if value is not None:
                     packet[field] = _bounded(clean(value))
                     if packet[field] != value:
@@ -159,10 +162,22 @@ def prepare_insight_request(
                 continue
             if row is not parent:
                 markers = {field: _bounded(clean(_value(parent, field))) for field in (
-                    "grounding_stale", "grounding_stale_superseded_by", "superseded_by", "contested_by"
+                    "grounding_stale", "grounding_stale_superseded_by", "superseded_by", "contested_by",
+                    "status", "superseded", "contested", "decision_state"
                 ) if _value(parent, field) is not None}
                 if markers:
                     packet["item_markers"] = markers
+            # Explicit item markers from canonical learned-source validation
+            # remain separate from this pinned revision's provenance.
+            declared_item = parent.get("item_markers")
+            if isinstance(declared_item, dict):
+                markers = {field: _bounded(clean(declared_item[field])) for field in (
+                    "grounding_stale", "grounding_stale_superseded_by", "superseded_by",
+                    "contested_by", "status", "superseded", "contested", "decision_state",
+                    "as_of_excluded", "deprecated",
+                ) if field in declared_item}
+                if markers:
+                    packet["item_markers"] = {**packet.get("item_markers", {}), **markers}
             packet["truncated_fields"] = truncated
             # Trim prose to fit, preserving an explicit truncation receipt. Metadata
             # that cannot fit is omitted with the entire packet, never silently cut.
