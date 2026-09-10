@@ -1,0 +1,447 @@
+{
+  "schema_version": 1,
+  "cases": 8,
+  "scored_pairs": 8,
+  "source_parity_failures": 0,
+  "quality_basis": "externally supplied blinded independent rubric labels; independence is asserted by caller, not verified",
+  "limitations": [
+    "Descriptive convenience-sample comparison, not a benchmark or causal estimate.",
+    "Citation membership validation does not verify semantic support.",
+    "Same captured source text and source budget; enriched guidance has additional overhead.",
+    "Mode-label agreement is only a hypothesis-vs-direct/clarify format proxy, not correct abstention or usefulness; direct answers can contain useful insight.",
+    "No model calls, keyword quality scoring, or semantic grading are performed by this script."
+  ],
+  "mean_guidance_overhead_chars": 2938.25,
+  "arms": {
+    "baseline": {
+      "structurally_valid": 8,
+      "unsupported_reference_occurrences": 0,
+      "mean_usefulness": 3.75,
+      "mean_grounding": 3.875,
+      "unsupported_claims_reviewed": 0,
+      "mode_label_agreement": 0.875
+    },
+    "insight": {
+      "structurally_valid": 8,
+      "unsupported_reference_occurrences": 0,
+      "mean_usefulness": 4,
+      "mean_grounding": 4,
+      "unsupported_claims_reviewed": 0,
+      "mode_label_agreement": 1
+    }
+  },
+  "paired": {
+    "usefulness": {
+      "wins": 2,
+      "ties": 6,
+      "regressions": 0,
+      "mean_delta": 0.25
+    },
+    "grounding": {
+      "wins": 1,
+      "ties": 7,
+      "regressions": 0,
+      "mean_delta": 0.125
+    }
+  },
+  "results": [
+    {
+      "id": "R1",
+      "source_parity": true,
+      "scored": true,
+      "validation": {
+        "baseline": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        },
+        "insight": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        }
+      },
+      "request_chars": {
+        "baseline": 8062,
+        "insight": 11340
+      },
+      "guidance_overhead_chars": 3278,
+      "response_chars": {
+        "baseline": 1369,
+        "insight": 1655
+      },
+      "scores": {
+        "baseline": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        },
+        "insight": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        }
+      },
+      "usefulness_delta": 0,
+      "grounding_delta": 0,
+      "non_hypothesis_mode_matches_label": {
+        "baseline": true,
+        "insight": true
+      }
+    },
+    {
+      "id": "R2",
+      "source_parity": true,
+      "scored": true,
+      "validation": {
+        "baseline": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        },
+        "insight": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        }
+      },
+      "request_chars": {
+        "baseline": 7044,
+        "insight": 11657
+      },
+      "guidance_overhead_chars": 4613,
+      "response_chars": {
+        "baseline": 548,
+        "insight": 682
+      },
+      "scores": {
+        "baseline": {
+          "usefulness": 3,
+          "grounding": 3,
+          "unsupported_claims": 0
+        },
+        "insight": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        }
+      },
+      "usefulness_delta": 1,
+      "grounding_delta": 1,
+      "non_hypothesis_mode_matches_label": {
+        "baseline": true,
+        "insight": true
+      }
+    },
+    {
+      "id": "R3",
+      "source_parity": true,
+      "scored": true,
+      "validation": {
+        "baseline": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        },
+        "insight": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        }
+      },
+      "request_chars": {
+        "baseline": 6576,
+        "insight": 8520
+      },
+      "guidance_overhead_chars": 1944,
+      "response_chars": {
+        "baseline": 408,
+        "insight": 1285
+      },
+      "scores": {
+        "baseline": {
+          "usefulness": 3,
+          "grounding": 4,
+          "unsupported_claims": 0
+        },
+        "insight": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        }
+      },
+      "usefulness_delta": 1,
+      "grounding_delta": 0,
+      "non_hypothesis_mode_matches_label": {
+        "baseline": false,
+        "insight": true
+      }
+    },
+    {
+      "id": "R4",
+      "source_parity": true,
+      "scored": true,
+      "validation": {
+        "baseline": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        },
+        "insight": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        }
+      },
+      "request_chars": {
+        "baseline": 6354,
+        "insight": 9591
+      },
+      "guidance_overhead_chars": 3237,
+      "response_chars": {
+        "baseline": 342,
+        "insight": 648
+      },
+      "scores": {
+        "baseline": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        },
+        "insight": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        }
+      },
+      "usefulness_delta": 0,
+      "grounding_delta": 0,
+      "non_hypothesis_mode_matches_label": {
+        "baseline": true,
+        "insight": true
+      }
+    },
+    {
+      "id": "R5",
+      "source_parity": true,
+      "scored": true,
+      "validation": {
+        "baseline": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        },
+        "insight": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        }
+      },
+      "request_chars": {
+        "baseline": 7750,
+        "insight": 9703
+      },
+      "guidance_overhead_chars": 1953,
+      "response_chars": {
+        "baseline": 600,
+        "insight": 724
+      },
+      "scores": {
+        "baseline": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        },
+        "insight": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        }
+      },
+      "usefulness_delta": 0,
+      "grounding_delta": 0,
+      "non_hypothesis_mode_matches_label": {
+        "baseline": true,
+        "insight": true
+      }
+    },
+    {
+      "id": "R6",
+      "source_parity": true,
+      "scored": true,
+      "validation": {
+        "baseline": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        },
+        "insight": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        }
+      },
+      "request_chars": {
+        "baseline": 7400,
+        "insight": 10691
+      },
+      "guidance_overhead_chars": 3291,
+      "response_chars": {
+        "baseline": 506,
+        "insight": 667
+      },
+      "scores": {
+        "baseline": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        },
+        "insight": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        }
+      },
+      "usefulness_delta": 0,
+      "grounding_delta": 0,
+      "non_hypothesis_mode_matches_label": {
+        "baseline": true,
+        "insight": true
+      }
+    },
+    {
+      "id": "R7",
+      "source_parity": true,
+      "scored": true,
+      "validation": {
+        "baseline": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        },
+        "insight": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        }
+      },
+      "request_chars": {
+        "baseline": 7422,
+        "insight": 9372
+      },
+      "guidance_overhead_chars": 1950,
+      "response_chars": {
+        "baseline": 562,
+        "insight": 708
+      },
+      "scores": {
+        "baseline": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        },
+        "insight": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        }
+      },
+      "usefulness_delta": 0,
+      "grounding_delta": 0,
+      "non_hypothesis_mode_matches_label": {
+        "baseline": true,
+        "insight": true
+      }
+    },
+    {
+      "id": "R8",
+      "source_parity": true,
+      "scored": true,
+      "validation": {
+        "baseline": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        },
+        "insight": {
+          "valid": true,
+          "errors": [],
+          "unsupported_source_krefs": [],
+          "validation_scope": "structural_only",
+          "semantic_support_verified": false
+        }
+      },
+      "request_chars": {
+        "baseline": 11475,
+        "insight": 14715
+      },
+      "guidance_overhead_chars": 3240,
+      "response_chars": {
+        "baseline": 68,
+        "insight": 67
+      },
+      "scores": {
+        "baseline": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        },
+        "insight": {
+          "usefulness": 4,
+          "grounding": 4,
+          "unsupported_claims": 0
+        }
+      },
+      "usefulness_delta": 0,
+      "grounding_delta": 0,
+      "non_hypothesis_mode_matches_label": {
+        "baseline": true,
+        "insight": true
+      }
+    }
+  ],
+  "generation_protocol": {
+    "sample": "8 purposive live-memory questions, one capture per arm",
+    "generators": "implementation-aware current host agents; baseline=root, insight=separate agent; exact model/version/decoding unavailable",
+    "reviewer": "separate implementation-aware same-host-family agent; did not generate responses; randomized arm mapping hidden; no human review",
+    "cost": "host reasoning latency, tokens and provider cost not measured",
+    "causal_inference": false
+  },
+  "preparation_timing": {
+    "samples": 160,
+    "median_ms": 4.086,
+    "p95_ms": 8.896,
+    "mean_recall_ms": 247.8,
+    "note": "Local Python preparation only,20 passes over8 fixed recall packets; not host reasoning or graph latency."
+  }
+}

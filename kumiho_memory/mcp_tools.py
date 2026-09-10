@@ -1218,6 +1218,8 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
     Returns pre-built context, raw results, and source krefs for linking.
     Shares the recall deduplication guard with ``tool_memory_recall``.
     """
+    if args.get("include_learned_sources") is True and args.get("include_insights") is not True:
+        raise ValueError("include_learned_sources=true requires include_insights=true")
     scope = _recall_scope(args)
     with _recall_guard_lock(scope):
         now = time.monotonic()
@@ -1249,6 +1251,34 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
         context = manager.build_recalled_context(
             results, args["query"], recall_mode
         )
+        # Build from the same scoped recall before summarized mode drops
+        # sibling prose. The brief alone adds no retrieval; learned-source
+        # discovery requires its own flag. Existing context stays unchanged.
+        synthesis_request = None
+        learned_status = None
+        if args.get("include_insights") is True:
+            from kumiho_memory.insight_synthesis import prepare_insight_request
+
+            synthesis_sources = results
+            retrieval_complete = not bool(getattr(manager, "_last_backend_error", None))
+            if args.get("include_learned_sources") is True:
+                from kumiho_memory.insight_recall import recall_learned_sources
+
+                learned = asyncio.run(recall_learned_sources(
+                    manager, args["query"], space_paths=args.get("space_paths"),
+                    memory_types=args.get("memory_types"), min_score=_min_score_from_args(args),
+                ))
+                synthesis_sources = [*learned["results"], *results]
+                learned_status = {key: value for key, value in learned.items() if key != "results"}
+                learned_status["source_krefs"] = [row["kref"] for row in learned["results"]]
+                retrieval_complete = retrieval_complete and learned["status"] in ("ready", "no_sources")
+            synthesis_request = prepare_insight_request(
+                args["query"], synthesis_sources,
+                current_context=args.get("current_context", ""),
+                goals=args.get("goals"),
+                retrieval_complete=retrieval_complete,
+                redactor=getattr(manager, "pii_redactor", None),
+            )
         source_krefs = [m["kref"] for m in results if m.get("kref")]
         _drop_sibling_prose(results, recall_mode)
 
@@ -1267,6 +1297,11 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
             # size the assembled context without a tokenizer.
             "approx_tokens": approx_tokens(context),
         }
+        if synthesis_request is not None:
+            engage_result["insight_brief"] = synthesis_request["review_brief"]
+            engage_result["synthesis_request"] = synthesis_request
+        if learned_status is not None:
+            engage_result["learned_source_status"] = learned_status
         # ``approx_tokens`` sizes the assembled context only; a caller budgeting
         # on it was off by a factor of ~18 (762 reported vs a 56 KB response,
         # measured 2026-07-31). What lands in the caller's context window is the
@@ -1967,7 +2002,19 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
             "building into one call. Returns pre-built context string, "
             "raw results, and source_krefs for passing to reflect. "
             "Shares the recall deduplication guard — at most one engage "
-            "or recall per response."
+            "or recall per response. Set include_insights=true on that call "
+            "to add a bounded belief insight brief and synthesis_request: source-backed review "
+            "prompts for changed premises, conflicts and prior decisions. "
+            "The brief alone adds no retrieval, LLM calls or writes. These are prompts for "
+            "hypotheses, not established conclusions; the answering agent "
+            "must check applicability and may answer directly without one. Use the "
+            "synthesis_request instructions/output_contract for the host answer, then "
+            "kumiho_memory_validate_insight_response for structural citation checks. "
+            "Also set include_learned_sources=true to discover saved experiences and "
+            "pattern proposals for synthesis: adds two kind-specific searches, at most "
+            "three records and six source-health reads (each revision plus item), "
+            "within space_paths. This extra option requires include_insights=true; "
+            "it leaves the ordinary context/results unchanged and never promotes beliefs."
         ),
         "inputSchema": {
             "type": "object",
@@ -1978,6 +2025,27 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                         "Natural-language search query derived from the "
                         "user's current message."
                     ),
+                },
+                "include_insights": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Add a read-only, bounded belief insight brief from "
+                        "the recalled evidence. No extra retrieval or LLM calls."
+                    ),
+                },
+                "include_learned_sources": {
+                    "type": "boolean", "default": False,
+                    "description": "Also retrieve bounded saved experiences/patterns for synthesis; requires include_insights=true and adds graph reads.",
+                },
+                "current_context": {
+                    "type": "string", "maxLength": 4000,
+                    "description": "Current situation for optional insight synthesis; does not change retrieval.",
+                },
+                "goals": {
+                    "type": "array", "maxItems": 8,
+                    "items": {"type": "string", "maxLength": 500},
+                    "description": "Current goals for optional insight synthesis; does not change retrieval.",
                 },
                 "limit": {
                     "type": "integer",
@@ -2762,3 +2830,9 @@ def _register_ontology_tools() -> None:
 
 
 _register_ontology_tools()
+
+
+# Explicit keyless experience and insight actions; no background/provider work.
+from kumiho_memory.insight_tools import INSIGHT_TOOLS, INSIGHT_TOOL_HANDLERS
+MEMORY_TOOLS.extend(INSIGHT_TOOLS)
+MEMORY_TOOL_HANDLERS.update(INSIGHT_TOOL_HANDLERS)

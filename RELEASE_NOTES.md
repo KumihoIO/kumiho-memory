@@ -1,126 +1,70 @@
 # Release Notes — kumiho-memory
 
-## v1.4.4
+## v1.5.0
 
-**Status:** Unpublished; included in the next consolidated release.
+**Release Date:** 2026-09-10
 
-**Applicability, origin, and uncertainty preserved across recall.**
+**Revision-aware insight and experience learning, with retryable belief recovery.**
 
-Additive changes; no breaking public API. Implements KumihoIO/kumiho-memory#28.
-Stacks on #26 (superseded recall marker + the shared `qualifier_notes` renderer).
-Audit + contract: `docs/RECALL_APPLICABILITY_AUDIT.md`.
+Combines PR #29, #30, #31, and #32. Versions 1.4.2–1.4.4 were integration
+versions and were not published to PyPI; all changes ship together here.
 
-- Two applicability axes are now defined and surfaced (`kumiho_memory.applicability`),
-  separate from the existing provenance grade and self-reported strength:
-  - **claim origin / actor** (`origin`: user / agent / imported / observed /
-    unknown) — an agent asserting a claim is not the same as it being verified;
-    recall flags `origin=agent` as self-asserted, and host-attested origins
-    (user / imported / observed) stay distinguishable.
-  - **decision acceptance state** (`decision_state`: proposal / accepted /
-    contested / superseded / unknown) — a floated proposal is never rendered as
-    an accepted decision, and nothing on the read/consolidate/decompose path
-    promotes it (repetition or self-citation cannot).
-- The axes are stamped on the write path (`tool_memory_reflect` reads and
-  normalises capture-level `origin` / `decision_state`), surfaced additively at
-  recall (`_fetch_revision_metadata`, the graph-augmented fact-recall leg), and
-  rendered by the one shared `context_compose.qualifier_notes`, so both the
-  composed-context and MCP `engage` paths carry them. An absent value reads as
-  unknown; a legacy revision is neither stamped nor rewritten.
-- Every qualifier note (contested, grounding-stale, superseded, proposal,
-  agent-origin) is appended after content truncation and rides on stacked/sibling
-  revisions, so a tight per-section budget or `limit=1` cannot silently drop a
-  material qualification.
-- Provenance-grade separation is unchanged: high self-reported certainty still
-  does not lift `evidence_level`, and the applicability marker never touches it.
-- Deliberate follow-up (documented, not silently defaulted): stamping an origin
-  on agent-decomposed typed facts / consolidated decisions, which would otherwise
-  flag effectively all typed knowledge and drown the signal.
-- Tests: `tests/test_recall_applicability.py`.
+### Belief replacement and recall
 
+- Deterministic operation identity, project-scope validation, bounded cycle
+  checks, and a post-write reverse check report detected conflicts and withhold
+  demotion when verification fails. Results distinguish errors, pending repair,
+  and foreground completion.
+- Grounding invalidation records pending work before dependent writes. Its
+  cursor tracks a successful prefix of a sorted dependency snapshot; changed
+  membership and read/write failures cannot silently skip an unfinished target.
+  Progress-write failures reach the caller. Maintenance can resume historical
+  fact, decision, and code-decision revisions within explicit scan caps, with
+  incomplete discovery reported. SDK enumeration remains unpaginated.
+- Recall carries superseded, contested, grounding-stale, valid-time, reported
+  origin, and decision-acceptance qualifications through bounded context.
+  Reflect exposes supported origin and decision-state enums in its MCP schema.
+  Reported origin and acceptance labels do not authenticate their author.
+- See [recovery contract](docs/BELIEF_REVISION_CONCURRENCY.md) and
+  [recall applicability](docs/RECALL_APPLICABILITY_AUDIT.md).
 
-## v1.4.3
+### Insight and experience lifecycle
 
-**Status:** Unpublished; included in the next consolidated release.
+- `engage(include_insights=true)` returns a bounded insight brief and sanitized
+  synthesis request from the existing filtered recall. The answering host
+  produces the insight; the memory layer adds no synthesis model call.
+  `include_learned_sources=true` separately enables bounded searches for stored
+  experiences and pattern candidates plus current-source checks.
+- Six explicit MCP tools record experiences, append observed outcomes,
+  prepare/store/check pattern candidates, and validate insight response
+  structure and reference membership. Expectations, user acceptance, observed
+  outcomes, event time, and source lineage remain distinct.
+- Integration preserves legacy experience hashes, accepts the compatible
+  proposal/origin vocabulary, and retains exact-revision and item health
+  qualifications through source packets and pattern review.
+- Pattern candidates remain inferred and unverified. Nothing automatically
+  promotes a hypothesis, publishes a belief, or establishes causal success.
+  See [workflow and bounds](docs/BELIEF_INSIGHT_PLAN.md).
 
-**Belief revision hardened for concurrent writers and resumable grounding invalidation.**
+### Evaluation and limits
 
-Additive changes; no breaking public API. Implements KumihoIO/kumiho-memory#27.
-See `docs/BELIEF_REVISION_CONCURRENCY.md` for the full contract.
-
-- The shared replacement protocol (`supersession.supersede_revision`) now
-  documents and enforces a concurrency/recovery contract on top of 1.4.1's
-  sequential replay safety: a deterministic operation identity (`op_id`),
-  cross-project scope rejection, bounded SUPERSEDES cycle rejection (the direct
-  reverse edge is the depth-1 case; deeper A→B→C→A is caught by a depth-capped
-  walk that fails closed on a read outage), and a post-write reverse re-check
-  that quarantines a concurrently created reverse edge by withholding the
-  demotion instead of silently picking a winner.
-- `SupersessionResult` gains additive machine-readable fields
-  (`reverse_conflict`, `cycle_rejected`, `ripple_truncated`, `ripple_pending`,
-  `op_id`, `events`) and a `complete` property that distinguishes foreground
-  completion from pending asynchronous work. The original counters are unchanged.
-- Grounding invalidation is now resumable. A ripple that truncates at the
-  fan-out cap persists a durable pending marker and cursor on the superseded
-  fact (`grounding_ripple_pending` / `grounding_ripple_cursor`), so the
-  remainder is discoverable after an acknowledged progress write. A sorted
-  dependency snapshot binds the cursor to membership; failed dependent reads
-  or writes retain pending work for retry, and progress-write errors are surfaced. `resume_grounding_ripple`
-  continues from the cursor, and the Dream State maintenance sweep drains pending
-  fact and decision revision ripples within scan caps, reporting incomplete
-  discovery (`GraphMaintainer` gains `ripple_dependents_resumed` and
-  `ripples_still_pending`). A truncated ripple is never reported as zero affected
-  dependents.
-- Explicitly out of scope, documented as required upstream (kumiho-SDKs /
-  server): true cross-process atomicity / exactly-once, which needs a
-  conditional edge write, a unique operation-identity constraint, or a durable
-  reconciliation record. A process-local lock is not a distributed guarantee and
-  is not used. The one race this cannot fully exclude — two writers creating
-  mutually reverse edges at the same instant — is detected and quarantined
-  best-effort rather than prevented.
-- Adversarial coverage with deterministic fault injection:
-  `tests/test_supersession_concurrency.py` and new maintenance resume tests.
-
-
-## v1.4.2
-
-**Status:** Unpublished; included in the next consolidated release.
-
-**Superseded beliefs are qualified at recall, and a cross-session decision-continuity evaluation.**
-
-Additive changes; no breaking public API changes. Implements KumihoIO/kumiho-memory#26.
-
-- Recall now surfaces a revision's belief `status`. `supersede_revision` already
-  demotes the replaced revision to `status=superseded` in the graph, but the
-  server's search does not filter on that field, so a superseded belief could
-  still be returned and reused as if current. A new additive marker
-  (`supersession.apply_supersession_marker`, mirroring the grounding marker)
-  stamps `superseded=True` on such recall entries; both context assemblers
-  (`context_compose.compose_context` and the MCP `engage` path in
-  `UniversalMemoryManager.build_recalled_context`, now sharing one
-  `context_compose.qualifier_notes` renderer) append a terse
-  `[superseded: a later memory replaced this]` note. The typed fact-recall leg
-  carries the same qualifiers (superseded / grounding-stale / valid-time).
-  Nothing is deleted or reordered; history stays inspectable.
-- New deterministic, keyless evaluation of cross-session decision continuity
-  (`tests/test_decision_continuity.py`, `tests/continuity_harness.py`,
-  `tests/fixtures/decision_continuity_v1.json`, and the offline emitter
-  `scripts/decision_continuity_report.py`). It drives the real MCP tool
-  handlers across genuinely separate sessions and a process restart, over an
-  in-memory SDK fake, in paired memory-on and memory-off arms, and asserts the
-  protocol: a settled decision survives a restart, an explicit correction
-  replaces and demotes the prior decision, an unaccepted proposal is not
-  promoted, an unresolved contradiction stays contested (a newer timestamp
-  does not pick a winner), a dependent decision is flagged when its grounding
-  changes, an as-of query differs from a current one, similar project names do
-  not leak scope, and negative controls (irrelevant / missing memory,
-  unavailable backend) yield uncertainty rather than fabricated continuity.
-  Korean and English variants of every family are checked for the same
-  structured outcome. The suite runs in the existing non-live CI job with no
-  workflow change; it is a protocol measurement, explicitly not evidence that a
-  model decides better. The agent tier and the three-arm behavioral effect
-  (A / B-prime / B) live in kumihoclouds/kumiho-benchmarks `decision_bench`,
-  which this suite maps to and reuses rather than duplicating.
-
+- Deterministic cross-session continuity tests cover corrections, unsettled
+  proposals, conflicts, changed grounding, temporal queries, and scope isolation
+  across sessions/restarts. These measure protocol behavior, not model quality.
+- The eight-question live-memory pilot found two usefulness wins and six ties
+  with matched source packets. It is a small same-host-family feasibility
+  demonstration, not independent evidence of general insight improvement.
+  See [pilot and error analysis](docs/INSIGHT_EVALUATION.md) and
+  [research outline](docs/INSIGHT_RESEARCH_OUTLINE.md).
+- Structural citation validation does not prove semantic support. Source checks
+  inspect available explicit markers, not complete graph-wide dependency state.
+  Client-side belief revision is not a distributed transaction and does not
+  guarantee cross-process uniqueness, exactly-once, or complete conflict
+  detection. Lifecycle stores/edges remain best effort; retries may duplicate
+  records. Direct ripple progress persistence errors now propagate for retry.
+- CI covers package/import and all non-live regressions on Python 3.10, 3.11,
+  and 3.12. Companion adaptive host guidance is tracked separately in
+  [kumiho-plugins PR #100](https://github.com/KumihoIO/kumiho-plugins/pull/100).
 
 ## v1.4.1
 

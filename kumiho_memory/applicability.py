@@ -9,8 +9,8 @@ belief-state markers already surfaced (``grounding_stale``, ``contested_by``,
 * **Claim origin / actor** — WHO asserted or accepted the claim. Deliberately
   distinct from provenance grade: an agent SAYING something is not the same as
   that something being independently verified. ``agent`` origin is
-  *self-asserted*, never authenticated; host-attested data (``user``,
-  ``imported``, ``observed``) stays distinguishable from it.
+  self-asserted. All origin labels, including ``user``, ``imported`` and
+  ``observed``, are caller-supplied claims, not authentication or verification.
 * **Decision acceptance state** — whether a decision is a ``proposal`` the agent
   floated, an ``accepted`` decision the user approved, ``contested``,
   ``superseded``, or ``unknown``. A proposal must stay a proposal through
@@ -33,15 +33,16 @@ CLAIM_ORIGIN_META = "origin"
 DECISION_STATE_META = "decision_state"
 
 # --- claim origin / actor ---------------------------------------------------
-ORIGIN_USER = "user"          # the person asserted or approved it (authoritative for their scope)
+ORIGIN_USER = "user"          # caller reports that the person asserted or approved it
 ORIGIN_AGENT = "agent"        # the agent asserted it — self-reported, NOT authenticated provenance
 ORIGIN_IMPORTED = "imported"  # ingested from an external source
 ORIGIN_OBSERVED = "observed"  # an observed tool/command result
+ORIGIN_EXTERNAL = "external"  # retained legacy label; do not rewrite canonical hashes
 ORIGIN_UNKNOWN = "unknown"
-CLAIM_ORIGINS = (ORIGIN_USER, ORIGIN_AGENT, ORIGIN_IMPORTED, ORIGIN_OBSERVED, ORIGIN_UNKNOWN)
+CLAIM_ORIGINS = (ORIGIN_USER, ORIGIN_AGENT, ORIGIN_IMPORTED, ORIGIN_OBSERVED, ORIGIN_EXTERNAL, ORIGIN_UNKNOWN)
 
-#: Origins that are self-asserted rather than host-attested: an answering model
-#: must not read them as independently verified.
+#: Legacy classification of agent/unknown labels. Its complement describes
+#: another claimed actor, never authenticated provenance.
 _UNAUTHENTICATED_ORIGINS = frozenset({ORIGIN_AGENT, ORIGIN_UNKNOWN})
 
 # --- decision acceptance state ----------------------------------------------
@@ -49,8 +50,10 @@ STATE_PROPOSAL = "proposal"      # floated, not yet accepted
 STATE_ACCEPTED = "accepted"      # explicitly accepted by an authorised actor
 STATE_CONTESTED = "contested"    # an unresolved disagreement stands
 STATE_SUPERSEDED = "superseded"  # replaced by a later belief
+STATE_PROPOSED = "proposed"      # legacy spelling retained verbatim in canonical records
+STATE_REJECTED = "rejected"      # not accepted; historical observations can still be useful
 STATE_UNKNOWN = "unknown"
-DECISION_STATES = (STATE_PROPOSAL, STATE_ACCEPTED, STATE_CONTESTED, STATE_SUPERSEDED, STATE_UNKNOWN)
+DECISION_STATES = (STATE_PROPOSAL, STATE_PROPOSED, STATE_ACCEPTED, STATE_REJECTED, STATE_CONTESTED, STATE_SUPERSEDED, STATE_UNKNOWN)
 
 
 def normalize_origin(value: Any) -> str:
@@ -66,7 +69,7 @@ def normalize_decision_state(value: Any) -> str:
 
 
 def is_unauthenticated_origin(origin: str) -> bool:
-    """True when the origin is self-asserted (agent) or unknown."""
+    """Classify agent/unknown labels; False is not an authentication result."""
     return normalize_origin(origin) in _UNAUTHENTICATED_ORIGINS
 
 
@@ -99,11 +102,19 @@ def applicability_notes(mem: Dict[str, Any]) -> str:
     *agent* origin is flagged as self-asserted rather than verified. Accepted /
     user / imported / observed and plain unknown add no note (they are the
     unremarkable cases, and noting every unknown-origin legacy memory would be
-    noise). Supersession and contested state are noted by their own markers.
+    noise). Standalone decision states also qualify a block when graph markers
+    are absent. These labels do not authenticate the actor or verify the claim.
     """
     notes = ""
-    if normalize_decision_state(mem.get("decision_state")) == STATE_PROPOSAL:
+    state = normalize_decision_state(mem.get("decision_state"))
+    if state in (STATE_PROPOSAL, STATE_PROPOSED):
         notes += "\n[proposal: floated, not an accepted decision]"
+    elif state == STATE_REJECTED:
+        notes += "\n[rejected: not an accepted decision; historical outcomes may still inform review]"
+    elif state == STATE_CONTESTED and not mem.get("contested_by"):
+        notes += "\n[contested: decision acceptance is disputed]"
+    elif state == STATE_SUPERSEDED and not mem.get("superseded"):
+        notes += "\n[superseded: this decision was replaced]"
     if normalize_origin(mem.get("origin")) == ORIGIN_AGENT:
         notes += "\n[origin: agent-asserted, not independently verified]"
     return notes

@@ -18,8 +18,8 @@ axes are absent.
 | grounding freshness | `grounding_stale`, `superseded_by` | `grounding.py` ripple | preserved (recall marker + context note) |
 | contested / unresolved | `contested_by` | CONTRADICTS edges (`graph_augmentation.py`) | preserved (marker + "disputed" note) |
 | superseded belief state | `superseded` | `status=superseded` at recall | added in #26 (marker + note; unified `qualifier_notes`) |
-| **claim origin / actor** | `origin` (`user`/`agent`/`imported`/`observed`/`unknown`) | writer-declared metadata | **absent → added in #28** |
-| **decision acceptance state** | `decision_state` (`proposal`/`accepted`/`contested`/`superseded`/`unknown`) | writer-declared metadata | **absent → added in #28** |
+| **claim origin / actor** | `origin` (`user`/`agent`/`imported`/`observed`/`external`/`unknown`) | writer-declared metadata | **absent → added in #28** |
+| **decision acceptance state** | `decision_state` (`proposal`/`proposed`/`accepted`/`rejected`/`contested`/`superseded`/`unknown`) | writer-declared metadata | **absent → added in #28** |
 
 The two axes #28 adds are deliberately separate from provenance grade: an agent
 *saying* something (`origin=agent`) is not the same as it being independently
@@ -56,9 +56,10 @@ round-trip and the truncation-survival of the qualifier is in
 1. **Origin is not provenance.** `origin=agent` and `origin=unknown` are
    *self-asserted / unattested*; recall renders `[origin: agent-asserted, not
    independently verified]` for the agent case. `user` / `imported` / `observed`
-   are host-attested and add no note. `evidence_level` remains the separate,
-   graded provenance axis; an agent origin never lifts it.
-2. **A proposal stays a proposal.** `decision_state=proposal` renders
+   / `external` are also caller-declared labels, not authentication or independent
+   verification; their lack of a note is not an endorsement. `evidence_level`
+   remains the separate, graded provenance axis; origin labels never lift it.
+2. **A proposal stays a proposal.** `decision_state=proposal` or legacy `proposed` renders
    `[proposal: floated, not an accepted decision]` and is never rendered as
    accepted. Nothing in the read/consolidate/decompose path *promotes* a state —
    repetition or self-citation cannot turn a proposal into an accepted decision,
@@ -83,3 +84,18 @@ keys of the same names; new module `applicability.py`; no field renamed or
 removed; capture-level inputs are optional and normalised (a bad value is
 dropped, never raised). Provenance-grade separation and the certainty/confidence
 limit are untouched.
+
+## PR32 integration compatibility
+
+Experience records and reflect share the additive origin/state vocabularies above.
+Legacy `proposed` and `external` spellings remain verbatim so existing version-1
+canonical `record_id` hashes still decode. `rejected` stays distinct from accepted;
+a rejected choice does not itself falsify the historical outcome or make a source
+stale. Ordinary context also qualifies standalone `contested`/`superseded` states
+when an edge marker is absent.
+
+Insight packets preserve supersession and dispute warnings separately for exact
+revisions and containing items. Learned-source health reports retain the affected
+source kref, reason, and marker scope. A superseded source is not relabelled as a
+changed grounding fact on the pattern that cites it. These checks preserve warning
+metadata; they neither authenticate actors nor prove semantic applicability.

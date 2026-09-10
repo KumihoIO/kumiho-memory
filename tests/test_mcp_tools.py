@@ -122,13 +122,13 @@ def _cleanup_manager():
 
 
 def test_memory_tools_count():
-    """Should have 14 tools registered (10 base + engage + reflect + space_profile + decompose)."""
-    assert len(MEMORY_TOOLS) == 14
+    """Should have 20 tools registered, including six explicit insight lifecycle tools."""
+    assert len(MEMORY_TOOLS) == 20
 
 
 def test_memory_tool_handlers_count():
-    """Should have 14 handlers registered."""
-    assert len(MEMORY_TOOL_HANDLERS) == 14
+    """Should have 20 handlers registered."""
+    assert len(MEMORY_TOOL_HANDLERS) == 20
 
 
 def test_all_tools_have_handlers():

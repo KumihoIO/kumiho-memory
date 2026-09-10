@@ -17,9 +17,9 @@ PII/credential boundary. Credential-bearing atoms are dropped, never stored.
 > **Stable (1.x)**
 > Follows semantic versioning — the documented public API is stable and
 > breaking changes bump the major version.
-> Latest release: `1.4.1` (2026-09-05) — **Reliable belief replacement**:
-> revision-pinned demotion and replay repair, explicit contradiction protection,
-> fail-closed write guards, full regression CI, and isolated live Cloud contracts.
+> Latest release: `1.5.0` (2026-09-10) — **Revision-aware insight and experience learning**:
+> bounded host synthesis, explicit experience/outcome tracking, qualified recall,
+> and retryable belief replacement with resumable grounding invalidation.
 > See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the full history.
 
 ---
@@ -96,8 +96,60 @@ client-side, no server changes required.
   extraction strategy can adapt per collection.
 * **Skill ingest** — parse and version `SKILL.md` files and reference
   docs into the graph (`kumiho-memory ingest-skill`).
-* **MCP tools** — 13 tool wrappers (15 with Decision Memory enabled),
+* **MCP tools** — 20 tools with default ontology enabled (24 with Decision Memory enabled),
   auto-discovered by the core `kumiho` MCP server (see table below).
+
+---
+
+### Belief-grounded insight (available in 1.5.0)
+
+For a question involving earlier decisions, request a bounded insight brief on
+that turn's first engage call:
+
+```json
+{
+  "query": "Should we revisit the deployment choice given our new constraints?",
+  "limit": 5,
+  "recall_mode": "summarized",
+  "include_insights": true
+}
+```
+
+The additional `insight_brief` gives the answering agent source-backed review
+prompts for changed premises, stored conflicts and prior decisions. It includes
+revision references, bounded evidence snippets and questions to check before
+applying a past belief. These are **hypothesis prompts**, not verified insights
+or accepted decisions. An answer can still be direct when no connection helps.
+
+The flag adds no retrieval, model call or memory write. Existing recall settings
+still apply; `context` and default behavior are unchanged. Missing related
+sources stay explicitly missing, and no hypothesis is automatically persisted.
+Set the flag on the first recall: engage's existing duplicate guard still
+applies. Python callers with already-retrieved, authorized results can use
+`from kumiho_memory.insight import build_insight_brief` directly.
+
+The same call also returns `synthesis_request`: bounded source summaries,
+current context/goals, and a JSON answer contract for the host model. Use
+`kumiho_memory_validate_insight_response` to check structure and citation
+membership; semantic correctness still needs review. No additional provider API
+is required. Include the flag on the first engage call because dedup is shared.
+
+For learning across decisions, explicitly record `record_experience` and separate
+`record_outcome` observations. The keyless Dream State workflow is
+`prepare_patterns` -> host proposal -> `store_pattern` -> `check_pattern` before
+reuse (all tool names carry the `kumiho_memory_` prefix). Proposals retain sources,
+conditions and counterexamples; changed premises trigger a stale review result.
+No automatic publishing or belief promotion occurs. Add
+`include_learned_sources: true` alongside `include_insights: true` to discover
+those separately stored experiences/patterns for the current answer; this adds
+bounded searches and current-source checks. See the
+[workflow and limits](docs/BELIEF_INSIGHT_PLAN.md),
+[real-memory pilot](docs/INSIGHT_EVALUATION.md), and
+[second-paper research outline](docs/INSIGHT_RESEARCH_OUTLINE.md).
+
+
+See [the development plan](docs/BELIEF_INSIGHT_PLAN.md) for the current contract,
+answer-quality evaluation, outcome tracking and Dream State follow-up phases.
 
 ---
 
@@ -432,7 +484,7 @@ Key properties:
 
 ### MCP Tools
 
-13 tool wrappers (15 with `KUMIHO_MEMORY_DECISIONS=1`), auto-discovered by the
+20 tools with default ontology enabled (24 with `KUMIHO_MEMORY_DECISIONS=1`), auto-discovered by the
 core `kumiho` MCP server:
 
 | Tool | Description |
@@ -450,8 +502,17 @@ core `kumiho` MCP server:
 | `kumiho_memory_reflect` | Buffer response + store captures |
 | `kumiho_memory_dream_state` | Run Dream State consolidation cycle |
 | `kumiho_memory_space_profile` | Profile each Space's knowledge dynamics |
+| `kumiho_memory_decompose` | Decompose a memory into typed graph records |
+| `kumiho_memory_record_experience` | Record a decision, expectations, and source lineage |
+| `kumiho_memory_record_outcome` | Append an observed outcome separately from acceptance |
+| `kumiho_memory_prepare_patterns` | Prepare bounded experience evidence for host review |
+| `kumiho_memory_store_pattern` | Store an unverified pattern candidate |
+| `kumiho_memory_check_pattern` | Recheck a candidate against current source markers |
+| `kumiho_memory_validate_insight_response` | Validate answer structure and reference membership |
 | `kumiho_code_why` | *(opt-in)* Why is this code the way it is? — anchored decisions + evidence |
 | `kumiho_code_ingest` | *(opt-in)* Mine a git commit range into decision nodes (idempotent) |
+| `kumiho_code_capture` | *(opt-in)* Record explicit code decisions and evidence |
+| `kumiho_code_mine_session` | *(opt-in)* Extract decisions from a session transcript |
 
 ---
 
