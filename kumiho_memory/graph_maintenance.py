@@ -72,10 +72,13 @@ from kumiho_memory.evidence import (
     parse_evidence,
 )
 from kumiho_memory.grounding import (
+    GROUNDING_RIPPLE_PENDING_META,
     GROUNDING_STALE_META,
     GROUNDING_STALE_SUPERSEDED_BY_META,
     GROUNDING_STALE_TAG,
+    has_pending_ripple,
     is_grounding_stale,
+    resume_grounding_ripple,
 )
 from kumiho_memory.ontology import OntologySchema, _mentions, _word_tokens
 from kumiho_memory.relations import _jaccard, _tokens
@@ -202,6 +205,11 @@ class MaintenanceStats:
     #: grounding was re-confirmed (flag cleared) vs. still stale (flag kept).
     dependents_cleared: int = 0
     dependents_kept: int = 0
+    #: Deferred grounding ripples (kumiho-memory#27) resumed this run: dependents
+    #: newly flagged by finishing a truncated write-time ripple, and facts whose
+    #: pending marker still could not be fully drained (remain discoverable).
+    ripple_dependents_resumed: int = 0
+    ripples_still_pending: int = 0
     llm_merges: int = 0
     #: LLM-suggested, referentially-valid merges that couldn't run because the
     #: entity deprecation budget was exhausted this run — lets an operator
@@ -229,6 +237,8 @@ class MaintenanceStats:
             "edges_repointed": self.edges_repointed,
             "dependents_cleared": self.dependents_cleared,
             "dependents_kept": self.dependents_kept,
+            "ripple_dependents_resumed": self.ripple_dependents_resumed,
+            "ripples_still_pending": self.ripples_still_pending,
             "llm_merges": self.llm_merges,
             "llm_merges_skipped": self.llm_merges_skipped,
             "embed_fact_candidates": self.embed_fact_candidates,
@@ -362,6 +372,15 @@ class GraphMaintainer:
         # away reads as "gone" and clears its dependents. Non-destructive
         # (un-flag only), so it takes no deprecation budget and needs no
         # code_project.
+        # Resume deferred grounding ripples (#27) BEFORE the clear pass, so a
+        # dependent flagged only now can still be considered for clearing in the
+        # same run. A truncated write-time ripple left a durable pending marker
+        # on the superseded fact; this drains it from durable state, surviving
+        # the process death that truncation implies.
+        try:
+            self._resume_pending_ripples(stats)
+        except Exception as exc:  # noqa: BLE001
+            stats.errors.append(f"resume_pending_ripples: {exc}")
         try:
             self._clear_stale_grounding(stats)
         except Exception as exc:  # noqa: BLE001
@@ -796,6 +815,63 @@ class GraphMaintainer:
     # ------------------------------------------------------------------
     # (A) Ontology — grounding-staleness clear (#95)
     # ------------------------------------------------------------------
+
+    def _resume_pending_ripples(self, stats: MaintenanceStats) -> None:
+        """Resume bounded pending work on exact fact/decision revisions.
+
+        Supersession can target historical revisions and code decisions. Neither
+        a newer revision nor item deprecation cancels their dependent invalidation.
+        SDK enumeration is not paginated; cap inspected items/revisions and report
+        an incomplete scan instead of claiming that an unseen backlog is empty.
+        """
+        scopes = [(self.project, "fact"), (self.project, "decision")]
+        if self.code_project:
+            scopes.append((self.code_project, KIND_DECISION))
+        items_seen = revisions_seen = 0
+        for project, kind in scopes:
+            try:
+                get_client = getattr(self.sdk, "get_client", None)
+                client = get_client() if callable(get_client) else None
+                search = getattr(client, "item_search", None)
+                if callable(search):
+                    # The module convenience wrapper cannot request deprecated
+                    # items; the supported client API can include pending history.
+                    items = search(context_filter=project, item_name_filter="",
+                                   kind_filter=kind, include_deprecated=True)
+                else:
+                    items = self.sdk.item_search(context_filter=project, name_filter="", kind_filter=kind)
+                for item in items:
+                    if items_seen >= _MAX_DEDUP_NODES:
+                        stats.errors.append("pending-ripple item scan incomplete: cap reached")
+                        return
+                    items_seen += 1
+                    try:
+                        get_revisions = getattr(item, "get_revisions", None)
+                        revisions = get_revisions() if callable(get_revisions) else [_latest(item)]
+                        for rev in revisions:
+                            if rev is None:
+                                continue
+                            if revisions_seen >= _MAX_DEDUP_NODES:
+                                stats.errors.append("pending-ripple revision scan incomplete: cap reached")
+                                return
+                            revisions_seen += 1
+                            if not has_pending_ripple(_meta(rev)):
+                                continue
+                            if self.dry_run:
+                                stats.ripples_still_pending += 1
+                                continue
+                            try:
+                                stats.ripple_dependents_resumed += resume_grounding_ripple(
+                                    rev, get_revision=self.sdk.get_revision,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                stats.errors.append(f"resume ripple {_uri(rev)}: {exc}")
+                            if has_pending_ripple(_meta(rev)):
+                                stats.ripples_still_pending += 1
+                    except Exception as exc:  # noqa: BLE001
+                        stats.errors.append(f"pending-ripple revisions {_uri(item)}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                stats.errors.append(f"pending-ripple search {project}/{kind}: {exc}")
 
     def _clear_stale_grounding(self, stats: MaintenanceStats) -> None:
         """Re-examine flagged DEPENDS_ON dependents; clear when re-grounded.

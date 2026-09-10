@@ -1,8 +1,51 @@
 # Release Notes — kumiho-memory
 
+## v1.4.3
+
+**Status:** Unpublished; included in the next consolidated release.
+
+**Belief revision hardened for concurrent writers and resumable grounding invalidation.**
+
+Additive changes; no breaking public API. Implements KumihoIO/kumiho-memory#27.
+See `docs/BELIEF_REVISION_CONCURRENCY.md` for the full contract.
+
+- The shared replacement protocol (`supersession.supersede_revision`) now
+  documents and enforces a concurrency/recovery contract on top of 1.4.1's
+  sequential replay safety: a deterministic operation identity (`op_id`),
+  cross-project scope rejection, bounded SUPERSEDES cycle rejection (the direct
+  reverse edge is the depth-1 case; deeper A→B→C→A is caught by a depth-capped
+  walk that fails closed on a read outage), and a post-write reverse re-check
+  that quarantines a concurrently created reverse edge by withholding the
+  demotion instead of silently picking a winner.
+- `SupersessionResult` gains additive machine-readable fields
+  (`reverse_conflict`, `cycle_rejected`, `ripple_truncated`, `ripple_pending`,
+  `op_id`, `events`) and a `complete` property that distinguishes foreground
+  completion from pending asynchronous work. The original counters are unchanged.
+- Grounding invalidation is now resumable. A ripple that truncates at the
+  fan-out cap persists a durable pending marker and cursor on the superseded
+  fact (`grounding_ripple_pending` / `grounding_ripple_cursor`), so the
+  remainder is discoverable after an acknowledged progress write. A sorted
+  dependency snapshot binds the cursor to membership; failed dependent reads
+  or writes retain pending work for retry, and progress-write errors are surfaced. `resume_grounding_ripple`
+  continues from the cursor, and the Dream State maintenance sweep drains pending
+  fact and decision revision ripples within scan caps, reporting incomplete
+  discovery (`GraphMaintainer` gains `ripple_dependents_resumed` and
+  `ripples_still_pending`). A truncated ripple is never reported as zero affected
+  dependents.
+- Explicitly out of scope, documented as required upstream (kumiho-SDKs /
+  server): true cross-process atomicity / exactly-once, which needs a
+  conditional edge write, a unique operation-identity constraint, or a durable
+  reconciliation record. A process-local lock is not a distributed guarantee and
+  is not used. The one race this cannot fully exclude — two writers creating
+  mutually reverse edges at the same instant — is detected and quarantined
+  best-effort rather than prevented.
+- Adversarial coverage with deterministic fault injection:
+  `tests/test_supersession_concurrency.py` and new maintenance resume tests.
+
+
 ## v1.4.2
 
-**Release Date:** 2026-09-06
+**Status:** Unpublished; included in the next consolidated release.
 
 **Superseded beliefs are qualified at recall, and a cross-session decision-continuity evaluation.**
 
