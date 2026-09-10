@@ -28,6 +28,7 @@ import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
+from kumiho_memory.applicability import CLAIM_ORIGINS, DECISION_STATES
 from kumiho_memory._request_context import current_request, hosted_llm_enabled
 
 logger = logging.getLogger(__name__)
@@ -2115,6 +2116,16 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                                     "when it was written. Omit when unknown; "
                                     "never guess."
                                 ),
+                            },
+                            "origin": {
+                                "type": "string",
+                                "enum": list(CLAIM_ORIGINS),
+                                "description": "Reported claim origin; this label does not authenticate provenance.",
+                            },
+                            "decision_state": {
+                                "type": "string",
+                                "enum": list(DECISION_STATES),
+                                "description": "Known acceptance state; a proposal is not an accepted decision. Omit when unknown.",
                             },
                         },
                         "required": ["type", "title", "content"],

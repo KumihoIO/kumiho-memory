@@ -240,3 +240,12 @@ def test_high_certainty_does_not_lift_provenance():
                                        "evidence_level": "unverified"})
     assert entry.get("origin") == "agent"
     assert "evidence_level" not in entry  # marker never touches provenance
+
+
+def test_reflect_catalog_exposes_supported_applicability_inputs():
+    from kumiho_memory.mcp_tools import MEMORY_TOOLS
+    from kumiho_memory.applicability import CLAIM_ORIGINS, DECISION_STATES
+    tool = next(t for t in MEMORY_TOOLS if t["name"] == "kumiho_memory_reflect")
+    fields = tool["inputSchema"]["properties"]["captures"]["items"]["properties"]
+    assert set(fields["origin"]["enum"]) == set(CLAIM_ORIGINS)
+    assert set(fields["decision_state"]["enum"]) == set(DECISION_STATES)
