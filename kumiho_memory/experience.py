@@ -17,6 +17,7 @@ from typing import Any
 from .applicability import CLAIM_ORIGINS, DECISION_STATES
 
 from ._request_context import current_request, is_hosted
+from ._store_compat import unpublished_store_payload
 from .privacy import PIIRedactor
 
 SCHEMA = "kumiho.experience.v1"
@@ -300,7 +301,8 @@ def _normalize_outcome(experience_kref: str, outcome: dict) -> dict:
 
 
 async def _store(manager: Any, record: dict, space: str) -> dict:
-    if not callable(getattr(manager, "memory_store", None)):
+    store = getattr(manager, "memory_store", None)
+    if not callable(store):
         raise ValueError("No memory_store configured")
     record = {**record, "recorded_at": datetime.now(timezone.utc).isoformat()}
     title = record.get("title") or "Outcome observation"
@@ -315,7 +317,11 @@ async def _store(manager: Any, record: dict, space: str) -> dict:
                             "decision_state": record.get("decision_state", "unknown")},
                "source_revision_krefs": refs, "edge_type": "DERIVED_FROM",
                "tags": ["experience", "evidence:unverified"] + (["proposal"] if record.get("decision_state") in ("proposal", "proposed") else []), "stack_revisions": False}
-    result = await asyncio.to_thread(manager.memory_store, **payload)
+    # Snapshots stay unpublished. kumiho>=0.13.2 publishes every stored revision
+    # unless given publish=False. Older SDKs lack that keyword, and there the
+    # tags alone, which omit "published", keep the record unpublished.
+    payload = unpublished_store_payload(store, payload)
+    result = await asyncio.to_thread(store, **payload)
     if inspect.isawaitable(result):
         result = await result
     if (not isinstance(result, dict) or result.get("error")

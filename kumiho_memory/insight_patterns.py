@@ -14,6 +14,7 @@ import math
 import re
 from typing import Any
 
+from ._store_compat import unpublished_store_payload
 from .evidence import UNVERIFIED, parse_evidence
 
 MAX_SOURCES = 12
@@ -461,6 +462,10 @@ async def store_pattern_candidate(manager: Any, request: dict, candidate: dict, 
     store = getattr(manager, "memory_store", None)
     if not callable(store):
         raise ValueError("Memory storage is unavailable")
+    # Proposals are never published. kumiho>=0.13.2 publishes every stored revision
+    # unless given publish=False. Older SDKs lack that keyword, and there the
+    # tags alone, which omit "published", keep the record unpublished.
+    payload = unpublished_store_payload(store, payload)
     result = await asyncio.to_thread(store, **payload)
     result = await result if inspect.isawaitable(result) else result
     stored_ref = result.get("revision_kref") if isinstance(result, dict) else None

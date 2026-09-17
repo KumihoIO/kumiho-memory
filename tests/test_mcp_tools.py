@@ -1221,6 +1221,33 @@ def test_memory_reflect_idempotency_prefix_forces_batch_and_returns_capture_resu
         _cleanup_manager()
 
 
+def test_memory_reflect_never_opts_out_of_publishing():
+    """Reflect captures must be published, so a tagged correction becomes what
+    recall reads (KumihoIO/kumiho-SDKs#170). Only experience snapshots and
+    pattern proposals pass ``publish=False``. The recorders accept ``**kwargs``,
+    so they would receive the keyword if reflect sent it."""
+    tagged = {"type": "decision", "title": "Adopt a pilot", "content": "Pilot first",
+              "tags": ["decision", "proposal"], "decision_state": "proposal"}
+    try:
+        _install_test_manager()
+        ingest = tool_memory_ingest({"user_id": "user-reflect-publish", "message": "x"})
+        store_calls, batch_calls = [], []
+        with patch("kumiho.mcp_server.tool_memory_store", _fake_store_recorder(store_calls)), \
+                patch("kumiho.mcp_server.tool_memory_store_batch", _fake_batch_recorder(batch_calls)), \
+                patch("kumiho.batch_create_revisions", create=True):
+            tool_memory_reflect({"session_id": ingest["session_id"], "response": "ok",
+                                 "captures": [dict(tagged)]})
+            tool_memory_reflect({"session_id": ingest["session_id"], "response": "ok",
+                                 "captures": [dict(tagged), {**tagged, "title": "Second"}]})
+        assert len(store_calls) == 1 and len(batch_calls) == 1
+        assert "publish" not in store_calls[0]
+        assert store_calls[0]["tags"] == ["decision", "proposal"]
+        assert "publish" not in batch_calls[0]
+        assert all("publish" not in capture for capture in batch_calls[0]["captures"])
+    finally:
+        _cleanup_manager()
+
+
 def test_reflect_schema_exposes_idempotency_prefix():
     """batch_capable() in the backfill runner keys off this schema property."""
     from kumiho_memory.mcp_tools import MEMORY_TOOLS
