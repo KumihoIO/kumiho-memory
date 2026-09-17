@@ -102,9 +102,15 @@ def test_a_store_taking_kwargs_or_a_mock_receives_the_keyword():
     def fake(**payload):
         return payload
 
+    async def async_fake(**payload):
+        return payload
+
     assert store_accepts_publish(fake)
+    assert store_accepts_publish(async_fake)
     assert store_accepts_publish(MagicMock())
-    assert store_accepts_publish(AsyncMock())
+    # AsyncMock is not asserted here: Python 3.10's AsyncMock does not report
+    # a ``(*args, **kwargs)`` signature (3.11+ does), so the answer depends on
+    # the interpreter. See test_an_async_mock_store_never_breaks_the_write.
 
 
 def test_a_wrapper_reports_the_store_it_wraps():
@@ -212,12 +218,25 @@ def test_experience_omits_publish_for_a_store_without_it(shape, monkeypatch):
     assert all("publish" not in call and "published" not in call["tags"] for call in calls)
 
 
-def test_experience_passes_publish_false_to_an_injected_async_mock():
+def test_experience_passes_publish_false_to_an_injected_mock():
     manager = SimpleNamespace(project="project",
-                              memory_store=AsyncMock(return_value={"revision_kref": EXPERIENCE_REF}))
+                              memory_store=MagicMock(return_value={"revision_kref": EXPERIENCE_REF}))
     asyncio.run(record_experience(manager, experience()))
     payload = manager.memory_store.call_args.kwargs
     assert payload["publish"] is False
+    assert "published" not in payload["tags"]
+
+
+def test_an_async_mock_store_never_breaks_the_write():
+    """The existing experience and insight tests inject an AsyncMock store."""
+    store = AsyncMock(return_value={"revision_kref": EXPERIENCE_REF})
+    manager = SimpleNamespace(project="project", memory_store=store)
+    result = asyncio.run(record_experience(manager, experience()))
+
+    assert result["revision_kref"] == EXPERIENCE_REF
+    payload = store.call_args.kwargs
+    assert payload.get("publish", False) is False
+    assert ("publish" in payload) is store_accepts_publish(store)
     assert "published" not in payload["tags"]
 
 
