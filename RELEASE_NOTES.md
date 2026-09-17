@@ -1,5 +1,79 @@
 # Release Notes — kumiho-memory
 
+## v1.5.1
+
+**Release Date:** 2026-09-18
+
+**Experience snapshots and pattern proposals stay unpublished under kumiho 0.13.2.**
+
+Patch release. No public API changes. Release it before kumiho 0.13.2, or
+together with it (see Release order below).
+
+### Why
+
+- Up to kumiho 0.13.1, `tool_memory_store` tagged the revision it created with
+  `tags or ["published"]`, so caller tags replaced `published` instead of
+  joining it. A tagged reflect correction that stacked therefore never became
+  the revision recall reads. kumiho 0.13.2
+  ([KumihoIO/kumiho-SDKs#170](https://github.com/KumihoIO/kumiho-SDKs/pull/170))
+  always publishes the stored revision, applies `published` after the caller's
+  tags, and adds a `publish` keyword to opt out.
+- `kumiho_memory_record_experience`, `kumiho_memory_record_outcome` and
+  `kumiho_memory_store_pattern` store unpublished records on purpose. The only
+  thing keeping them unpublished was passing tags without `published`. With
+  kumiho 0.13.2 and kumiho-memory 1.5.0, they would be published, against
+  1.5.0's promise that they are never published automatically. A published
+  revision also gets different treatment: Dream State and graph maintenance
+  don't deprecate it unless `allow_published_deprecation` is set, and the
+  server rejects later tag and metadata edits to it.
+
+### What changed
+
+- Those three writes pass `publish=False` when the store they call accepts it.
+  A new private helper, `kumiho_memory._store_compat`, reads the signature of
+  the manager's `memory_store` once and caches the answer. A `publish`
+  parameter or `**kwargs` gets the keyword. kumiho 0.13.1's signature, or a
+  signature that can't be read, doesn't. The check covers the default SDK
+  store, a `memory_store` injected into `UniversalMemoryManager`, and sync or
+  async stores alike.
+- Everything else still publishes: reflect (single capture and batched),
+  consolidation, execution records and auto-memorize. Under 0.13.2, reflect
+  and auto-memorize captures carrying tags are published for the first time,
+  which is the SDK fix working as intended. Skill ingest and the ontology spec
+  tag revisions directly and don't go through `tool_memory_store`, so neither
+  SDK version changes them.
+
+### Compatibility
+
+- The dependency floor is still `kumiho>=0.10.7`. From 0.10.7 through 0.13.1,
+  `tool_memory_store` has no `publish` parameter and rejects unknown keywords,
+  so the keyword is left out. The records' tags already keep them unpublished
+  on those versions, as before. On 0.13.2 and later, `publish=False` withholds
+  `published`.
+- None of the unpublished writes goes through `tool_memory_store_batch`, so
+  the batch path needs no per-capture `publish` key.
+
+### Release order
+
+- **Release kumiho-memory 1.5.1 before kumiho 0.13.2, or together with it.**
+  Running kumiho 0.13.2 with kumiho-memory 1.5.0 or older publishes every
+  experience snapshot, outcome observation and pattern proposal stored from
+  then on. Nothing retags those records afterwards.
+- The kumiho-plugins `cloud-mcp` image should pin kumiho 0.13.2 and
+  kumiho-memory 1.5.1 together. kumiho-plugins PR #106 does that once both are
+  released.
+
+**Validation:** `tests/test_store_compat.py` covers the helper and both callers
+against stores shaped like kumiho 0.13.1 and 0.13.2 (sync and async) and an
+`AsyncMock`. It also runs the installed SDK's real `tool_memory_store` with its
+graph I/O faked and checks that no `published` tag is applied. A
+`tests/test_mcp_tools.py` test checks that reflect never sends `publish`. The
+full non-live suite passed 1,736 tests (2 skipped, 2 live tests deselected)
+against both kumiho 0.13.1 from PyPI and kumiho 0.13.2 from
+KumihoIO/kumiho-SDKs#170 (Windows, Python 3.13). The 1.5.0 baseline was 1,716.
+Without the fix, 7 of the 19 new compatibility tests fail on 0.13.2, including
+both real-SDK checks.
+
 ## v1.5.0
 
 **Release Date:** 2026-09-10

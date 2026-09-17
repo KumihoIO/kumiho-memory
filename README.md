@@ -17,7 +17,9 @@ PII/credential boundary. Credential-bearing atoms are dropped, never stored.
 > **Stable (1.x)**
 > Follows semantic versioning — the documented public API is stable and
 > breaking changes bump the major version.
-> Latest release: `1.5.0` (2026-09-10) — **Revision-aware insight and experience learning**:
+> Latest release: `1.5.1` (2026-09-18) — **Experience snapshots and pattern proposals
+> stay unpublished under kumiho 0.13.2**. Upgrade to it before, or together with, kumiho 0.13.2.
+> Previous: `1.5.0` (2026-09-10) — **Revision-aware insight and experience learning**:
 > bounded host synthesis, explicit experience/outcome tracking, qualified recall,
 > and retryable belief replacement with resumable grounding invalidation.
 > See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the full history.
