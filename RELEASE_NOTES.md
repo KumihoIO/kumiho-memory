@@ -64,15 +64,15 @@ together with it (see Release order below).
   released.
 
 **Validation:** `tests/test_store_compat.py` covers the helper and both callers
-against stores shaped like kumiho 0.13.1 and 0.13.2 (sync and async) and an
-`AsyncMock`. It also runs the installed SDK's real `tool_memory_store` with its
-graph I/O faked and checks that no `published` tag is applied. A
-`tests/test_mcp_tools.py` test checks that reflect never sends `publish`. The
-full non-live suite passed 1,736 tests (2 skipped, 2 live tests deselected)
-against both kumiho 0.13.1 from PyPI and kumiho 0.13.2 from
-KumihoIO/kumiho-SDKs#170 (Windows, Python 3.13). The 1.5.0 baseline was 1,716.
-Without the fix, 7 of the 19 new compatibility tests fail on 0.13.2, including
-both real-SDK checks.
+against stores shaped like kumiho 0.13.1 and 0.13.2 (sync and async), plus
+injected `MagicMock` and `AsyncMock` stores. It also runs the installed SDK's
+real `tool_memory_store` with its graph I/O faked and checks that no
+`published` tag is applied. A `tests/test_mcp_tools.py` test checks that
+reflect never sends `publish`. The full non-live suite passed 1,737 tests
+(2 skipped, 2 live tests deselected) against both kumiho 0.13.1 from PyPI and
+kumiho 0.13.2 from KumihoIO/kumiho-SDKs#170 (Windows, Python 3.13). The 1.5.0
+baseline was 1,716. Without the fix, 8 of the 20 new compatibility tests fail
+on 0.13.2, including both real-SDK checks.
 
 ## v1.5.0
 
