@@ -95,6 +95,12 @@ client-side, no server changes required.
   a corroboration-aware assessor grades claims automatically, recall
   reranks and badges by grade, and Dream State respects grade-aware
   deployment policy. See below for details.
+* **Judged delivery** *(opt-in, paid Kumiho Cloud)* — engage judges a
+  wider candidate pool in one batched evaluation request and delivers
+  only the memories that answer the query (necessary-memory recall
+  0.55 → 0.95, precision 0.38 → 0.95), instead of delivering whatever
+  ranked top. Inert and fallback-safe wherever the capability is absent.
+  See below.
 * **Space profiles** — per-Space churn/evidence/stability signals
   classify each Space (`canonical` / `working` / `correspondence`) so
   extraction strategy can adapt per collection.
@@ -379,6 +385,75 @@ applies to the **adjusted** score — an `unverified` memory sitting just
 above the threshold can drop below it. That is the intended screening
 behavior; use the `base_score` result field if you need the raw retrieval score.
 
+#### Judged delivery (context optimization, opt-in)
+
+`kumiho_memory_engage` normally delivers whatever the search returned:
+`limit` memories (default 5), so retrieval rank also decides what enters
+the answering context. Measured on 40 queries over 50 candidates each,
+rank cannot carry that decision — 61 of 100 necessary memories sat
+outside the top 5, and the search score separated necessary from
+unnecessary at AUC 0.67. Judging the same pool in **one** batched
+evaluation request separates them at AUC 0.97: necessary-memory recall
+0.55 → 0.95, precision 0.38 → 0.95, delivered count dynamic (0–43,
+median 3), and **nothing delivered** for a query whose pool held nothing
+relevant.
+
+Enabled, engage recalls a wider candidate pool, asks the Kumiho server's
+`Evaluate` RPC two questions about each candidate — is it about the
+query's subject, does it state something usable in a direct answer — and
+delivers the memories that pass both. `context`, `results`,
+`source_krefs` and `count` are all built from the survivors, and so is
+the optional insight brief. Nothing is padded: zero delivered memories
+is a valid, intended answer. `kumiho_memory_recall` is unchanged.
+
+**Requires a paid Kumiho Cloud tier.** `Evaluate` does not exist on
+self-hosted CE or on an SDK without `kumiho.evaluate`, and an unentitled
+tier is refused. Everywhere it is unavailable the feature is inert:
+engage delivers the first `limit` recalled memories — today's behavior —
+and never raises. After a refusal that will not change soon (no
+entitlement, no RPC) the requesting identity stops asking for 10
+minutes; after a transient one (over limit, provider unavailable) for 1
+minute. While backed off the recall is not widened either, so the
+unavailable case costs nothing.
+
+| variable | default | meaning |
+|---|---|---|
+| `KUMIHO_MEMORY_CONTEXT_OPT_ENABLED` | off | master switch; unset leaves engage untouched |
+| `KUMIHO_MEMORY_CONTEXT_OPT_CANDIDATES` | `50` | candidate pool to judge (the RPC accepts at most 64) |
+| `KUMIHO_MEMORY_CONTEXT_OPT_SUMMARY_CHARS` | `600` | summary characters sent per candidate |
+| `KUMIHO_MEMORY_CONTEXT_OPT_RELEVANCE_MIN` | `0.45` | keep threshold for "addresses the subject" |
+| `KUMIHO_MEMORY_CONTEXT_OPT_EVIDENCE_MIN` | `0.5` | keep threshold for "usable in a direct answer" |
+| `KUMIHO_MEMORY_CONTEXT_OPT_TIMEOUT_MS` | `4000` | per-request deadline |
+
+A malformed value falls back to the default with one warning.
+
+**What is sent for evaluation** — per candidate: the first
+`SUMMARY_CHARS` characters of its summary, plus title, memory type and
+the ISO day it was created, under an opaque positional id (`c01`,
+`c02`, …). Krefs, space paths, tags, tenant and user ids never leave the
+process, and delivery always uses the full memory — the cut is for the
+judge only (measured: judging 600 characters keeps recall, raises
+precision 0.88 → 0.95 and cuts evaluation tokens 36%).
+
+**What engage reports** — one additive field, present only while the
+feature is enabled:
+
+```json
+{"optimization": {"status": "applied", "candidates": 50}}
+{"optimization": {"status": "fallback", "candidates": 5, "reason": "not_entitled"}}
+```
+
+`candidates` is how many memories were judged (`applied`) or recalled
+(`fallback`); `reason` appears only on a fallback and is one of
+`backoff`, `no_candidates`, `sdk_unavailable`, `not_entitled`,
+`over_limit`, `provider_unavailable`, `invalid_request`,
+`unknown_status`, `unimplemented`, `permission_denied`, `timeout`,
+`error`.
+
+Supersession is deliberately **not** part of this: the judge keeps
+superseded "latest version" memories, which the existing deterministic
+supersession markers handle instead.
+
 #### Space profiles (per-collection extraction strategy)
 
 A collection's observed dynamics are a signal about what kind of
@@ -540,6 +615,7 @@ core `kumiho` MCP server:
 | `relations` | deterministic edge derivation (`ABOUT`, `DEPENDS_ON`, `SUPERSEDES`) |
 | `entity_promotion` | `EntityPromotionConfig` — entity anchor hubs |
 | `context_compose` | `compose_context`, `collect_top_revisions`, `DEFAULT_CONTEXT_TOP_K` |
+| `context_optimization` | `ContextOptimizationPolicy`, `optimize_recall` — opt-in judged engage delivery |
 | `recall_rerank` | `RerankConfig`, `rerank`, `rerank_async`, `two_pass_rerank` |
 | `code_decisions` | Decision Memory schema: `CodeMemoryConfig`, slugs, anchors |
 | `code_capture` | `ingest_repo`, `IngestStats` — git commit mining |
