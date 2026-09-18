@@ -33,9 +33,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from kumiho_memory.applicability import CLAIM_ORIGINS, DECISION_STATES
 from kumiho_memory._request_context import current_request, hosted_llm_enabled
 from kumiho_memory.context_optimization import (
-    ContextOptimizationPolicy,
     is_backed_off,
     optimize_recall,
+    resolve_policy,
 )
 
 logger = logging.getLogger(__name__)
@@ -1249,8 +1249,9 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
         # Judged delivery (context_optimization): when it is on and this scope
         # is not backed off, recall a wider pool so the judgment has something
         # to choose from. Off or backed off, the recall is the caller's own —
-        # the widened pool exists only to be narrowed again.
-        policy = ContextOptimizationPolicy.from_env()
+        # the widened pool exists only to be narrowed again. On comes from this
+        # request's override when a host set one, else from the environment.
+        policy = resolve_policy()
         judged = policy.enabled and not is_backed_off(scope)
         results = asyncio.run(
             manager.recall_memories(

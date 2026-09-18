@@ -343,6 +343,52 @@ def test_the_backoff_is_per_requesting_identity(manager, enabled, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Per-request override — a host decides on/off for one caller
+# ---------------------------------------------------------------------------
+
+
+def test_override_on_judges_with_no_environment(manager, monkeypatch):
+    """The hosted path: nothing in the environment, the tier says yes."""
+    monkeypatch.delenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", raising=False)
+    verdicts = [(0.1, 0.1)] * 12
+    verdicts[3] = (0.9, 0.9)
+    install(monkeypatch, judge(verdicts))
+
+    with ctxopt.judged_delivery(True):
+        result = engage(limit=5)
+
+    assert recall_limit(manager) == 50
+    assert result["optimization"] == {"status": "applied", "candidates": 12}
+    assert [m["title"] for m in result["results"]] == ["memory 3"]
+
+
+def test_override_off_beats_the_environment(manager, enabled, monkeypatch):
+    """A caller whose tier cannot judge pays for neither the pool nor the RPC."""
+    install(monkeypatch, Mock(side_effect=AssertionError("must not evaluate")))
+
+    with ctxopt.judged_delivery(False):
+        result = engage(limit=3)
+
+    assert recall_limit(manager) == 3
+    assert "optimization" not in result
+    assert result["count"] == 12
+
+
+def test_engage_is_unchanged_once_the_override_is_gone(manager, monkeypatch):
+    monkeypatch.delenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", raising=False)
+    install(monkeypatch, judge([(0.9, 0.9)] * 12))
+
+    with ctxopt.judged_delivery(True):
+        engage(limit=3)
+    mcp_tools._recall_recent.clear()
+    after = engage(limit=3)
+
+    assert recall_limit(manager) == 3
+    assert "optimization" not in after
+    assert after["count"] == 12
+
+
+# ---------------------------------------------------------------------------
 # tool_memory_recall is not part of this
 # ---------------------------------------------------------------------------
 
