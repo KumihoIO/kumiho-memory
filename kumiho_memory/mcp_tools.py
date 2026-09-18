@@ -2198,7 +2198,11 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                 "limit": {
                     "type": "integer",
                     "default": 5,
-                    "description": "Max results to return.",
+                    "description": (
+                        "Max results to return. When judged delivery is on, the "
+                        "number returned is decided per query and may be fewer "
+                        "or more than this, including none."
+                    ),
                 },
                 "min_score": {
                     "type": "number",
