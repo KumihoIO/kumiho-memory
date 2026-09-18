@@ -655,3 +655,13 @@ def test_expired_windows_do_not_accumulate():
     _fail("tenant-late", clock, status="over_limit")
 
     assert list(ctxopt._backoff_until) == ["tenant-late"]
+
+
+def test_fragment_date_prefers_the_event_date_over_the_storage_day():
+    dated = {"title": "t", "summary": "s", "type": "fact",
+             "created_at": "2026-09-18T01:02:03Z", "event_date": "2026-07"}
+    undated = {"title": "t", "summary": "s", "type": "fact",
+               "created_at": "2026-09-18T01:02:03Z", "event_date": "last week"}
+    fragments = ctxopt.build_fragments([dated, undated], ENABLED)
+    assert fragments[0]["metadata"]["date"] == "2026-07"
+    assert fragments[1]["metadata"]["date"] == "2026-09-18"

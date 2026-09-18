@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -407,13 +408,30 @@ def fragment_id(position: int) -> str:
     return "c%02d" % (position + 1)
 
 
+_ISO_EVENT_DATE = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
+
+
+def judged_date(mem: Mapping[str, Any]) -> str:
+    """The date a memory is judged under: when it happened, else when it was stored.
+
+    ``event_date`` is valid-time — recall surfaces it only when it is a clean
+    ISO calendar date — and it is what a question about "the latest" or "at
+    the time" is about.  The storage day stands in when no event date was
+    recorded (22% of candidates in the measured pools).
+    """
+    event = str(mem.get("event_date") or "").strip()
+    if _ISO_EVENT_DATE.match(event):
+        return event
+    return str(mem.get("created_at") or "")[:10]
+
+
 def build_fragments(
     memories: Sequence[Dict[str, Any]],
     policy: ContextOptimizationPolicy,
 ) -> List[Dict[str, Any]]:
     """The judged view of *memories*, in pipeline order.
 
-    Title, type and ISO day of ``created_at`` travel as metadata (empty values
+    Title, type and :func:`judged_date` travel as metadata (empty values
     omitted); the text is the summary cut to ``policy.summary_chars``.  Nothing
     else is included — see the module docstring.
     """
@@ -422,7 +440,7 @@ def build_fragments(
         pairs = (
             ("title", mem.get("title")),
             ("type", mem.get("type")),
-            ("date", str(mem.get("created_at") or "")[:10]),
+            ("date", judged_date(mem)),
         )
         metadata = {
             key: str(value).strip()
