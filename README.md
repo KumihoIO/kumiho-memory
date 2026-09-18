@@ -427,6 +427,17 @@ unavailable case costs nothing.
 
 A malformed value falls back to the default with one warning.
 
+**Per request, not per process.** A host that serves several identities
+from one process cannot express "on" as an environment variable — the
+entitlement belongs to the caller, not to the deployment. For those,
+`judged_delivery(enabled)` from `kumiho_memory.context_optimization` is a
+context manager that decides the switch for the calling context only, and
+engage prefers it over `KUMIHO_MEMORY_CONTEXT_OPT_ENABLED` in either
+direction while it is in force; the remaining knobs still come from the
+environment. The hosted Kumiho connector sets it per request from the
+caller's Kumiho Cloud tier. Nothing sets it on the stdio path, where the
+environment alone decides exactly as it did before.
+
 **What is sent for evaluation** — per candidate: the first
 `SUMMARY_CHARS` characters of its summary, plus title, memory type and
 the ISO day it was created, under an opaque positional id (`c01`,
@@ -615,7 +626,7 @@ core `kumiho` MCP server:
 | `relations` | deterministic edge derivation (`ABOUT`, `DEPENDS_ON`, `SUPERSEDES`) |
 | `entity_promotion` | `EntityPromotionConfig` — entity anchor hubs |
 | `context_compose` | `compose_context`, `collect_top_revisions`, `DEFAULT_CONTEXT_TOP_K` |
-| `context_optimization` | `ContextOptimizationPolicy`, `optimize_recall` — opt-in judged engage delivery |
+| `context_optimization` | `ContextOptimizationPolicy`, `resolve_policy`, `judged_delivery`, `optimize_recall` — opt-in judged engage delivery |
 | `recall_rerank` | `RerankConfig`, `rerank`, `rerank_async`, `two_pass_rerank` |
 | `code_decisions` | Decision Memory schema: `CodeMemoryConfig`, slugs, anchors |
 | `code_capture` | `ingest_repo`, `IngestStats` — git commit mining |
