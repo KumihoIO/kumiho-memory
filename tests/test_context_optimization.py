@@ -4,7 +4,9 @@ No network, no graph: the evaluation client is injected and the clock is
 passed in, so the back-off windows are exercised without sleeping.
 """
 
+import asyncio
 import json
+import threading
 
 import pytest
 
@@ -16,7 +18,10 @@ from kumiho_memory.context_optimization import (
     SdkEvaluationClient,
     build_fragments,
     is_backed_off,
+    judged_delivery,
+    judged_delivery_override,
     optimize_recall,
+    resolve_policy,
 )
 
 
@@ -219,6 +224,119 @@ def test_policy_accepts_the_unit_interval_bounds():
 def test_policy_reads_os_environ_by_default(monkeypatch):
     monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", "1")
     assert ContextOptimizationPolicy.from_env().enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Per-request override
+# ---------------------------------------------------------------------------
+
+
+def test_no_override_is_exactly_the_environment(monkeypatch):
+    """The stdio path sets nothing, so resolution must be ``from_env`` itself."""
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", "1")
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_CANDIDATES", "20")
+
+    assert judged_delivery_override() is None
+    assert resolve_policy() == ContextOptimizationPolicy.from_env()
+
+
+def test_override_on_enables_it_without_the_environment(monkeypatch):
+    monkeypatch.delenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", raising=False)
+
+    with judged_delivery(True):
+        assert resolve_policy().enabled is True
+    assert resolve_policy().enabled is False
+
+
+def test_override_off_beats_an_enabled_environment(monkeypatch):
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", "1")
+
+    with judged_delivery(False):
+        assert resolve_policy().enabled is False
+    assert resolve_policy().enabled is True
+
+
+def test_override_leaves_the_other_knobs_in_the_environment(monkeypatch):
+    """One host decides on/off per caller; the operating point stays deployment-wide."""
+    monkeypatch.delenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", raising=False)
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_CANDIDATES", "20")
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_TIMEOUT_MS", "1500")
+
+    with judged_delivery(True):
+        policy = resolve_policy()
+
+    assert (policy.enabled, policy.candidates, policy.timeout_ms) == (True, 20, 1500)
+
+
+def test_override_reports_itself(monkeypatch):
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", "1")
+
+    with judged_delivery(False) as bound:
+        assert bound is False
+        assert judged_delivery_override() is False
+    assert judged_delivery_override() is None
+
+
+def test_override_nests_and_restores(monkeypatch):
+    monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", "1")
+
+    with judged_delivery(False):
+        assert resolve_policy().enabled is False
+        with judged_delivery(True):
+            assert resolve_policy().enabled is True
+        assert resolve_policy().enabled is False
+    assert judged_delivery_override() is None
+    assert resolve_policy().enabled is True
+
+
+def test_override_is_restored_when_the_block_raises():
+    with pytest.raises(RuntimeError):
+        with judged_delivery(True):
+            raise RuntimeError("boom")
+    assert judged_delivery_override() is None
+
+
+def test_concurrent_contexts_do_not_see_each_others_override(monkeypatch):
+    """Two overlapping requests, opposite verdicts: the hosted failure mode.
+
+    The two tasks hold their overrides at the same time — each waits for the
+    other to enter before reading — so a shared process-wide switch, or a
+    contextvar set in the wrong context, fails here rather than in production.
+    """
+    monkeypatch.delenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", raising=False)
+    seen = {}
+
+    async def request(name, enabled, entered, other):
+        with judged_delivery(enabled):
+            entered.set()
+            await other.wait()
+            seen[name] = resolve_policy().enabled
+
+    async def overlapping():
+        paid, free = asyncio.Event(), asyncio.Event()
+        await asyncio.gather(
+            request("paid", True, paid, free),
+            request("free", False, free, paid),
+        )
+
+    asyncio.run(overlapping())
+
+    assert seen == {"paid": True, "free": False}
+    assert judged_delivery_override() is None
+
+
+def test_a_thread_does_not_inherit_an_override(monkeypatch):
+    """A worker thread starts from an empty context, so it falls back to the env."""
+    monkeypatch.delenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", raising=False)
+    seen = []
+
+    with judged_delivery(True):
+        worker = threading.Thread(target=lambda: seen.append(resolve_policy().enabled))
+        worker.start()
+        worker.join()
+        assert resolve_policy().enabled is True
+
+    assert seen == [False]
 
 
 # ---------------------------------------------------------------------------

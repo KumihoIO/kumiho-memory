@@ -38,16 +38,19 @@ elsewhere.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import (
     Any,
     Callable,
     Dict,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -260,6 +263,60 @@ class ContextOptimizationPolicy:
             ),
             timeout_ms=_env_int(source, "TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-request override
+# ---------------------------------------------------------------------------
+# ``Evaluate`` is entitled per tenant, and the hosted connector serves many
+# tenants from one process: there, on/off is a property of the caller, not of
+# the deployment, and the process environment cannot express it (mutating it
+# per request is a cross-tenant leak by construction — see ``_request_context``).
+# So a host may decide ``enabled`` for the duration of one request. The other
+# knobs stay in the environment: they are one deployment's measured operating
+# point and are the same for every caller.
+
+_enabled_override: "contextvars.ContextVar[Optional[bool]]" = contextvars.ContextVar(
+    "kumiho_memory_judged_delivery", default=None,
+)
+
+
+@contextmanager
+def judged_delivery(enabled: bool) -> Iterator[bool]:
+    """Turn judged delivery on or off for the calling context only.
+
+    Nests and restores: whatever was in force before the block — including no
+    override at all — is back when it exits, and a context set in one task or
+    thread is invisible to every other. Nothing sets this on the stdio path,
+    where the environment decides exactly as it did before this existed.
+    """
+    value = bool(enabled)
+    token = _enabled_override.set(value)
+    try:
+        yield value
+    finally:
+        _enabled_override.reset(token)
+
+
+def judged_delivery_override() -> Optional[bool]:
+    """The override in force for this context, or ``None`` when there is none."""
+    return _enabled_override.get()
+
+
+def resolve_policy(
+    env: Optional[Mapping[str, str]] = None,
+) -> ContextOptimizationPolicy:
+    """The policy for one call: the environment, with the override deciding on/off.
+
+    :func:`judged_delivery` wins over ``KUMIHO_MEMORY_CONTEXT_OPT_ENABLED`` while
+    it is set, in either direction; with no override this is
+    :meth:`ContextOptimizationPolicy.from_env` and nothing else.
+    """
+    policy = ContextOptimizationPolicy.from_env(env)
+    override = _enabled_override.get()
+    if override is None:
+        return policy
+    return replace(policy, enabled=override)
 
 
 # ---------------------------------------------------------------------------
