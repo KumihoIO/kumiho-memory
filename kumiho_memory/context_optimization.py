@@ -551,6 +551,10 @@ def optimize_recall(
             query, fragments, questions, timeout_ms=policy.timeout_ms,
         )
     except EvaluationUnavailable:
+        # An SDK without ``evaluate`` will not grow one mid-process; without a
+        # back-off every engage would pay for the widened recall and then
+        # deliver the old prefix anyway.
+        _start_backoff(scope, ENTITLEMENT_BACKOFF_SECS, "sdk_unavailable", now)
         return _fallback(candidates, limit, "sdk_unavailable")
     except Exception as exc:
         reason = _grpc_reason(exc)

@@ -459,6 +459,8 @@ def test_missing_sdk_function_is_feature_unavailable(monkeypatch):
     assert outcome.status == "fallback"
     assert outcome.reason == "sdk_unavailable"
     assert outcome.memories == pool[:5]
+    # The SDK will not grow the function mid-process: stop widening the recall.
+    assert ctxopt.is_backed_off("")
 
 
 def test_default_client_calls_the_sdk_with_the_rubric(monkeypatch):
