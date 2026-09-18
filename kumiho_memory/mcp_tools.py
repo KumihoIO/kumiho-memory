@@ -21,11 +21,13 @@ with no active event loop — ``asyncio.run()`` is safe to use inside them.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import threading
 import time
 from collections import OrderedDict
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 from kumiho_memory.applicability import CLAIM_ORIGINS, DECISION_STATES
@@ -1372,6 +1374,85 @@ def _normalize_capture_state(value: Any) -> str:
     return "" if state == STATE_UNKNOWN else state
 
 
+@lru_cache(maxsize=32)
+def _accepts_item_kref(store: Any) -> bool:
+    """Whether *store* declares the SDK's ``item_kref`` parameter.
+
+    ``item_kref`` (``kumiho>=0.13.2``, KumihoIO/kumiho-SDKs#172) names the
+    memory a store *revises*: the similarity search is skipped and the new
+    text becomes a revision of that item. kumiho-memory's dependency floor
+    stays at ``kumiho>=0.10.7``, where the keyword does not exist and passing
+    it raises ``TypeError``, so the callable is asked before it is used.
+
+    **Declared parameter only.** A ``**kwargs`` catch-all does not count: a
+    forwarder that swallows unknown keywords tells us nothing about the store
+    behind it, and a store that accepts the keyword without acting on it would
+    silently file a correction as a brand-new memory instead of revising the
+    one the user named. A callable whose signature cannot be read counts as
+    not accepting, for the same reason — the capture is stored either way, so
+    the cost of saying no is the old behaviour, not a lost write.
+
+    Asked of the *resolved callable* rather than the package version so an
+    injected or wrapped store answers for itself; cached, so one read per store.
+    """
+    try:
+        params = inspect.signature(store, follow_wrapped=False).parameters
+    except (TypeError, ValueError):
+        return False
+    return "item_kref" in params
+
+
+def _item_kref_for(store: Any, revises: str) -> Dict[str, Any]:
+    """``{"item_kref": revises}`` when this store can act on it, else ``{}``.
+
+    Empty when the capture named nothing to revise, and empty on an older SDK
+    — where the capture is stored exactly as 1.5.0 stored it, with no error.
+    """
+    if not revises:
+        return {}
+    try:
+        accepts = _accepts_item_kref(store)
+    except TypeError:  # unhashable callable — probe it uncached
+        accepts = _accepts_item_kref.__wrapped__(store)
+    return {"item_kref": revises} if accepts else {}
+
+
+def _record_supersession(new_kref: str, previous_kref: str) -> None:
+    """Record that the correction just stored replaces the revision it revised.
+
+    The SDK moves the ``published`` tag, so recall already answers with the
+    correction. The graph still has to say *why*: without a SUPERSEDES edge
+    the old revision keeps ``status`` unset and reads as a live belief on
+    every path that walks revisions rather than tags (dream state, insight
+    grounding, sibling recall), and anything grounded on it is never marked
+    stale. :func:`kumiho_memory.supersession.supersede_revision` is the one
+    protocol for that — edge first, then demote the exact target revision,
+    then ripple grounding staleness — and it is replay-convergent, so a
+    failure here is repaired by the next correction rather than needing to be
+    undone.
+
+    Best-effort, exactly like reflect's edge discovery: the memory is already
+    written and tagged, and refusing to report the store because the
+    bookkeeping edge failed would be a worse answer than a missing edge.
+    """
+    import kumiho
+
+    from kumiho_memory.supersession import supersede_revision
+
+    source = kumiho.get_revision(new_kref)
+    target = kumiho.get_revision(previous_kref)
+    # basis=agent: declared by the in-loop agent, not inferred from lexical
+    # overlap — the capture named the memory it corrects (see ontology_spec).
+    result = supersede_revision(
+        source, target, {"reason": "belief update", "basis": "agent"},
+    )
+    if result.error:
+        logger.warning(
+            "reflect: supersession bookkeeping incomplete for %s -> %s: %s",
+            new_kref, previous_kref, result.error,
+        )
+
+
 def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
     """Capture what matters after responding — buffers response + stores facts.
 
@@ -1443,7 +1524,26 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                     cap_metadata["origin"] = _origin
                 if _state:
                     cap_metadata["decision_state"] = _state
-            prepared.append({"cap": cap, "metadata": cap_metadata})
+            # A correction says what it corrects: `revises` carries the kref
+            # of the memory this capture replaces, so the store revises that
+            # item instead of guessing from a similarity score which memory —
+            # if any — the capture restates.
+            revises = str(cap.get("revises", "") or "").strip()
+            prepared.append({"cap": cap, "metadata": cap_metadata, "revises": revises})
+
+        def _supersede(rev_kref: str, previous_kref: str) -> None:
+            # Best-effort, like _discover: the store already landed and moved
+            # `published`, so a failed edge must not be reported as a failed
+            # capture. supersede_revision converges on replay.
+            if not (rev_kref and previous_kref):
+                return
+            try:
+                _record_supersession(rev_kref, previous_kref)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "reflect: supersession bookkeeping failed for %s -> %s",
+                    rev_kref, previous_kref, exc_info=True,
+                )
 
         def _discover(rev_kref: str, cap: Dict[str, Any]) -> None:
             # Edge discovery (best-effort, skipped if no server-side LLM).
@@ -1489,6 +1589,14 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                     "tags": p["cap"].get("tags"),
                     "metadata": p["metadata"],
                     "space_hint": space,
+                    # The batch takes the revise target as a per-capture dict
+                    # key, so there is no parameter of its own to probe. The
+                    # single store is the same release declaring the same
+                    # feature, and that is what is asked — and a wrong answer
+                    # here is harmless in a way it is not on the single path:
+                    # an older batch ignores a capture key it does not know,
+                    # where an unknown keyword would be a TypeError.
+                    **_item_kref_for(tool_memory_store, p["revises"]),
                 } for p, space in zip(prepared, spaces)],
                 project=manager.project,
                 space_path=space_path,
@@ -1507,6 +1615,8 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                 rev_kref = (res or {}).get("revision_kref", "")
                 if rev_kref:
                     stored_krefs.append(rev_kref)
+                    if p["revises"]:
+                        _supersede(rev_kref, (res or {}).get("previous_revision_kref", ""))
                     _discover(rev_kref, p["cap"])
         else:
             for p in prepared:
@@ -1524,10 +1634,15 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                     tags=cap.get("tags"),
                     metadata=p["metadata"],
                     stack_revisions=bool(cap_space),
+                    # A named revise target pins placement to the item's own
+                    # space; the SDK ignores space_path/stack_revisions there.
+                    **_item_kref_for(tool_memory_store, p["revises"]),
                 )
                 rev_kref = store_result.get("revision_kref", "")
                 if rev_kref:
                     stored_krefs.append(rev_kref)
+                    if p["revises"]:
+                        _supersede(rev_kref, store_result.get("previous_revision_kref", ""))
                 _discover(rev_kref, cap)
 
     result: Dict[str, Any] = {
@@ -2171,6 +2286,14 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
                                     "inside a space you named, because at the "
                                     "root the similarity search spans every "
                                     "unrouted memory in the project."
+                                ),
+                            },
+                            "revises": {
+                                "type": "string",
+                                "description": (
+                                    "kref of the memory this capture corrects "
+                                    "or updates; the capture becomes that "
+                                    "memory's new revision."
                                 ),
                             },
                             "event_date": {

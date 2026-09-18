@@ -17,7 +17,11 @@ PII/credential boundary. Credential-bearing atoms are dropped, never stored.
 > **Stable (1.x)**
 > Follows semantic versioning — the documented public API is stable and
 > breaking changes bump the major version.
-> Latest release: `1.5.0` (2026-09-10) — **Revision-aware insight and experience learning**:
+> Latest release: `1.5.1` (2026-09-18) — **A correction says what it
+> corrects**: a `kumiho_memory_reflect` capture can carry `revises`, the kref of
+> the memory it replaces, and becomes that memory's next revision instead of a
+> second memory beside it (needs `kumiho>=0.13.2`; older SDKs store as before).
+> Before it: `1.5.0` (2026-09-10) — **Revision-aware insight and experience learning**:
 > bounded host synthesis, explicit experience/outcome tracking, qualified recall,
 > and retryable belief replacement with resumable grounding invalidation.
 > See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the full history.
