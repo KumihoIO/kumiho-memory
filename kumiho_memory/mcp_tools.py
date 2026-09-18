@@ -32,6 +32,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kumiho_memory.applicability import CLAIM_ORIGINS, DECISION_STATES
 from kumiho_memory._request_context import current_request, hosted_llm_enabled
+from kumiho_memory.context_optimization import (
+    ContextOptimizationPolicy,
+    is_backed_off,
+    optimize_recall,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1240,16 +1245,37 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
 
         manager = _get_manager()
         recall_mode = args.get("recall_mode", manager.recall_mode)
+        limit = args.get("limit", 5)
+        # Judged delivery (context_optimization): when it is on and this scope
+        # is not backed off, recall a wider pool so the judgment has something
+        # to choose from. Off or backed off, the recall is the caller's own —
+        # the widened pool exists only to be narrowed again.
+        policy = ContextOptimizationPolicy.from_env()
+        judged = policy.enabled and not is_backed_off(scope)
         results = asyncio.run(
             manager.recall_memories(
                 args["query"],
-                limit=args.get("limit", 5),
+                limit=max(limit, policy.candidates) if judged else limit,
                 space_paths=args.get("space_paths"),
                 memory_types=args.get("memory_types"),
                 graph_augmented=args.get("graph_augmented", False),
             )
         )
         results = _filter_by_min_score(results, _min_score_from_args(args))
+        optimization = None
+        if policy.enabled:
+            outcome = optimize_recall(
+                args["query"], results, limit=limit, policy=policy, scope=scope,
+            )
+            # Everything downstream — context, results, source_krefs, count and
+            # the insight brief — is built from the kept memories only.
+            results = outcome.memories
+            optimization = {
+                "status": outcome.status,
+                "candidates": outcome.candidates,
+            }
+            if outcome.reason:
+                optimization["reason"] = outcome.reason
         context = manager.build_recalled_context(
             results, args["query"], recall_mode
         )
@@ -1304,6 +1330,12 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
             engage_result["synthesis_request"] = synthesis_request
         if learned_status is not None:
             engage_result["learned_source_status"] = learned_status
+        # Only when the feature is configured on: a caller that asked for
+        # judged delivery has to be able to tell a judged empty result ("no
+        # memory here answers this") from an unjudged one, and which of the two
+        # produced the count it is reading.
+        if optimization is not None:
+            engage_result["optimization"] = optimization
         # ``approx_tokens`` sizes the assembled context only; a caller budgeting
         # on it was off by a factor of ~18 (762 reported vs a 56 KB response,
         # measured 2026-07-31). What lands in the caller's context window is the
