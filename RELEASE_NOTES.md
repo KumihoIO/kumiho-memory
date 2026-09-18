@@ -1,5 +1,52 @@
 # Release Notes — kumiho-memory
 
+## v1.5.1
+
+**Release Date:** 2026-09-18
+
+**A correction now says which memory it corrects.**
+
+Patch release. One optional capture field, on one tool. No breaking public API
+changes, no new result fields, and no change to any other write path.
+
+- **`kumiho_memory_reflect` captures gain `revises`.** Put the kref of an
+  existing memory in it — an item kref or a revision kref, exactly as engage
+  results or an earlier `stored_krefs` printed it — and the capture is stored
+  as that memory's next revision rather than as a new memory beside it. This is
+  the correction case: "no, my favourite colour is black". Until now the store
+  had to guess, from a similarity score, whether a capture restated something
+  it already held; a guess that misses leaves the stale version exactly where
+  recall will find it. A capture that names its target is not a guess.
+- **What changes for a `revises` capture.** The similarity search does not run.
+  The new revision lands on the named item, in that item's own space, so
+  `space_hint` and `space_path` no longer decide where it goes. If the memory
+  being corrected was published, the `published` tag moves onto the correction
+  — which is what recall reads — and if it was not published, nothing is
+  published. Nothing is published on reflect's own initiative.
+- **The graph records the replacement, not just the new text.** After a
+  successful revise, reflect writes the SUPERSEDES edge from the correction to
+  the revision it replaced, marks that revision superseded, and ripples
+  grounding staleness to anything that was resting on it — the same belief
+  replacement protocol every other writer in this package uses. So a superseded
+  belief reads as superseded on the paths that walk revisions rather than tags.
+  This bookkeeping is best-effort, like edge discovery: if it fails, the
+  capture is still stored and still reported, and the next correction on that
+  memory repairs it.
+- **Captures without `revises` are unchanged**, byte for byte, including
+  stacking. Omit the field and reflect behaves exactly as it did in 1.5.0.
+- **The effect requires `kumiho>=0.13.2`**
+  ([KumihoIO/kumiho-SDKs#172](https://github.com/KumihoIO/kumiho-SDKs/pull/172)),
+  which is where the store learned to be told what it is revising. The
+  dependency floor stays at `kumiho>=0.10.7`: reflect asks the resolved store
+  callable whether it declares the parameter and simply omits it on an older
+  SDK, where a `revises` capture is accepted by the schema and stored normally,
+  with no error. There is no release-order constraint — the effect appears once
+  both are installed.
+- **Automated writers are deliberately unchanged**: the auto-memorize
+  background assessment, consolidation, experience records, insight pattern
+  candidates, and execution records. None of them is a correction anyone
+  authorized, so none of them names a memory to replace.
+
 ## v1.5.0
 
 **Release Date:** 2026-09-10
