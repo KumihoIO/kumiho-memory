@@ -1,5 +1,40 @@
 # Release Notes — kumiho-memory
 
+## v1.5.1
+
+**Release Date:** 2026-09-18
+
+**A correction now lands where recall reads it.**
+
+Patch release. One keyword, on one caller. No breaking public API changes, no
+new tool options, no new result fields, and no change to any other write path.
+
+- `kumiho_memory_reflect` passes `keep_published=True` to the SDK memory store,
+  on both the single-capture path and the batched path. A reflect capture is a
+  correction the user authorized, and reflect forwards each capture's
+  classification tags. When such a tagged capture *stacks* onto an existing
+  memory whose current revision is `published`, the SDK left the tag on the old
+  revision — and recall, which resolves `published` before `latest`, kept
+  returning the value the user had just corrected. With the opt-in, the tag
+  moves forward onto the stacked revision, so the correction is what recall
+  returns.
+- Nothing is published that was not already published. On an item with no
+  `published` revision, and on a newly created item, the opt-in does nothing —
+  unpublished chains are untouched. Memories corrected *before* this release
+  are not retagged retroactively; the next reflect that stacks onto them fixes
+  them.
+- The effect requires `kumiho>=0.13.2`
+  ([KumihoIO/kumiho-SDKs#171](https://github.com/KumihoIO/kumiho-SDKs/pull/171)),
+  which is where `keep_published` exists. The dependency floor stays at
+  `kumiho>=0.10.7`: reflect inspects the resolved store callable and simply
+  omits the keyword on an older SDK, where behaviour is exactly as in 1.5.0.
+  There is no release-order constraint — the effect appears once both are
+  installed.
+- Automated writers are deliberately unchanged and keep the default: the
+  auto-memorize background assessment, experience records, insight pattern
+  candidates, consolidation, and execution records. `published` is an approval
+  and immutability marker, so nothing publishes on a writer's own initiative.
+
 ## v1.5.0
 
 **Release Date:** 2026-09-10

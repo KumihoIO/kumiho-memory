@@ -21,11 +21,13 @@ with no active event loop — ``asyncio.run()`` is safe to use inside them.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import threading
 import time
 from collections import OrderedDict
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 from kumiho_memory.applicability import CLAIM_ORIGINS, DECISION_STATES
@@ -1372,6 +1374,51 @@ def _normalize_capture_state(value: Any) -> str:
     return "" if state == STATE_UNKNOWN else state
 
 
+@lru_cache(maxsize=32)
+def _accepts_keep_published(store: Any) -> bool:
+    """Whether *store* takes the SDK's ``keep_published`` keyword.
+
+    ``**kwargs`` counts as accepting — a wrapper that forwards everything
+    forwards this too. A callable whose signature cannot be read (a C
+    accelerator, an exotic proxy) counts as NOT accepting: omitting the
+    keyword costs one tag move, passing it blindly costs the whole write.
+    """
+    try:
+        params = inspect.signature(store).parameters
+    except (TypeError, ValueError):
+        return False
+    return "keep_published" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _keep_published_kwarg(store: Any) -> Dict[str, Any]:
+    """``{"keep_published": True}`` when *store* accepts it, else ``{}``.
+
+    A reflect capture is a correction the user authorized ("my favourite
+    colour is black"), and reflect passes each capture's classification tags
+    through. On kumiho < 0.13.2 a tagged capture that STACKS onto an item
+    whose current revision is ``published`` left the tag on the old revision,
+    and recall — which resolves ``published`` before ``latest`` — kept
+    returning the value the user had just corrected. ``keep_published=True``
+    moves the tag forward onto the stacked revision (it never publishes a new
+    item, and never one that had no ``published`` revision).
+
+    Only reflect opts in. The automated writers — auto-memorize, experience
+    records, insight patterns, consolidation, execution records — keep the
+    default, because nothing should publish on a writer's own initiative.
+
+    Asked per callable because kumiho-memory's floor is ``kumiho>=0.10.7``
+    and an older core raises ``TypeError`` on the unknown keyword; the answer
+    is cached, so the signature is read once per store.
+    """
+    try:
+        accepts = _accepts_keep_published(store)
+    except TypeError:  # unhashable callable — probe it uncached
+        accepts = _accepts_keep_published.__wrapped__(store)
+    return {"keep_published": True} if accepts else {}
+
+
 def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
     """Capture what matters after responding — buffers response + stores facts.
 
@@ -1496,6 +1543,8 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                 edge_type="DERIVED_FROM",
                 stack_revisions=all(spaces),
                 idempotency_prefix=idempotency_prefix,
+                # A correction that stacks must become what recall reads.
+                **_keep_published_kwarg(tool_memory_store_batch),
             )
             # Positionally-aligned per-capture results (each {revision_kref, ...} or
             # {error}) so a bulk caller (history backfill) can map + mark each
@@ -1524,6 +1573,8 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
                     tags=cap.get("tags"),
                     metadata=p["metadata"],
                     stack_revisions=bool(cap_space),
+                    # A correction that stacks must become what recall reads.
+                    **_keep_published_kwarg(tool_memory_store),
                 )
                 rev_kref = store_result.get("revision_kref", "")
                 if rev_kref:
