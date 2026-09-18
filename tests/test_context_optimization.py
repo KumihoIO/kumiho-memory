@@ -128,8 +128,8 @@ def test_policy_defaults_are_off():
     assert policy.enabled is False
     assert policy.candidates == 50
     assert policy.summary_chars == 600
-    assert policy.relevance_min == 0.45
-    assert policy.evidence_min == 0.5
+    assert policy.relevance_min == 0.4
+    assert policy.evidence_min == 0.4
     assert policy.timeout_ms == 4000
 
 
@@ -203,8 +203,8 @@ def test_policy_invalid_thresholds_fall_back_to_the_default(raw, caplog):
             "KUMIHO_MEMORY_CONTEXT_OPT_RELEVANCE_MIN": raw,
             "KUMIHO_MEMORY_CONTEXT_OPT_EVIDENCE_MIN": raw,
         })
-    assert policy.relevance_min == 0.45
-    assert policy.evidence_min == 0.5
+    assert policy.relevance_min == 0.4
+    assert policy.evidence_min == 0.4
     assert "RELEVANCE_MIN" in caplog.text
 
 
@@ -344,9 +344,9 @@ def test_keeps_only_what_passes_both_questions():
 def test_thresholds_are_inclusive_at_the_boundary():
     pool = memories(3)
     client = RecordingClient(_judged([
-        (0.45, 0.5),     # exactly on both thresholds — kept
-        (0.4499, 0.9),   # just under relevance
-        (0.9, 0.4999),   # just under evidence
+        (0.4, 0.4),      # exactly on both thresholds — kept
+        (0.3999, 0.9),   # just under relevance
+        (0.9, 0.3999),   # just under evidence
     ]))
     outcome = optimize_recall("q", pool, limit=5, policy=ENABLED, client=client)
     assert outcome.memories == [pool[0]]

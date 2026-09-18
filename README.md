@@ -421,8 +421,8 @@ unavailable case costs nothing.
 | `KUMIHO_MEMORY_CONTEXT_OPT_ENABLED` | off | master switch; unset leaves engage untouched |
 | `KUMIHO_MEMORY_CONTEXT_OPT_CANDIDATES` | `50` | candidate pool to judge (the RPC accepts at most 64) |
 | `KUMIHO_MEMORY_CONTEXT_OPT_SUMMARY_CHARS` | `600` | summary characters sent per candidate |
-| `KUMIHO_MEMORY_CONTEXT_OPT_RELEVANCE_MIN` | `0.45` | keep threshold for "addresses the subject" |
-| `KUMIHO_MEMORY_CONTEXT_OPT_EVIDENCE_MIN` | `0.5` | keep threshold for "usable in a direct answer" |
+| `KUMIHO_MEMORY_CONTEXT_OPT_RELEVANCE_MIN` | `0.4` | keep threshold for "addresses the subject" |
+| `KUMIHO_MEMORY_CONTEXT_OPT_EVIDENCE_MIN` | `0.4` | keep threshold for "usable in a direct answer" |
 | `KUMIHO_MEMORY_CONTEXT_OPT_TIMEOUT_MS` | `4000` | per-request deadline |
 
 A malformed value falls back to the default with one warning.

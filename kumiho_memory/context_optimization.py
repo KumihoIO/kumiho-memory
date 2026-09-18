@@ -5,8 +5,8 @@ also the delivery decision.  Measured on 40 queries x 50 candidates, rank
 cannot carry that: 61 of 100 necessary memories sat outside the top 5 and the
 search score separated necessary from unnecessary at AUC 0.67.  Judging the
 same 50 candidates in ONE batched evaluation request separates them at AUC
-0.97 — necessary-memory recall 0.55 -> 0.95, precision 0.38 -> 0.95, delivered
-count dynamic (0-43, median 3), and nothing delivered for a query whose pool
+0.97 — necessary-memory recall 0.55 -> 0.93, precision 0.38 -> 0.92, delivered
+count dynamic (0-47, median 3), and nothing delivered for a query whose pool
 held nothing relevant.
 
 So this module widens the recall, asks the Kumiho server's ``Evaluate`` RPC two
@@ -71,8 +71,14 @@ MAX_CANDIDATES = 64
 
 DEFAULT_CANDIDATES = 50
 DEFAULT_SUMMARY_CHARS = 600
-DEFAULT_RELEVANCE_MIN = 0.45
-DEFAULT_EVIDENCE_MIN = 0.5
+#: Keep thresholds.  Measured end to end (this module -> SDK -> server -> judge)
+#: and against the judge API directly, with three question wordings: 0.4 / 0.4
+#: held necessary-memory recall at 0.93-0.96 and precision at 0.86-0.92 in every
+#: variant.  The judge's own cookbook values (0.45 / 0.55) are tuned for one
+#: passage per request; in a batch the evidence score sits lower, and 0.5 put
+#: several necessary memories on the wrong side of it (recall 0.88-0.95).
+DEFAULT_RELEVANCE_MIN = 0.4
+DEFAULT_EVIDENCE_MIN = 0.4
 DEFAULT_TIMEOUT_MS = 4000
 
 RELEVANCE_QUESTION = "is_relevant"
