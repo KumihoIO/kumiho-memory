@@ -1,5 +1,121 @@
 # Release Notes — kumiho-memory
 
+## v1.6.0
+
+**Release Date:** 2026-09-19
+
+**Engage can decide what to deliver, instead of delivering whatever ranked
+top.**
+
+Minor release. One new opt-in module, one additive engage response field, and
+no change to any path that does not switch it on. Off by default, and the
+`kumiho` dependency floor is deliberately unchanged.
+
+### Judged delivery (`kumiho_memory.context_optimization`)
+
+`kumiho_memory_engage` recalls `limit` memories (default 5) and delivers all of
+them, so retrieval rank is also the delivery decision. On a 40-query benchmark
+over 50 candidates per query, rank could not carry that decision: 61 of 100
+necessary memories sat outside the top 5.
+
+- **What it does when it is on.** Engage widens the recall to a candidate pool,
+  sends that pool to the Kumiho server's `Evaluate` RPC in one batched request,
+  and asks two yes/no-probability questions about each candidate — does this
+  memory address the subject of the query, and does it state something usable
+  in a direct answer. A memory is delivered when it scores at least `0.4` on
+  both. `context`, `results`, `source_krefs`, `count` and the optional insight
+  brief are all built from the survivors. Nothing is padded: delivering zero
+  memories is a valid answer and the measured point of the feature.
+  `kumiho_memory_recall` is untouched.
+- **Measured effect** on that benchmark: necessary-memory recall 0.55 → 0.93,
+  precision 0.38 → 0.92, and a delivered count that follows the query instead
+  of the limit (0–47, median 3), with nothing delivered for a query whose pool
+  held nothing relevant.
+- **Off by default.** `KUMIHO_MEMORY_CONTEXT_OPT_ENABLED` is the master switch
+  and is unset out of the box. With it unset, engage behaves exactly as it did
+  in 1.5.1 and nothing in this release runs.
+- **Inert where the capability is absent.** `Evaluate` is a paid Kumiho Cloud
+  capability. On a self-hosted CE server, on a tier without the entitlement, or
+  on an SDK that has no `kumiho.evaluate`, the feature simply does not apply:
+  every failure path delivers the first `limit` recalled memories — 1.5.1's
+  behaviour — and nothing raises out of engage. After a verdict that will not
+  change soon (no entitlement, no RPC, no SDK function) the requesting identity
+  stops asking for 10 minutes; after a transient one (over limit, evaluation
+  provider unavailable) for 1 minute. While backed off the recall is not
+  widened either, so the unavailable case costs nothing. The back-off is keyed
+  per requesting identity, so one unentitled tenant cannot turn the feature off
+  for the others a hosted process serves.
+- **The dependency floor stays at `kumiho>=0.10.7`.** `kumiho.evaluate` is
+  resolved at call time, never at import, so an install without it degrades to
+  the old delivery rather than failing to import. The effect appears once a
+  Kumiho server with `Evaluate` and an SDK release carrying `kumiho.evaluate`
+  are both in place; there is no release-order constraint.
+
+### Configuration
+
+| variable | default | meaning |
+|---|---|---|
+| `KUMIHO_MEMORY_CONTEXT_OPT_ENABLED` | off | master switch; unset leaves engage untouched |
+| `KUMIHO_MEMORY_CONTEXT_OPT_CANDIDATES` | `50` | candidate pool to judge (the RPC accepts at most 64) |
+| `KUMIHO_MEMORY_CONTEXT_OPT_SUMMARY_CHARS` | `600` | summary characters sent per candidate |
+| `KUMIHO_MEMORY_CONTEXT_OPT_RELEVANCE_MIN` | `0.4` | keep threshold for "addresses the subject" |
+| `KUMIHO_MEMORY_CONTEXT_OPT_EVIDENCE_MIN` | `0.4` | keep threshold for "usable in a direct answer" |
+| `KUMIHO_MEMORY_CONTEXT_OPT_TIMEOUT_MS` | `4000` | per-request deadline |
+
+A malformed value falls back to its default with one warning.
+
+**Per request, not only per process.** The entitlement belongs to the caller,
+not to the deployment, and a process serving several identities cannot express
+that as an environment variable. `judged_delivery(enabled)` is a context
+manager that decides the switch for the calling context only, and
+`resolve_policy()` prefers it over `KUMIHO_MEMORY_CONTEXT_OPT_ENABLED` in
+either direction while it is in force; the remaining knobs still come from the
+environment, since they are one deployment's measured operating point. Nothing
+sets the override on the stdio path, where the environment alone decides
+exactly as before.
+
+### What is sent for judgment
+
+One fragment per candidate: the first `SUMMARY_CHARS` (600) characters of the
+memory's summary, plus its title, memory type and the date it is judged under,
+carried as metadata under an opaque positional id (`c01`, `c02`, …) local to
+that one call. Krefs, space paths, tags, tenant ids and user ids never leave
+the process. Delivery always uses the full memory — the cut is for the judge
+only. Judging 600 characters rather than the whole summary was measured: same
+recall, precision 0.88 → 0.95, 36% fewer evaluation tokens.
+
+The judged date is the memory's `event_date` when recall reported a clean ISO
+calendar date for it, and its storage day otherwise.
+
+### Response contract
+
+One additive field, present only while the feature is enabled:
+
+```json
+{"optimization": {"status": "applied", "candidates": 50}}
+{"optimization": {"status": "fallback", "candidates": 5, "reason": "not_entitled"}}
+```
+
+`candidates` is how many memories were judged (`applied`) or recalled
+(`fallback`); `reason` appears only on a fallback. A judged result that keeps
+nothing is `count: 0` with `status: "applied"` — a caller has to be able to
+tell "no memory here answers this" from "the judgment did not happen".
+
+### Deliberately not in this release
+
+- **No temporal logic.** The rubric asks about subject and evidence, not about
+  order, and the judge keeps superseded "latest version" memories. Recency —
+  "what did I decide most recently" — is still the `kumiho_memory_retrieve`
+  tool's `latest` mode, and supersession is still handled by the existing
+  deterministic markers. Neither changes here.
+- **No delivery cap and no graph-neighbour expansion.** Both were measured and
+  neither improved the delivered set.
+
+**Validation:** 92 new tests covering policy resolution, the per-request
+override, fragment building, the keep rule, every fallback reason, back-off
+windows and the engage integration; the full non-live suite passes alongside
+them.
+
 ## v1.5.1
 
 **Release Date:** 2026-09-18

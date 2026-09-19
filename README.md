@@ -17,13 +17,15 @@ PII/credential boundary. Credential-bearing atoms are dropped, never stored.
 > **Stable (1.x)**
 > Follows semantic versioning — the documented public API is stable and
 > breaking changes bump the major version.
-> Latest release: `1.5.1` (2026-09-18) — **A correction says what it
-> corrects**: a `kumiho_memory_reflect` capture can carry `revises`, the kref of
-> the memory it replaces, and becomes that memory's next revision instead of a
-> second memory beside it (needs `kumiho>=0.13.2`; older SDKs store as before).
-> Before it: `1.5.0` (2026-09-10) — **Revision-aware insight and experience learning**:
-> bounded host synthesis, explicit experience/outcome tracking, qualified recall,
-> and retryable belief replacement with resumable grounding invalidation.
+> Latest release: `1.6.0` (2026-09-19) — **Engage can decide what to
+> deliver**: opt-in judged delivery judges a wider candidate pool in one batched
+> evaluation request and hands over only the memories that answer the query,
+> instead of whatever ranked top (off by default; inert without a paid Kumiho
+> Cloud tier, and the `kumiho` floor is unchanged).
+> Before it: `1.5.1` (2026-09-18) — **A correction says what it corrects**: a
+> `kumiho_memory_reflect` capture can carry `revises`, the kref of the memory it
+> replaces, and becomes that memory's next revision instead of a second memory
+> beside it (needs `kumiho>=0.13.2`; older SDKs store as before).
 > See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the full history.
 
 ---
