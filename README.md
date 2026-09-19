@@ -98,7 +98,7 @@ client-side, no server changes required.
 * **Judged delivery** *(opt-in, paid Kumiho Cloud)* — engage judges a
   wider candidate pool in one batched evaluation request and delivers
   only the memories that answer the query (necessary-memory recall
-  0.55 → 0.95, precision 0.38 → 0.95), instead of delivering whatever
+  0.55 → 0.93, precision 0.38 → 0.92), instead of delivering whatever
   ranked top. Inert and fallback-safe wherever the capability is absent.
   See below.
 * **Space profiles** — per-Space churn/evidence/stability signals
@@ -394,7 +394,7 @@ rank cannot carry that decision — 61 of 100 necessary memories sat
 outside the top 5, and the search score separated necessary from
 unnecessary at AUC 0.67. Judging the same pool in **one** batched
 evaluation request separates them at AUC 0.97: necessary-memory recall
-0.55 → 0.95, precision 0.38 → 0.95, delivered count dynamic (0–43,
+0.55 → 0.93, precision 0.38 → 0.92, delivered count dynamic (0–47,
 median 3), and **nothing delivered** for a query whose pool held nothing
 relevant.
 

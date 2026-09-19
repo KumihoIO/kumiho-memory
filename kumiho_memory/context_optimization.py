@@ -225,7 +225,7 @@ class ContextOptimizationPolicy:
     """How wide to judge, on how much text, and how hard to pass.
 
     Thresholds are the measured operating point of :data:`RUBRIC_VERSION`
-    (necessary-memory recall 0.95 at precision 0.95); moving them trades one
+    (necessary-memory recall 0.93 at precision 0.92); moving them trades one
     for the other.
     """
 
