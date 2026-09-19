@@ -385,20 +385,24 @@ Next content.
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def plugin_skill_path():
+    """Find an optional sibling checkout without assuming a fixed repo depth."""
+    def locate(relative_path):
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "kumiho-plugins" / relative_path
+            if candidate.is_file():
+                return candidate
+        pytest.skip(f"Plugin skill {relative_path} not found in a sibling checkout")
+
+    return locate
+
+
 class TestParseRealSkills:
-    """Parse the actual plugin SKILL.md files to ensure they're valid."""
+    """Parse actual plugin files when the optional sibling checkout exists."""
 
-    # Navigate from kumiho-SDKs/python/kumiho-memory/tests/ up to repo root
-    _REPO_ROOT = Path(__file__).resolve().parents[4]  # KumihoIO/
-    CLAUDE_SKILL = _REPO_ROOT / "kumiho-plugins" / "claude" / "skills" / "kumiho-memory" / "SKILL.md"
-    ZEROCLAW_SKILL = _REPO_ROOT / "kumiho-plugins" / "zeroclaw" / "SKILL.md"
-
-    @pytest.mark.skipif(
-        not (Path(__file__).resolve().parents[4] / "kumiho-plugins" / "claude" / "skills" / "kumiho-memory" / "SKILL.md").exists(),
-        reason="Claude SKILL.md not found in repo",
-    )
-    def test_parse_claude_skill(self):
-        parsed = parse_skill(self.CLAUDE_SKILL)
+    def test_parse_claude_skill(self, plugin_skill_path):
+        parsed = parse_skill(plugin_skill_path("claude/skills/kumiho-memory/SKILL.md"))
         assert parsed.name == "kumiho-memory"
         assert len(parsed.sections) > 0
 
@@ -412,12 +416,8 @@ class TestParseRealSkills:
         assert len(reflex_sections) == 1
         assert reflex_sections[0].inline is True
 
-    @pytest.mark.skipif(
-        not (Path(__file__).resolve().parents[4] / "kumiho-plugins" / "zeroclaw" / "SKILL.md").exists(),
-        reason="ZeroClaw SKILL.md not found in repo",
-    )
-    def test_parse_zeroclaw_skill(self):
-        parsed = parse_skill(self.ZEROCLAW_SKILL)
+    def test_parse_zeroclaw_skill(self, plugin_skill_path):
+        parsed = parse_skill(plugin_skill_path("zeroclaw/SKILL.md"))
         assert parsed.name == "kumiho-memory"
         assert len(parsed.sections) > 0
 
