@@ -411,8 +411,11 @@ is a valid, intended answer. `kumiho_memory_recall` is unchanged.
 **Requires a paid Kumiho Cloud tier.** `Evaluate` does not exist on
 self-hosted CE or on an SDK without `kumiho.evaluate`, and an unentitled
 tier is refused. Everywhere it is unavailable the feature is inert:
-engage delivers the first `limit` recalled memories — today's behavior —
-and never raises. After a refusal that will not change soon (no
+engage restores the caller's original recall. If candidates were widened,
+this requires one extra recall at the original limit: a wide result's prefix
+can differ from the original ranking. Graph-expanded evidence is preserved.
+Pools above the RPC's 64-fragment limit also take this fallback without an
+evaluation request. After a refusal that will not change soon (no
 entitlement, no RPC) the requesting identity stops asking for 10
 minutes; after a transient one (over limit, provider unavailable) for 1
 minute. While backed off the recall is not widened either, so the
@@ -461,7 +464,7 @@ feature is enabled:
 `backoff`, `no_candidates`, `sdk_unavailable`, `not_entitled`,
 `over_limit`, `provider_unavailable`, `invalid_request`,
 `unknown_status`, `unimplemented`, `permission_denied`, `timeout`,
-`error`.
+`candidate_limit_exceeded`, `invalid_response`, `no_valid_judgments`, `error`.
 
 Supersession is deliberately **not** part of this: the judge keeps
 superseded "latest version" memories, which the existing deterministic

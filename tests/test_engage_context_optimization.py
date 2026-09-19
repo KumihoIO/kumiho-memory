@@ -47,7 +47,7 @@ def manager(monkeypatch):
     )
     mgr.rows = [row(index) for index in range(12)]
     mgr.recall_memories = AsyncMock(
-        side_effect=lambda *a, **k: copy.deepcopy(mgr.rows),
+        side_effect=lambda *a, **k: copy.deepcopy(mgr.rows[:k["limit"]]),
     )
     mgr.build_recalled_context = Mock(side_effect=lambda *a, **k:
         UniversalMemoryManager.build_recalled_context(mgr, *a, **k))
@@ -106,7 +106,7 @@ def test_disabled_recalls_the_callers_limit_and_reports_nothing(manager, monkeyp
 
     assert recall_limit(manager) == 3
     assert "optimization" not in result
-    assert result["count"] == 12
+    assert result["count"] == 3
 
 
 def test_disabled_response_is_unchanged(manager, monkeypatch):
@@ -268,10 +268,51 @@ def test_an_sdk_without_evaluate_delivers_the_caller_limit_prefix(
     assert result["count"] == 5
 
 
-def test_fallback_still_widened_the_recall(manager, enabled, monkeypatch):
-    """The first failure pays for one wide recall; the back-off pays for none."""
+def test_fallback_restores_the_original_recall(manager, enabled, monkeypatch):
+    """The first failure restores the baseline; back-off avoids widening again."""
     _fallback_result(monkeypatch, lambda *a, **k: Result(status="not_entitled"))
-    assert recall_limit(manager) == 50
+    assert [call.kwargs["limit"] for call in manager.recall_memories.await_args_list] == [50, 5]
+
+
+@pytest.mark.parametrize("status", ["provider_unavailable", "ok", "partial"])
+def test_fallback_does_not_assume_a_wide_prefix_is_the_baseline(manager, enabled, monkeypatch, status):
+    wide = [row(index) for index in range(12)]
+    baseline = [wide[8], wide[1], wide[7]]
+    manager.recall_memories.side_effect = lambda *a, **k: copy.deepcopy(
+        wide if k["limit"] == 50 else baseline
+    )
+    install(monkeypatch, lambda *a, **k: Result(status=status))
+
+    result = engage(limit=3, space_paths=["decisions"], memory_types=["decision"])
+
+    assert result["source_krefs"] == [memory["kref"] for memory in baseline]
+    assert result["optimization"]["status"] == "fallback"
+    assert result["optimization"]["reason"] == (
+        "provider_unavailable" if status == "provider_unavailable" else "no_valid_judgments"
+    )
+    last = manager.recall_memories.await_args.kwargs
+    assert last["space_paths"] == ["decisions"]
+    assert last["memory_types"] == ["decision"]
+
+
+@pytest.mark.parametrize("backed_off", [False, True])
+def test_graph_fallback_preserves_the_actual_baseline(manager, enabled, monkeypatch, backed_off):
+    # Graph recall may return up to limit * 3, plus reserved evidence.
+    manager.recall_memories.side_effect = lambda *a, **k: [
+        row(index) for index in range(k["limit"] * 3)
+    ]
+    evaluator = install(monkeypatch, Mock(side_effect=AssertionError("must not evaluate")))
+    if backed_off:
+        ctxopt._backoff_until[""] = time.monotonic() + 600.0
+
+    result = engage(limit=5, graph_augmented=True)
+
+    evaluator.assert_not_called()
+    assert result["count"] == 15, "graph evidence is not truncated to the seed limit"
+    assert result["optimization"]["reason"] == (
+        "backoff" if backed_off else "candidate_limit_exceeded"
+    )
+    assert recall_limit(manager) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +330,7 @@ def test_a_backed_off_scope_does_not_widen_and_does_not_evaluate(
 
     assert recall_limit(manager) == 3
     assert result["optimization"] == {
-        "status": "fallback", "candidates": 12, "reason": "backoff",
+        "status": "fallback", "candidates": 3, "reason": "backoff",
     }
     assert result["count"] == 3
 
@@ -371,7 +412,7 @@ def test_override_off_beats_the_environment(manager, enabled, monkeypatch):
 
     assert recall_limit(manager) == 3
     assert "optimization" not in result
-    assert result["count"] == 12
+    assert result["count"] == 3
 
 
 def test_engage_is_unchanged_once_the_override_is_gone(manager, monkeypatch):
@@ -385,7 +426,7 @@ def test_engage_is_unchanged_once_the_override_is_gone(manager, monkeypatch):
 
     assert recall_limit(manager) == 3
     assert "optimization" not in after
-    assert after["count"] == 12
+    assert after["count"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -400,4 +441,4 @@ def test_recall_is_untouched(manager, enabled, monkeypatch):
 
     assert recall_limit(manager) == 3
     assert "optimization" not in result
-    assert result["count"] == 12
+    assert result["count"] == 3

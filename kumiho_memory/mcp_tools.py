@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from kumiho_memory.applicability import CLAIM_ORIGINS, DECISION_STATES
 from kumiho_memory._request_context import current_request, hosted_llm_enabled
 from kumiho_memory.context_optimization import (
+    STATUS_FALLBACK,
     is_backed_off,
     optimize_recall,
     resolve_policy,
@@ -1253,13 +1254,17 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
         # request's override when a host set one, else from the environment.
         policy = resolve_policy()
         judged = policy.enabled and not is_backed_off(scope)
+        search_limit = max(limit, policy.candidates) if judged else limit
+        recall_options = {
+            "space_paths": args.get("space_paths"),
+            "memory_types": args.get("memory_types"),
+            "graph_augmented": args.get("graph_augmented", False),
+        }
         results = asyncio.run(
             manager.recall_memories(
                 args["query"],
-                limit=max(limit, policy.candidates) if judged else limit,
-                space_paths=args.get("space_paths"),
-                memory_types=args.get("memory_types"),
-                graph_augmented=args.get("graph_augmented", False),
+                limit=search_limit,
+                **recall_options,
             )
         )
         results = _filter_by_min_score(results, _min_score_from_args(args))
@@ -1268,9 +1273,18 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
             outcome = optimize_recall(
                 args["query"], results, limit=limit, policy=policy, scope=scope,
             )
-            # Everything downstream — context, results, source_krefs, count and
-            # the insight brief — is built from the kept memories only.
-            results = outcome.memories
+            if outcome.status != STATUS_FALLBACK:
+                results = outcome.memories
+            elif search_limit != limit:
+                # A widened prefix need not equal the original ranked recall.
+                # Restore its actual membership and retain all graph evidence,
+                # which can legitimately exceed the caller's seed limit.
+                results = asyncio.run(manager.recall_memories(
+                    args["query"], limit=limit, **recall_options,
+                ))
+                results = _filter_by_min_score(results, _min_score_from_args(args))
+            # On an unwidened fallback results already IS the original recall.
+            # Everything downstream uses this same final set.
             optimization = {
                 "status": outcome.status,
                 "candidates": outcome.candidates,

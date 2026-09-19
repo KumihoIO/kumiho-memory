@@ -550,6 +550,46 @@ def test_missing_answer_is_treated_as_unjudged():
     assert outcome.memories == [pool[0]]
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), -0.1, 1.1])
+@pytest.mark.parametrize("question_id", ["is_relevant", "contains_answer_evidence"])
+def test_invalid_probability_cannot_remove_or_promote_a_memory(invalid, question_id):
+    pool = memories(2)
+    judgments = []
+    for index in range(2):
+        answers = {
+            "is_relevant": Answer(0.9),
+            "contains_answer_evidence": Answer(0.9),
+        }
+        answers[question_id] = Answer(invalid)
+        judgments.append(Judgment("c%02d" % (index + 1), answers=answers))
+    outcome = optimize_recall(
+        "q", pool, limit=1, policy=ENABLED,
+        client=RecordingClient(Result(fragments=judgments)),
+    )
+    assert outcome.memories == pool[:1], "invalid probabilities are unjudged"
+
+
+def test_malformed_evaluation_response_does_not_break_recall():
+    pool = memories(3)
+    result = Result()
+    result.fragments = 42
+    outcome = optimize_recall(
+        "q", pool, limit=2, policy=ENABLED, client=RecordingClient(result),
+    )
+    assert outcome.status == "fallback"
+    assert outcome.reason == "invalid_response"
+    assert outcome.memories == pool[:2]
+
+
+def test_oversized_candidate_pool_does_not_send_an_invalid_rpc():
+    pool = memories(65)
+    client = RecordingClient()
+    outcome = optimize_recall("q", pool, limit=5, policy=ENABLED, client=client)
+    assert client.calls == []
+    assert outcome.status == "fallback"
+    assert outcome.reason == "candidate_limit_exceeded"
+
+
 # ---------------------------------------------------------------------------
 # Fallback paths
 # ---------------------------------------------------------------------------

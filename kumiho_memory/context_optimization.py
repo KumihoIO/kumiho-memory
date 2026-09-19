@@ -24,8 +24,8 @@ measured against judging the whole summary: same recall, precision 0.88 ->
 
 **Availability.**  ``Evaluate`` is a paid Kumiho Cloud capability.  On a
 self-hosted CE server, an older SDK, or a tier without the entitlement the
-feature is simply off: every failure path delivers the first ``limit``
-candidates — today's behaviour — and nothing raises out of engage.  After a
+feature is simply off: on a whole-request fallback engage restores the
+caller's original recall, and nothing raises out of engage. After a
 verdict that will not change soon (no entitlement, no RPC) the scope backs off
 for ten minutes; after a transient one (over limit, provider unavailable) for
 one minute.  The back-off is per requesting identity, because the hosted
@@ -525,7 +525,10 @@ def _noul(answers: Any, question_id: str) -> Optional[float]:
     value = getattr(get(question_id), "noul", None)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    probability = float(value)
+    # NaN, infinities and out-of-range numbers are not negative judgments.
+    # Treat them as unjudged so bad provider data cannot erase the baseline.
+    return probability if 0.0 <= probability <= 1.0 else None
 
 
 def _verdict(judgment: Any) -> Optional[Tuple[float, float]]:
@@ -549,7 +552,7 @@ def apply_keep_rule(
     *,
     limit: int,
     policy: ContextOptimizationPolicy,
-) -> List[Dict[str, Any]]:
+) -> Optional[List[Dict[str, Any]]]:
     """The memories to deliver, in pipeline order.
 
     A judged memory is kept when it is about the query's subject *and* states
@@ -557,7 +560,8 @@ def apply_keep_rule(
     per-fragment error, missing answer) is treated exactly as it is today: kept
     if it is within the caller's own ``limit`` positions, dropped otherwise.
     Nothing pads the result — delivering zero memories is a valid outcome, and
-    the measured point of the feature.
+    the measured point of the feature. None means no candidate had a valid
+    verdict at all, so the whole request must fall back instead.
     """
     by_id: Dict[str, Any] = {}
     for judgment in getattr(result, "fragments", None) or []:
@@ -566,6 +570,7 @@ def apply_keep_rule(
             by_id[key] = judgment
 
     kept: List[Dict[str, Any]] = []
+    judged = 0
     for position, mem in enumerate(memories):
         verdict = _verdict(by_id.get(fragment_id(position)))
         if verdict is None:
@@ -573,9 +578,10 @@ def apply_keep_rule(
                 kept.append(mem)
             continue
         relevance, evidence = verdict
+        judged += 1
         if relevance >= policy.relevance_min and evidence >= policy.evidence_min:
             kept.append(mem)
-    return kept
+    return kept if judged else None
 
 
 @dataclass(frozen=True)
@@ -591,7 +597,7 @@ class OptimizationOutcome:
 def _fallback(
     memories: Sequence[Dict[str, Any]], limit: int, reason: str,
 ) -> OptimizationOutcome:
-    """Today's delivery: the first *limit* recalled candidates."""
+    """A safe local prefix; engage restores the original recall when widened."""
     return OptimizationOutcome(
         memories=list(memories[:limit]),
         status=STATUS_FALLBACK,
@@ -624,10 +630,14 @@ def optimize_recall(
         return _fallback(candidates, limit, "backoff")
     if not candidates:
         return _fallback(candidates, limit, "no_candidates")
+    if len(candidates) > MAX_CANDIDATES:
+        # Graph expansion and explicit caller limits can exceed the policy's
+        # candidate target. Do not send a request the RPC must reject.
+        return _fallback(candidates, limit, "candidate_limit_exceeded")
 
-    fragments = build_fragments(candidates, policy)
-    questions = [dict(question) for question in QUESTIONS]
     try:
+        fragments = build_fragments(candidates, policy)
+        questions = [dict(question) for question in QUESTIONS]
         result = (client or SdkEvaluationClient()).evaluate(
             query, fragments, questions, timeout_ms=policy.timeout_ms,
         )
@@ -646,15 +656,23 @@ def optimize_recall(
             logger.debug("context optimization failed (%s): %s", reason, exc)
         return _fallback(candidates, limit, reason)
 
-    status = str(getattr(result, "status", "") or "")
-    if status not in _USABLE_STATUSES:
-        reason = status if status in _KNOWN_STATUSES else "unknown_status"
-        seconds = _backoff_seconds(reason)
-        if seconds:
-            _start_backoff(scope, seconds, reason, now)
-        return _fallback(candidates, limit, reason)
+    try:
+        status = str(getattr(result, "status", "") or "")
+        if status not in _USABLE_STATUSES:
+            reason = status if status in _KNOWN_STATUSES else "unknown_status"
+            seconds = _backoff_seconds(reason)
+            if seconds:
+                _start_backoff(scope, seconds, reason, now)
+            return _fallback(candidates, limit, reason)
 
-    kept = apply_keep_rule(candidates, result, limit=limit, policy=policy)
+        kept = apply_keep_rule(candidates, result, limit=limit, policy=policy)
+        if kept is None:
+            return _fallback(candidates, limit, "no_valid_judgments")
+    except Exception:
+        # Decoding and selection belong to the same optional boundary as the
+        # RPC itself. A malformed response must not make engage unavailable.
+        logger.debug("context optimization returned an invalid response")
+        return _fallback(candidates, limit, "invalid_response")
     logger.debug(
         "context optimization delivered %d of %d judged candidates.",
         len(kept), len(candidates),
