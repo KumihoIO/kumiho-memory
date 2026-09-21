@@ -1,6 +1,6 @@
 # Release Notes — kumiho-memory
 
-## Unreleased
+## 1.6.1
 
 - Forward evaluation usage to engage's `optimization.usage`: provider requests,
   cached fragments, input tokens, and output tokens. Missing counters remain
