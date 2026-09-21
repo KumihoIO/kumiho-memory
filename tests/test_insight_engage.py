@@ -68,7 +68,7 @@ def test_opt_in_preserves_existing_fields_and_has_no_extra_calls(manager):
     assert with_brief["insight_brief"]["status"] == "ready"
     assert with_brief["insight_brief"]["candidates"][0]["kind"] == "changed_premise"
     for key, value in baseline.items():
-        if key != "approx_payload_tokens":
+        if key not in ("approx_payload_tokens", "timing_ms"):
             assert with_brief[key] == value
     assert manager.recall_memories.await_count == 2
     assert manager.build_recalled_context.call_count == 2

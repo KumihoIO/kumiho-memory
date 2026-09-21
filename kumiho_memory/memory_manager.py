@@ -14,6 +14,10 @@ import re
 import shutil
 import threading
 import uuid
+from contextvars import ContextVar
+from copy import deepcopy
+from functools import wraps, partial
+from types import SimpleNamespace
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,7 +41,59 @@ from kumiho_memory.retry import RetryQueue, classify_failure, retry_with_backoff
 from kumiho_memory.summarization import LLMAdapter, MemorySummarizer
 from kumiho_memory.temporal_guard import classify_event_date, parse_timestamp
 
+from kumiho_memory.recall_timing import timed
+
 logger = logging.getLogger(__name__)
+
+
+# Only shared by subqueries of ONE recall. Never retained across requests,
+# tenants, event loops, or writes; returned dictionaries are independent.
+_recall_metadata = ContextVar("recall_metadata", default=None)
+
+
+def _metadata_scope(fn):
+    @wraps(fn)
+    async def wrapped(*args, **kwargs):
+        cache = {}
+        token = _recall_metadata.set(cache)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            tasks = list(cache.values())
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            _recall_metadata.reset(token)
+    return wrapped
+
+
+def _coalesce_metadata(fn):
+    @wraps(fn)
+    async def wrapped(self, kref, load_artifacts=True, resolved=None):
+        if resolved is not None:
+            return await fn(self, kref, load_artifacts=load_artifacts, resolved=resolved)
+        cache = _recall_metadata.get()
+        # Artifact reads may involve mutable external files; do not cache them.
+        if cache is None or load_artifacts:
+            return await fn(self, kref, load_artifacts=load_artifacts)
+        key = (id(self), kref)
+        task = cache.get(key)
+        if task is None:
+            task = asyncio.create_task(fn(self, kref, load_artifacts=False))
+            cache[key] = task
+        try:
+            result = await asyncio.shield(task)
+        except BaseException:
+            if cache.get(key) is task:
+                cache.pop(key, None)
+            raise
+        # A transient failed read must remain retryable in this request.
+        if not result and cache.get(key) is task:
+            cache.pop(key, None)
+        return deepcopy(result)
+    return wrapped
 
 
 StoreCallable = Callable[..., Any]
@@ -2188,6 +2244,8 @@ class UniversalMemoryManager:
         artifact_path.write_text(content, encoding="utf-8")
         return str(artifact_path)
 
+    @_metadata_scope
+    @timed("retrieval")
     async def recall_memories(
         self,
         query: str,
@@ -2368,6 +2426,7 @@ class UniversalMemoryManager:
             memories = memories[:limit]
         return memories
 
+    @timed("search")
     async def _lightweight_recall(
         self,
         query: str,
@@ -2412,7 +2471,10 @@ class UniversalMemoryManager:
             # Fetch basic revision metadata (title, summary, type) —
             # no artifacts, no siblings.
             meta_tasks = [
-                self._fetch_revision_metadata(kref, load_artifacts=False)
+                self._fetch_revision_metadata(
+                    kref, load_artifacts=False,
+                    resolved=(result.get("resolved_metadata") or {}).get(kref),
+                )
                 for kref in revision_krefs
             ]
             meta_results = await asyncio.gather(
@@ -2438,6 +2500,7 @@ class UniversalMemoryManager:
             return result
         return []
 
+    @timed("sibling_enrichment")
     async def _enrich_with_siblings(
         self,
         memories: List[Dict[str, Any]],
@@ -2655,6 +2718,7 @@ class UniversalMemoryManager:
             return []
         return await gr.discover_edges(revision_kref, summary, **kwargs)
 
+    @timed("context_assembly")
     def build_recalled_context(
         self,
         memories: List[Dict[str, Any]],
@@ -3085,8 +3149,9 @@ class UniversalMemoryManager:
         )
         return stats.as_dict()
 
+    @_coalesce_metadata
     async def _fetch_revision_metadata(
-        self, kref: str, load_artifacts: bool = True,
+        self, kref: str, load_artifacts: bool = True, resolved: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fetch revision metadata and optionally raw artifact content.
 
@@ -3100,7 +3165,11 @@ class UniversalMemoryManager:
         try:
             import kumiho
 
-            revision = await asyncio.to_thread(kumiho.get_revision, kref)
+            if (not load_artifacts and isinstance(resolved, dict)
+                    and isinstance(resolved.get("metadata"), dict)):
+                revision = SimpleNamespace(**resolved)
+            else:
+                revision = await asyncio.to_thread(kumiho.get_revision, kref)
             meta = revision.metadata or {}
             entry: Dict[str, Any] = {
                 "title": meta.get("title", ""),
@@ -4181,13 +4250,19 @@ def _load_default_retrieve() -> Optional[RetrieveCallable]:
     try:
         from kumiho.mcp_server import tool_memory_retrieve  # type: ignore
 
+        if "include_resolved_metadata" in inspect.signature(tool_memory_retrieve).parameters:
+            return partial(tool_memory_retrieve, include_resolved_metadata=True)
         return tool_memory_retrieve
     except Exception:
         return None
 
 
 async def _maybe_await(func: Callable[..., Any], **kwargs: Any) -> Any:
-    result = func(**kwargs)
+    # SDK retrieval is synchronous. Preserve ContextVars while moving its
+    # network wait off the event loop so graph subqueries actually overlap.
+    if inspect.iscoroutinefunction(func):
+        return await func(**kwargs)
+    result = await asyncio.to_thread(func, **kwargs)
     if inspect.isawaitable(result):
         return await result
     return result

@@ -1,3 +1,11 @@
+## 1.6.2
+
+- Avoid blocking the event loop during synchronous SDK searches; overlap the
+  original search with query reformulation without changing merge order.
+- Reuse request-local metadata and SDK batch-resolved revisions, preserving
+  belief qualifiers and fresh reads on the next request.
+- Add content-free Engage `timing_ms` diagnostics with overlapping stage semantics.
+
 # Release Notes — kumiho-memory
 
 ## 1.6.1

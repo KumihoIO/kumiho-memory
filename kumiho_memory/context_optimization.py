@@ -59,6 +59,8 @@ from typing import (
     Tuple,
 )
 
+from kumiho_memory.recall_timing import timed
+
 logger = logging.getLogger(__name__)
 
 #: Rubric identity sent with every request, so server-side caching and the
@@ -649,6 +651,7 @@ def _fallback(
     )
 
 
+@timed("evaluation")
 def optimize_recall(
     query: str,
     memories: Sequence[Dict[str, Any]],
