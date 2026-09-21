@@ -4,6 +4,9 @@
   within five seconds. Repeated queries no longer return artificial empty results.
 - Preserve scoped serialization, current-request diagnostics and backend evaluation
   caching. Corrections, filter changes and retries observe fresh retrieval.
+- Read sibling revisions directly through the existing SDK client, avoiding an
+  unused item lookup per candidate while preserving history selection and limits.
+  Older custom adapters retain the original lookup path.
 
 ## 1.6.2
 

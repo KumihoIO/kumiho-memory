@@ -147,6 +147,8 @@ membership; semantic correctness still needs review. No additional provider API
 is required. Each explicit engage or recall call runs retrieval, including
 immediate repeats. Evaluation may reuse its own backend cache; complete recall
 responses are not cached or replaced with an empty duplicate result.
+Sibling enrichment uses the SDK's direct revision-list read when available,
+avoiding an extra item lookup without changing which revisions are considered.
 
 For learning across decisions, explicitly record `record_experience` and separate
 `record_outcome` observations. The keyless Dream State workflow is
