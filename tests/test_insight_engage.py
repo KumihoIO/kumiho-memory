@@ -48,9 +48,7 @@ def manager(monkeypatch):
     mgr.build_recalled_context = Mock(side_effect=lambda *a, **k:
         UniversalMemoryManager.build_recalled_context(mgr, *a, **k))
     monkeypatch.setattr(mcp_tools, "_get_manager", lambda: mgr)
-    mcp_tools._recall_recent.clear()
     yield mgr
-    mcp_tools._recall_recent.clear()
 
 
 def engage(**overrides):
@@ -63,7 +61,6 @@ def engage(**overrides):
 
 def test_opt_in_preserves_existing_fields_and_has_no_extra_calls(manager):
     baseline = engage(include_insights=False)
-    mcp_tools._recall_recent.clear()
     with_brief = engage()
     assert with_brief["insight_brief"]["status"] == "ready"
     assert with_brief["insight_brief"]["candidates"][0]["kind"] == "changed_premise"
@@ -140,30 +137,28 @@ def test_empty_backend_failure_differs_from_no_candidates(manager):
     manager.rows = []
     result = engage()
     assert result["insight_brief"]["status"] == "insufficient_evidence"
-    mcp_tools._recall_recent.clear()
     manager._last_backend_error = "retrieve unavailable"
     result = engage()
     assert result["insight_brief"]["status"] == "retrieval_incomplete"
     assert result["insight_brief"]["candidates"] == []
 
 
-def test_shared_dedup_still_blocks_extra_retrieval_and_false_empty_brief(manager):
+def test_repeated_engage_keeps_the_brief_and_recall_keeps_results(manager):
     first = engage()
+    second = engage()
     assert first["insight_brief"]["status"] == "ready"
-    duplicate = engage()
-    assert duplicate["deduplicated"] is True
-    assert "insight_brief" not in duplicate
+    assert second["insight_brief"] == first["insight_brief"]
     recall = mcp_tools.tool_memory_recall({"query": "Should we revisit deployment with our new team?"})
-    assert recall["deduplicated"] is True
-    assert manager.recall_memories.await_count == 1
+    assert recall["count"] == 1
+    assert manager.recall_memories.await_count == 3
 
 
-def test_enabling_flag_after_same_recall_does_not_bypass_dedup(manager):
-    engage(include_insights=False)
+def test_enabling_insights_on_an_immediate_repeat_builds_the_brief(manager):
+    baseline = engage(include_insights=False)
     result = engage()
-    assert result["deduplicated"] is True
-    assert "insight_brief" not in result
-    assert manager.recall_memories.await_count == 1
+    assert "insight_brief" not in baseline
+    assert result["insight_brief"]["status"] == "ready"
+    assert manager.recall_memories.await_count == 2
 
 
 def test_payload_estimate_includes_brief(manager):
@@ -252,7 +247,6 @@ def test_extra_learned_sources_feed_only_opt_in_synthesis(manager, monkeypatch):
     monkeypatch.setattr(learned_module, "recall_learned_sources", recall)
     baseline = engage()
     recall.assert_not_called()
-    mcp_tools._recall_recent.clear()
     result = engage(include_learned_sources=True, space_paths=["CognitiveMemory/experiences"])
     assert extra["kref"] in result["synthesis_request"]["source_krefs"]
     assert result["context"] == baseline["context"]

@@ -26,9 +26,8 @@ Session boundaries
 ------------------
 ``new_host_session`` — new session id, new Redis, new manager process.
 ``process_restart``  — same session id and Redis, new manager process (the
-                       ``mcp_tools`` module singleton is reset and its recall
-                       dedup cache cleared, as a freshly spawned server would
-                       start).
+                       ``mcp_tools`` module singleton is reset, as a freshly
+                       spawned server would start).
 
 This tier produces *protocol assertions*: it proves what the memory layer
 returns and marks, never that a model makes better decisions. The scripted
@@ -540,12 +539,10 @@ class _Process:
             consolidation_threshold=10_000,
         )
         mcp_tools_module._manager = self.manager
-        mcp_tools_module._recall_recent.clear()
 
     @staticmethod
     def teardown() -> None:
         mcp_tools_module._manager = None
-        mcp_tools_module._recall_recent.clear()
 
 
 def _subst(value: Any, binds: Dict[str, str]) -> Any:
@@ -613,7 +610,6 @@ def run_scenario(scenario: Dict[str, Any], arm: str, workdir: Optional[Path] = N
             assert process is not None and graph is not None and session_id is not None
             with install_sdk(graph):
                 mcp_tools_module._manager = process.manager
-                mcp_tools_module._recall_recent.clear()
                 started = time.perf_counter()
                 engage = tool_memory_engage({
                     "query": final["query"], "limit": final.get("limit", 5),
@@ -646,7 +642,6 @@ def run_scenario(scenario: Dict[str, Any], arm: str, workdir: Optional[Path] = N
                 if final.get("also_in_other_project") and scenario.get("other_project"):
                     other_proc = _Process(scenario["other_project"], FakeRedis(), graph,
                                           workdir / arm / "other", False, False)
-                    mcp_tools_module._recall_recent.clear()
                     other_engage = tool_memory_engage({"query": final["query"], "limit": final.get("limit", 5)})
                     other = {
                         "results": other_engage.get("results") or [],

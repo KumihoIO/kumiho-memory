@@ -11,7 +11,7 @@
     "scoring_rule": "Outcomes are structured labels read from `option:*` tags (or the scenario's declared per-language `option_signals`), never free-text keyword matching. A scenario passes when every named check passes; checks are deterministic assertions on the tool results and the graph state. Item counts and trial counts are reported separately; this tier runs one trial per scenario because it is deterministic.",
     "boundaries": {
       "new_host_session": "a new session id, a fresh working-memory (Redis) instance and a fresh manager process; only the long-term graph is shared in the memory arm",
-      "process_restart": "the same session id and working memory, but a fresh manager process (module singleton reset, recall dedup cache cleared)"
+      "process_restart": "the same session id and working memory, but a fresh manager process (module singleton reset)"
     },
     "arms": {
       "B": "memory: sessions share one long-term graph",

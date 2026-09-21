@@ -112,8 +112,6 @@ def _install_test_manager(tmpdir=None):
 
 def _cleanup_manager():
     mcp_tools_module._manager = None
-    # Reset the recall deduplication cache so tests don't interfere
-    mcp_tools_module._recall_recent.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -549,27 +547,18 @@ def test_memory_recall_with_filters():
         _cleanup_manager()
 
 
-def test_memory_recall_deduplication():
-    """An IDENTICAL recall query within the dedup window returns empty."""
+def test_memory_recall_immediate_repeat():
     try:
         _install_test_manager()
-        # First call — executes normally
-        result1 = tool_memory_recall({"query": "same query"})
-        assert result1["count"] == 1
-
-        # Same query again within the window — deduplicated
-        result2 = tool_memory_recall({"query": "same query"})
-        assert result2["count"] == 0
-        assert result2["deduplicated"] is True
-        assert "Duplicate recall" in result2["note"]
+        results = [tool_memory_recall({"query": "same query"}) for _ in range(3)]
+        assert [r["count"] for r in results] == [1, 1, 1]
+        assert all(r.get("deduplicated") is not True for r in results)
     finally:
         _cleanup_manager()
 
 
 def test_memory_recall_distinct_queries_not_deduped():
-    """DISTINCT queries within the window both execute — the dedup keys off the
-    query, not a single global timestamp (regression guard for the singleton-
-    lock bug that starved concurrent distinct recalls)."""
+    """Different queries and scopes all execute."""
     try:
         _install_test_manager()
         r1 = tool_memory_recall({"query": "query A"})
@@ -582,29 +571,15 @@ def test_memory_recall_distinct_queries_not_deduped():
         _cleanup_manager()
 
 
-def test_memory_recall_dedup_expires():
-    """After the dedup window expires, the same query executes again."""
-    import time as _time
-
+def test_memory_recall_returns_a_fresh_response():
     try:
         _install_test_manager()
-        result1 = tool_memory_recall({"query": "query A"})
-
-        # Backdate every recorded signature so the window has elapsed.
-        for sig in list(mcp_tools_module._recall_recent):
-            mcp_tools_module._recall_recent[sig] = _time.monotonic() - 10.0
-
-        result2 = tool_memory_recall({"query": "query A"})
-        # Should be a fresh call, not deduplicated
-        assert result2 is not result1
-        assert result2["count"] == 1
+        first = tool_memory_recall({"query": "query A"})
+        second = tool_memory_recall({"query": "query A"})
+        assert second is not first
+        assert second["count"] == 1
     finally:
         _cleanup_manager()
-
-
-# ---------------------------------------------------------------------------
-# Tests — composite tools (engage / reflect)
-# ---------------------------------------------------------------------------
 
 
 def test_memory_engage_returns_context_and_krefs():
@@ -789,36 +764,23 @@ def test_memory_recall_filters_by_min_score():
         _cleanup_manager()
 
 
-def test_memory_engage_deduplication():
-    """Engage dedups an identical repeated query within the window."""
+def test_memory_engage_immediate_repeat():
     try:
         _install_test_manager()
-        result1 = tool_memory_engage({"query": "same"})
-        assert result1["count"] == 1
-
-        result2 = tool_memory_engage({"query": "same"})
-        assert result2["count"] == 0
-        assert result2["deduplicated"] is True
+        results = [tool_memory_engage({"query": "same"}) for _ in range(3)]
+        assert [r["count"] for r in results] == [1, 1, 1]
+        assert all(r.get("deduplicated") is not True for r in results)
     finally:
         _cleanup_manager()
 
 
-def test_memory_engage_and_recall_share_dedup():
-    """Engage and recall share the dedup cache: the same query across the two
-    tools is deduped, while a distinct query still executes."""
+def test_memory_engage_and_recall_do_not_suppress_each_other():
     try:
         _install_test_manager()
-        result1 = tool_memory_engage({"query": "shared query"})
-        assert result1["count"] == 1
-
-        # Same query via recall — deduped (shared cache)
-        result2 = tool_memory_recall({"query": "shared query"})
-        assert result2["count"] == 0
-        assert result2["deduplicated"] is True
-
-        # A distinct query still executes
-        result3 = tool_memory_recall({"query": "other query"})
-        assert result3.get("deduplicated") is not True and result3["count"] == 1
+        for tool in (tool_memory_engage, tool_memory_recall, tool_memory_engage):
+            result = tool({"query": "shared query"})
+            assert result["count"] == 1
+            assert result.get("deduplicated") is not True
     finally:
         _cleanup_manager()
 

@@ -83,9 +83,9 @@ standalone helper must receive only caller-authorized results.
 `ready` means review candidates exist, not that their hypotheses are true.
 `insufficient_evidence` means the selected recall supplies no suitable candidate.
 `retrieval_incomplete` on engage means the backend reported an error, possibly
-with partial results. Duplicate recalls retain the existing dedup response and
-return no new brief: set the flag on the first engage call or use the pure
-helper on already-held results. No backend outage is presented as an absence
+with partial results. Repeated recalls run retrieval and build a fresh brief
+when requested. Call the pure helper to reuse already-held results without
+retrieval. No backend outage is presented as an absence
 of stored knowledge.
 
 ### Host answer contract
