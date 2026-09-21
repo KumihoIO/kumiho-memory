@@ -1291,6 +1291,12 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
             }
             if outcome.reason:
                 optimization["reason"] = outcome.reason
+            if outcome.budget is not None:
+                optimization["budget"] = outcome.budget
+            if outcome.usage is not None:
+                optimization["usage"] = outcome.usage
+            if outcome.evaluation_status is not None:
+                optimization["evaluation_status"] = outcome.evaluation_status
         context = manager.build_recalled_context(
             results, args["query"], recall_mode
         )
