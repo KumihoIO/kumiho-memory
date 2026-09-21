@@ -960,47 +960,24 @@ def tool_memory_consolidate(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Recall deduplication
+# Recall serialization
 # ---------------------------------------------------------------------------
-# Models sometimes generate parallel kumiho_memory_recall calls for the SAME
-# query within a single response despite instructions not to.  This lock
-# serializes recall calls so the first one executes and any *identical-query*
-# duplicate within the dedup window returns an empty result — eliminating the
-# duplicate "Retrieved..." output lines.  The dedup keys off the query + scope
-# (not just time), so DISTINCT queries — including concurrent ones from parallel
-# agents — always execute instead of being starved by one global timestamp.
-
+# Each explicit call runs retrieval, including immediate identical calls.
+# Time-based suppression used to turn legitimate retries into empty results.
+# Preserve existing serialization while leaving reuse to the backend's caches.
 _recall_lock = threading.Lock()
-_RECALL_DEDUP_WINDOW_SECS = 5.0
-# Recall signature -> monotonic time it last executed. Only a true duplicate
-# (same query + scope) within the window is suppressed.
-_recall_recent: Dict[str, float] = {}
-# Guards _recall_recent itself. On stdio this is always taken inside
-# _recall_lock and is uncontended; hosted callers in different scopes hold
-# DIFFERENT critical-section locks, so the shared dict needs its own.
-_recall_recent_guard = threading.Lock()
-# Per-scope critical-section locks (hosted only), created on demand. Capped
-# because a hosted server is long-lived and a scope is per SESSION, not per
-# tenant: unbounded, this grows with every conversation the process ever
-# serves. Over the cap the unheld locks are dropped — a caller that still
-# holds one keeps working (it holds the reference), and the only cost of
-# dropping a lock some later caller would have shared is that one duplicate
-# recall runs instead of being suppressed, which is the guard's benign
-# direction. Correctness of the dedup record itself is _recall_recent's job.
+# Hosted locks are scoped by tenant/user/session, so unrelated callers do not
+# queue behind one another. Bound this process-local bookkeeping as before.
 _RECALL_SCOPE_LOCK_CAP = 4096
 _recall_scope_locks: Dict[str, threading.Lock] = {}
 _recall_scope_locks_guard = threading.Lock()
 
 
 def _recall_scope(args: Dict[str, Any]) -> str:
-    """Who this recall belongs to: "" on stdio, (tenant, user, session) hosted.
+    """Identity scope for recall serialization and evaluation backoff.
 
-    The dedup guard exists to swallow a model's duplicate tool calls *within
-    one response*. Process-global, that is exactly wrong on a shared server:
-    two tenants asking the same question at the same moment are not
-    duplicates, and the second one would silently receive an empty result
-    labelled "you already asked this". Scoping restores the guard's actual
-    meaning — same conversation, same question, same instant.
+    Stdio uses the process scope; hosted requests keep tenants, users and
+    sessions separate. This is not a result cache or a duplicate-call key.
     """
     ctx = current_request()
     if ctx is None:
@@ -1035,63 +1012,10 @@ def _recall_guard_lock(scope: str) -> threading.Lock:
         return lock
 
 
-def _recall_signature(args: Dict[str, Any], scope: str = "") -> str:
-    """Dedup key: the query plus the scope args that determine the result set,
-    prefixed by the requesting identity when there is one."""
-    signature = "\x1f".join(str(x) for x in (
-        args.get("query", ""),
-        args.get("space_paths") or "",
-        args.get("memory_types") or "",
-        args.get("recall_mode") or "",
-        bool(args.get("graph_augmented", False)),
-    ))
-    return f"{scope}\x1d{signature}" if scope else signature
-
-
-def _recall_is_duplicate(args: Dict[str, Any], now: float, scope: str = "") -> bool:
-    """True if an identical recall ran within the dedup window. Prunes expired
-    signatures first so the cache stays small."""
-    signature = _recall_signature(args, scope)
-    with _recall_recent_guard:
-        for key in [k for k, t in _recall_recent.items()
-                    if now - t >= _RECALL_DEDUP_WINDOW_SECS]:
-            _recall_recent.pop(key, None)
-        return signature in _recall_recent
-
-
-def _recall_mark(args: Dict[str, Any], scope: str = "") -> None:
-    """Record that this recall just executed."""
-    with _recall_recent_guard:
-        _recall_recent[_recall_signature(args, scope)] = time.monotonic()
-
-
 def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Search long-term memories by semantic query.
-
-    Includes a deduplication guard: if called more than once within a short
-    time window (e.g. parallel tool calls from the model), subsequent calls
-    return an empty result with a note instead of hitting the backend again.
-    """
+    """Search current long-term memories on every explicit invocation."""
     scope = _recall_scope(args)
     with _recall_guard_lock(scope):
-        now = time.monotonic()
-        if _recall_is_duplicate(args, now, scope):
-            logger.warning(
-                "kumiho_memory_recall called again with the same query within "
-                "%.1fs — returning empty (query=%r)",
-                _RECALL_DEDUP_WINDOW_SECS,
-                args.get("query", ""),
-            )
-            return {
-                "results": [],
-                "count": 0,
-                "deduplicated": True,
-                "note": (
-                    "Duplicate recall — identical query already returned in "
-                    "this response. Vary the query or reuse the prior results."
-                ),
-            }
-
         manager = _get_manager()
         recall_mode = args.get("recall_mode", manager.recall_mode)
         results = asyncio.run(
@@ -1111,7 +1035,6 @@ def tool_memory_recall(args: Dict[str, Any]) -> Dict[str, Any]:
         if backend_error:
             result["backend_error"] = backend_error
 
-        _recall_mark(args, scope)
         return result
 
 
@@ -1227,26 +1150,12 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
     """Check memory before responding — combines recall + context building.
 
     Returns pre-built context, raw results, and source krefs for linking.
-    Shares the recall deduplication guard with ``tool_memory_recall``.
+    Repeated calls run retrieval again so corrections and retries remain visible.
     """
     if args.get("include_learned_sources") is True and args.get("include_insights") is not True:
         raise ValueError("include_learned_sources=true requires include_insights=true")
     scope = _recall_scope(args)
     with _recall_guard_lock(scope):
-        now = time.monotonic()
-        if _recall_is_duplicate(args, now, scope):
-            return {
-                "context": "",
-                "results": [],
-                "source_krefs": [],
-                "count": 0,
-                "deduplicated": True,
-                "note": (
-                    "Duplicate recall — identical query already returned in "
-                    "this response. Vary the query or reuse the prior results."
-                ),
-            }
-
         manager = _get_manager()
         recall_mode = args.get("recall_mode", manager.recall_mode)
         limit = args.get("limit", 5)
@@ -1338,7 +1247,6 @@ def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
 
         from kumiho_memory.context_compose import approx_tokens
 
-        _recall_mark(args, scope)
         engage_result = {
             "context": context,
             "results": results,
@@ -2172,8 +2080,8 @@ MEMORY_TOOLS: List[Dict[str, Any]] = [
             "Check memory before responding. Combines recall + context "
             "building into one call. Returns pre-built context string, "
             "raw results, and source_krefs for passing to reflect. "
-            "Shares the recall deduplication guard — at most one engage "
-            "or recall per response. Set include_insights=true on that call "
+            "Prefer one targeted engage or recall per response. Explicit repeat calls "
+            "run retrieval again. Set include_insights=true on the call "
             "to add a bounded belief insight brief and synthesis_request: source-backed review "
             "prompts for changed premises, conflicts and prior decisions. "
             "The brief alone adds no retrieval, LLM calls or writes. These are prompts for "

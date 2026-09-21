@@ -52,10 +52,8 @@ def manager(monkeypatch):
     mgr.build_recalled_context = Mock(side_effect=lambda *a, **k:
         UniversalMemoryManager.build_recalled_context(mgr, *a, **k))
     monkeypatch.setattr(mcp_tools, "_get_manager", lambda: mgr)
-    mcp_tools._recall_recent.clear()
     ctxopt._backoff_until.clear()
     yield mgr
-    mcp_tools._recall_recent.clear()
     ctxopt._backoff_until.clear()
 
 
@@ -112,7 +110,6 @@ def test_disabled_recalls_the_callers_limit_and_reports_nothing(manager, monkeyp
 def test_disabled_response_is_unchanged(manager, monkeypatch):
     """The feature adds exactly one field, and only when it is configured on."""
     baseline = engage()
-    mcp_tools._recall_recent.clear()
     monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", "0")
     again = engage()
 
@@ -349,7 +346,6 @@ def test_not_entitled_backs_the_scope_off_for_the_next_call(
 
     install(monkeypatch, refuse)
     engage(limit=5)
-    mcp_tools._recall_recent.clear()
     second = engage(limit=5)
 
     assert len(calls) == 1, "the second call must not ask again"
@@ -374,10 +370,8 @@ def test_the_backoff_is_per_requesting_identity(manager, enabled, monkeypatch):
 
     with request_context(make_request_context("tenant-a", session_id="s-1")):
         refused = engage(limit=5)
-        mcp_tools._recall_recent.clear()
         again = engage(limit=5)
     with request_context(make_request_context("tenant-b", session_id="s-2")):
-        mcp_tools._recall_recent.clear()
         other = engage(limit=5)
 
     assert refused["optimization"]["reason"] == "not_entitled"
@@ -424,7 +418,6 @@ def test_engage_is_unchanged_once_the_override_is_gone(manager, monkeypatch):
 
     with ctxopt.judged_delivery(True):
         engage(limit=3)
-    mcp_tools._recall_recent.clear()
     after = engage(limit=3)
 
     assert recall_limit(manager) == 3
@@ -493,3 +486,25 @@ def test_rpc_error_has_no_invented_usage(manager, enabled, monkeypatch):
     assert result["optimization"]["status"] == "fallback"
     assert "usage" not in result["optimization"]
     assert "evaluation_status" not in result["optimization"]
+
+
+def test_immediate_repeat_reports_this_requests_evaluation_usage(manager, enabled, monkeypatch):
+    original = judge([(0.9, 0.9)] * 12)
+    usages = [
+        dict(provider_requests=1, cached_fragments=0, input_tokens=240, output_tokens=30),
+        dict(provider_requests=0, cached_fragments=12, input_tokens=0, output_tokens=0),
+    ]
+
+    def evaluate(*args, **kwargs):
+        response = original(*args, **kwargs)
+        response.usage = SimpleNamespace(**usages[len(original.calls) - 1])
+        return response
+
+    install(monkeypatch, evaluate)
+    first = engage(limit=5)
+    second = engage(limit=5)
+    assert first["count"] == second["count"] == 12
+    assert manager.recall_memories.await_count == len(original.calls) == 2
+    assert first["optimization"]["usage"] == usages[0]
+    assert second["optimization"]["usage"] == usages[1]
+    assert second["timing_ms"] is not first["timing_ms"]

@@ -96,6 +96,32 @@ def _coalesce_metadata(fn):
     return wrapped
 
 
+def _get_sibling_revisions(item_kref: str):
+    """Read the existing revision list without first fetching an unused Item.
+
+    Resolve the client inside the worker so the SDK's request context selects
+    the caller's client. Only missing API capabilities use the legacy path;
+    authentication, permission and transport errors must not trigger extra RPCs.
+    """
+    import kumiho
+
+    get_client = getattr(kumiho, "get_client", None)
+    kref_type = getattr(kumiho, "Kref", None)
+    if callable(get_client) and callable(kref_type):
+        client = get_client()
+        get_revisions = getattr(client, "get_revisions", None)
+        if callable(get_revisions):
+            # Match get_item_by_kref: validate the full URI before removing any
+            # revision/artifact selector. The query may name an existing item.
+            parsed = kref_type(item_kref)
+            path = parsed.get_path()
+            # Legacy root-level spellings have different server canonicalization.
+            # Normal search results use project-qualified item references.
+            if not path.startswith("/"):
+                return get_revisions(kref_type("kref://" + path))
+    return kumiho.get_item(item_kref).get_revisions()
+
+
 StoreCallable = Callable[..., Any]
 RetrieveCallable = Callable[..., Any]
 
@@ -3707,8 +3733,7 @@ class UniversalMemoryManager:
         try:
             import kumiho
 
-            item = await asyncio.to_thread(kumiho.get_item, item_kref)
-            revisions = await asyncio.to_thread(item.get_revisions)
+            revisions = await asyncio.to_thread(_get_sibling_revisions, item_kref)
             if not revisions or len(revisions) <= 1:
                 return []
 

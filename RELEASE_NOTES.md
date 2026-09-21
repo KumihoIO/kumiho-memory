@@ -1,3 +1,13 @@
+## 1.6.3
+
+- Execute every explicit Engage and Recall request, including identical calls
+  within five seconds. Repeated queries no longer return artificial empty results.
+- Preserve scoped serialization, current-request diagnostics and backend evaluation
+  caching. Corrections, filter changes and retries observe fresh retrieval.
+- Read sibling revisions directly through the existing SDK client, avoiding an
+  unused item lookup per candidate while preserving history selection and limits.
+  Older custom adapters retain the original lookup path.
+
 ## 1.6.2
 
 - Avoid blocking the event loop during synchronous SDK searches; overlap the

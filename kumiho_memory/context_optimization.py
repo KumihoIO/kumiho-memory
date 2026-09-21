@@ -324,7 +324,7 @@ def resolve_policy(
 # ---------------------------------------------------------------------------
 # Back-off, per requesting identity
 # ---------------------------------------------------------------------------
-# Keyed by the scope the recall dedup guard uses (``mcp_tools._recall_scope``):
+# Keyed by the identity scope recall serialization uses (``mcp_tools._recall_scope``):
 # "" on stdio, (tenant, user, session) hosted. A process-global back-off would
 # let one unentitled tenant turn the feature off for every other tenant the
 # hosted connector serves.

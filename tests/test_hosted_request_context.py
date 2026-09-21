@@ -2,7 +2,7 @@
 
 The one property every test here defends: **nothing tenant-derived may be
 shared through the process.** Not the manager, not the Redis credentials, not
-the dedup guard, not the disk. The stdio plugin depends on the opposite —
+recall serialization, not the disk. The stdio plugin depends on the opposite —
 one process, one tenant, one singleton — so each rule is checked twice: that
 it holds under a request context, and that it is absent without one.
 """
@@ -57,7 +57,6 @@ def _clean_process_state(monkeypatch, tmp_path):
     def _reset():
         mcp_tools._manager = None
         mcp_tools._tenant_managers.clear()
-        mcp_tools._recall_recent.clear()
         mcp_tools._recall_scope_locks.clear()
         entity_promotion._project_cache.clear()
         entity_promotion._anchor_locks.clear()
@@ -613,21 +612,20 @@ def test_hosted_ingest_treats_a_null_context_as_unspecified(proxy, hosted_manage
 
 
 # ---------------------------------------------------------------------------
-# Dedup guard keying (§2.3 item 3)
+# Recall scope isolation (§2.3 item 3)
 # ---------------------------------------------------------------------------
 
 
-def test_dedup_scope_is_tenant_user_and_session():
+def test_recall_scope_is_tenant_user_and_session():
     assert mcp_tools._recall_scope({}) == ""
     with request_context(make_request_context("t1", user_id="u1", session_id="s1")):
         assert mcp_tools._recall_scope({}) == "t1\x1eu1\x1es1"
-        # An explicit session argument names the conversation being deduped.
+        # An explicit session argument names the conversation scope.
         assert mcp_tools._recall_scope({"session_id": "s2"}) == "t1\x1eu1\x1es2"
 
 
 def test_identical_queries_from_two_tenants_both_execute(proxy, hosted_managers):
-    """The guard suppresses a MODEL's duplicate call, not two customers asking
-    the same question at the same moment."""
+    """Two customers asking the same question each execute retrieval."""
     with bind_request(make_request_context("tenant-a")):
         a = mcp_tools.tool_memory_engage({"query": "what did we decide"})
     with bind_request(make_request_context("tenant-b")):
@@ -636,13 +634,14 @@ def test_identical_queries_from_two_tenants_both_execute(proxy, hosted_managers)
     assert b.get("deduplicated") is not True, "tenant B was starved by tenant A"
 
 
-def test_a_true_duplicate_within_one_tenant_is_still_suppressed(proxy, hosted_managers):
+def test_immediate_repeat_within_one_tenant_executes(proxy, hosted_managers):
     ctx = make_request_context("tenant-a", session_id="s1")
     with request_context(ctx):
         first = mcp_tools.tool_memory_engage({"query": "same"})
         second = mcp_tools.tool_memory_engage({"query": "same"})
     assert first.get("deduplicated") is not True
-    assert second["deduplicated"] is True
+    assert second.get("deduplicated") is not True
+    assert second["results"] == first["results"]
 
 
 def test_two_sessions_of_one_user_do_not_dedup_each_other(proxy, hosted_managers):

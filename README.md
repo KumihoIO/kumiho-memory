@@ -144,7 +144,11 @@ The same call also returns `synthesis_request`: bounded source summaries,
 current context/goals, and a JSON answer contract for the host model. Use
 `kumiho_memory_validate_insight_response` to check structure and citation
 membership; semantic correctness still needs review. No additional provider API
-is required. Include the flag on the first engage call because dedup is shared.
+is required. Each explicit engage or recall call runs retrieval, including
+immediate repeats. Evaluation may reuse its own backend cache; complete recall
+responses are not cached or replaced with an empty duplicate result.
+Sibling enrichment uses the SDK's direct revision-list read when available,
+avoiding an extra item lookup without changing which revisions are considered.
 
 For learning across decisions, explicitly record `record_experience` and separate
 `record_outcome` observations. The keyless Dream State workflow is
@@ -614,7 +618,7 @@ core `kumiho` MCP server:
 | `kumiho_memory_ingest` | Buffer message + recall context |
 | `kumiho_memory_add_response` | Add assistant response to buffer |
 | `kumiho_memory_consolidate` | Summarize, redact, store to graph |
-| `kumiho_memory_recall` | Semantic search with dedup guard |
+| `kumiho_memory_recall` | Semantic search with fresh retrieval per call |
 | `kumiho_memory_discover_edges` | Link new memory to related memories |
 | `kumiho_memory_store_execution` | Store tool/command results |
 | `kumiho_memory_engage` | Recall + build context in one call |
