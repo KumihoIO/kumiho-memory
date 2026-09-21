@@ -459,6 +459,30 @@ feature is enabled:
 {"optimization": {"status": "fallback", "candidates": 5, "reason": "not_entitled"}}
 ```
 
+When the evaluation response reports usage, engage also returns an allowlisted
+`optimization.usage` object and `optimization.evaluation_status` (`ok`, `partial`,
+or a known evaluation failure status). For example:
+
+```json
+{"optimization":{"status":"applied","candidates":35,"evaluation_status":"ok","usage":{"provider_requests":1,"cached_fragments":0,"input_tokens":2100,"output_tokens":180}}}
+```
+
+These example values are illustrative, not benchmark results. `input_tokens` and
+`output_tokens` are evaluation-provider usage, not the host LLM's context tokens
+or engage's `approx_tokens` / `approx_payload_tokens`. `cached_fragments` counts
+fragments served from evaluation cache. A successful full cache hit reports zero
+provider requests and a positive cached-fragment count. The current server's
+`provider_requests` counts successfully decoded provider responses, **not every
+attempt**: zero alone cannot rule out a timed-out or failed provider call.
+
+Missing or invalid counters are omitted, never invented as zero. Usage is also
+preserved on evaluation-response fallbacks; local skips and RPC exceptions have
+no reported usage. Partial evaluation usage may be incomplete. `applied` means
+selection was applied, not that every candidate was judged successfully. No
+server request/trace ID is supplied by the current evaluation contract, so this
+response does not fabricate one. Optional `optimization.budget` describes the
+monthly quota including reservations; it is not an invoice.
+
 `candidates` is how many memories were judged (`applied`) or recalled
 (`fallback`); `reason` appears only on a fallback and is one of
 `backoff`, `no_candidates`, `sdk_unavailable`, `not_entitled`,

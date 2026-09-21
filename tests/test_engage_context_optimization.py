@@ -149,7 +149,7 @@ def test_delivery_is_the_kept_memories_only(manager, enabled, monkeypatch):
 
     result = engage(limit=5)
 
-    assert result["optimization"] == {"status": "applied", "candidates": 12}
+    assert result["optimization"] == {"status": "applied", "candidates": 12, "evaluation_status": "ok"}
     assert result["count"] == 2
     assert result["source_krefs"] == [
         "kref://CognitiveMemory/decisions/item-2?r=1",
@@ -171,7 +171,7 @@ def test_nothing_relevant_delivers_nothing(manager, enabled, monkeypatch):
     assert result["count"] == 0
     assert result["results"] == []
     assert result["source_krefs"] == []
-    assert result["optimization"] == {"status": "applied", "candidates": 12}
+    assert result["optimization"] == {"status": "applied", "candidates": 12, "evaluation_status": "ok"}
 
 
 def test_the_judged_request_carries_no_krefs(manager, enabled, monkeypatch):
@@ -236,7 +236,7 @@ def test_each_non_ok_status_delivers_the_caller_limit_prefix(
     )
 
     assert result["optimization"] == {
-        "status": "fallback", "candidates": 12, "reason": status,
+        "status": "fallback", "candidates": 12, "reason": status, "evaluation_status": status,
     }
     assert result["count"] == 5
     assert [m["title"] for m in result["results"]] == [
@@ -399,7 +399,7 @@ def test_override_on_judges_with_no_environment(manager, monkeypatch):
         result = engage(limit=5)
 
     assert recall_limit(manager) == 50
-    assert result["optimization"] == {"status": "applied", "candidates": 12}
+    assert result["optimization"] == {"status": "applied", "candidates": 12, "evaluation_status": "ok"}
     assert [m["title"] for m in result["results"]] == ["memory 3"]
 
 
@@ -442,3 +442,51 @@ def test_recall_is_untouched(manager, enabled, monkeypatch):
     assert recall_limit(manager) == 3
     assert "optimization" not in result
     assert result["count"] == 3
+
+
+def test_budget_status_reaches_engage_response(manager, enabled, monkeypatch):
+    from types import SimpleNamespace
+    original = judge([(0.9, 0.9)] * 12)
+    def evaluate(*args, **kwargs):
+        response = original(*args, **kwargs)
+        response.usage = SimpleNamespace(month_tokens_used=80, month_tokens_limit=100)
+        return response
+    install(monkeypatch, evaluate)
+    result = engage(limit=5)
+    assert result["optimization"]["budget"] == {
+        "used_input_tokens": 80, "limit_input_tokens": 100,
+        "remaining_input_tokens": 20, "state": "near_limit",
+    }
+
+@pytest.mark.parametrize("status,requests,cached", [
+    ("ok", 2, 0), ("ok", 0, 12), ("partial", 1, 0),
+    ("provider_unavailable", 0, 0), ("over_limit", 0, 0),
+])
+def test_evaluation_usage_reaches_engage(manager, enabled, monkeypatch, status, requests, cached):
+    original = judge([(0.9, 0.9)] * 12)
+    usage = dict(provider_requests=requests, cached_fragments=cached,
+                 input_tokens=240 if requests else 0, output_tokens=30 if requests else 0)
+    def evaluate(*args, **kwargs):
+        response = original(*args, **kwargs)
+        response.status = status
+        response.usage = SimpleNamespace(**usage, secret="must-not-leak")
+        return response
+    install(monkeypatch, evaluate)
+    result = engage(limit=5)
+    assert result["optimization"]["usage"] == usage
+    assert result["optimization"]["evaluation_status"] == status
+    assert result["optimization"]["status"] == ("applied" if status in ("ok", "partial") else "fallback")
+    assert "request_id" not in result["optimization"]
+
+
+def test_missing_usage_is_not_fabricated(manager, enabled, monkeypatch):
+    install(monkeypatch, judge([(0.9, 0.9)] * 12))
+    assert "usage" not in engage()["optimization"]
+
+
+def test_rpc_error_has_no_invented_usage(manager, enabled, monkeypatch):
+    install(monkeypatch, Mock(side_effect=TimeoutError("private provider details")))
+    result = engage()
+    assert result["optimization"]["status"] == "fallback"
+    assert "usage" not in result["optimization"]
+    assert "evaluation_status" not in result["optimization"]

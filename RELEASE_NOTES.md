@@ -1,5 +1,17 @@
 # Release Notes — kumiho-memory
 
+## Unreleased
+
+- Forward evaluation usage to engage's `optimization.usage`: provider requests,
+  cached fragments, input tokens, and output tokens. Missing counters remain
+  absent; malformed and unrelated fields are not exposed.
+- Report `optimization.evaluation_status` independently of the selection status,
+  preserving reported diagnostics when selection falls back.
+- Expose validated monthly quota counters in optional `optimization.budget`.
+- Request counters currently describe successful provider responses, not all
+  attempts; zero is not evidence that no provider request was attempted.
+
+
 ## v1.6.0
 
 **Release Date:** 2026-09-19

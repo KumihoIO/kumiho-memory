@@ -592,17 +592,60 @@ class OptimizationOutcome:
     status: str
     candidates: int
     reason: str = ""
+    budget: Optional[Dict[str, Any]] = None
+    usage: Optional[Dict[str, int]] = None
+    evaluation_status: Optional[str] = None
+
+
+def _usage_from_result(result: Any) -> Optional[Dict[str, int]]:
+    """Copy only reported, nonnegative counters; absent is not zero.
+
+    provider_requests currently counts successful provider responses, not all
+    attempts. In particular, zero does not rule out a failed/timeout attempt.
+    """
+    try:
+        source = getattr(result, "usage", None)
+        usage = {}
+        for name in ("provider_requests", "cached_fragments", "input_tokens", "output_tokens"):
+            value = getattr(source, name, None)
+            if type(value) is int and 0 <= value <= 2**63 - 1:
+                usage[name] = value
+        return usage or None
+    except Exception:
+        # Diagnostics must never change selection or make recall unavailable.
+        return None
+
+
+def _budget_from_result(result: Any) -> Optional[Dict[str, Any]]:
+    """Expose bounded counters only; estimates/reservations are not a bill."""
+    try:
+        usage = getattr(result, "usage", None)
+        used = getattr(usage, "month_tokens_used", None)
+        limit = getattr(usage, "month_tokens_limit", None)
+    except Exception:
+        return None
+    if type(used) is not int or type(limit) is not int or used < 0 or limit < -1:
+        return None
+    state = "unlimited" if limit == -1 else (
+        "exhausted" if used >= limit else "near_limit" if used * 5 >= limit * 4 else "available"
+    )
+    return {"used_input_tokens": used, "limit_input_tokens": limit,
+            "remaining_input_tokens": None if limit == -1 else max(0, limit - used),
+            "state": state}
 
 
 def _fallback(
     memories: Sequence[Dict[str, Any]], limit: int, reason: str,
+    budget: Optional[Dict[str, Any]] = None,
+    usage: Optional[Dict[str, int]] = None,
+    evaluation_status: Optional[str] = None,
 ) -> OptimizationOutcome:
     """A safe local prefix; engage restores the original recall when widened."""
     return OptimizationOutcome(
         memories=list(memories[:limit]),
         status=STATUS_FALLBACK,
         candidates=len(memories),
-        reason=reason,
+        reason=reason, budget=budget, usage=usage, evaluation_status=evaluation_status,
     )
 
 
@@ -656,27 +699,33 @@ def optimize_recall(
             logger.debug("context optimization failed (%s): %s", reason, exc)
         return _fallback(candidates, limit, reason)
 
+    usage = _usage_from_result(result)
+    evaluation_status = None
+    budget = None
     try:
         status = str(getattr(result, "status", "") or "")
+        evaluation_status = status if status in _KNOWN_STATUSES or status in _USABLE_STATUSES else None
+        budget = _budget_from_result(result)
         if status not in _USABLE_STATUSES:
             reason = status if status in _KNOWN_STATUSES else "unknown_status"
             seconds = _backoff_seconds(reason)
             if seconds:
                 _start_backoff(scope, seconds, reason, now)
-            return _fallback(candidates, limit, reason)
+            return _fallback(candidates, limit, reason, budget, usage, evaluation_status)
 
         kept = apply_keep_rule(candidates, result, limit=limit, policy=policy)
         if kept is None:
-            return _fallback(candidates, limit, "no_valid_judgments")
+            return _fallback(candidates, limit, "no_valid_judgments", budget, usage, evaluation_status)
     except Exception:
         # Decoding and selection belong to the same optional boundary as the
         # RPC itself. A malformed response must not make engage unavailable.
         logger.debug("context optimization returned an invalid response")
-        return _fallback(candidates, limit, "invalid_response")
+        return _fallback(candidates, limit, "invalid_response", budget, usage, evaluation_status)
     logger.debug(
         "context optimization delivered %d of %d judged candidates.",
         len(kept), len(candidates),
     )
     return OptimizationOutcome(
-        memories=kept, status=STATUS_APPLIED, candidates=len(candidates),
+        memories=kept, status=STATUS_APPLIED, candidates=len(candidates), budget=budget,
+        usage=usage, evaluation_status=evaluation_status,
     )

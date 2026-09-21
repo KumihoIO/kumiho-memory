@@ -823,3 +823,79 @@ def test_fragment_date_prefers_the_event_date_over_the_storage_day():
     fragments = ctxopt.build_fragments([dated, undated], ENABLED)
     assert fragments[0]["metadata"]["date"] == "2026-07"
     assert fragments[1]["metadata"]["date"] == "2026-09-18"
+
+
+@pytest.mark.parametrize("used,limit,state,remaining", [
+    (79, 100, "available", 21), (80, 100, "near_limit", 20),
+    (100, 100, "exhausted", 0), (110, 100, "exhausted", 0),
+    (0, 0, "exhausted", 0), (100, -1, "unlimited", None),
+])
+def test_budget_boundaries(used, limit, state, remaining):
+    from types import SimpleNamespace
+    result = SimpleNamespace(usage=SimpleNamespace(month_tokens_used=used, month_tokens_limit=limit))
+    budget = ctxopt._budget_from_result(result)
+    assert budget["state"] == state
+    assert budget["remaining_input_tokens"] == remaining
+
+@pytest.mark.parametrize("used,limit", [(True, 100), (-1, 100), (1, -2), (1.5, 100), (1, "100")])
+def test_malformed_budget_is_not_exposed(used, limit):
+    from types import SimpleNamespace
+    assert ctxopt._budget_from_result(SimpleNamespace(usage=SimpleNamespace(month_tokens_used=used, month_tokens_limit=limit))) is None
+
+def test_over_limit_keeps_memory_and_budget_visible():
+    from types import SimpleNamespace
+    result = Result(status="over_limit")
+    result.usage = SimpleNamespace(month_tokens_used=100, month_tokens_limit=100)
+    memories = [{"summary": "Keep this memory", "title": "original"}]
+    outcome = optimize_recall("question", memories, limit=1, policy=ContextOptimizationPolicy(),
+                              scope="budget-test-unique", client=RecordingClient(result))
+    assert outcome.memories == memories
+    assert outcome.reason == "over_limit"
+    assert outcome.budget["state"] == "exhausted"
+
+@pytest.mark.parametrize("value", [True, False, -1, 1.5, "3", None, 2**63])
+def test_invalid_usage_counters_are_omitted(value):
+    from types import SimpleNamespace
+    result = SimpleNamespace(usage=SimpleNamespace(provider_requests=value, cached_fragments=0))
+    assert ctxopt._usage_from_result(result) == {"cached_fragments": 0}
+
+
+def test_diagnostic_usage_is_allowlisted_and_copied():
+    from types import SimpleNamespace
+    source = SimpleNamespace(provider_requests=1, cached_fragments=0, input_tokens=90,
+                             output_tokens=12, api_key="private", model_id="private")
+    usage = ctxopt._usage_from_result(SimpleNamespace(usage=source))
+    source.input_tokens = 999
+    assert usage == dict(provider_requests=1, cached_fragments=0, input_tokens=90, output_tokens=12)
+
+
+def test_no_valid_judgments_preserves_reported_usage():
+    from types import SimpleNamespace
+    response = Result()
+    response.usage = SimpleNamespace(provider_requests=1, input_tokens=25)
+    outcome = optimize_recall("q", memories(2), limit=1, policy=ENABLED,
+                              client=RecordingClient(response))
+    assert outcome.reason == "no_valid_judgments"
+    assert outcome.usage == {"provider_requests": 1, "input_tokens": 25}
+
+
+def test_unreadable_usage_is_omitted():
+    class BadDiagnostics:
+        @property
+        def usage(self):
+            raise ValueError("private")
+    assert ctxopt._usage_from_result(BadDiagnostics()) is None
+
+
+def test_broken_diagnostics_do_not_change_selection():
+    class ResponseWithBrokenUsage(Result):
+        @property
+        def usage(self):
+            raise ValueError("private")
+    response = ResponseWithBrokenUsage(fragments=_judged([(0.9, 0.9)] * 2).fragments)
+    outcome = optimize_recall("q", memories(2), limit=2, policy=ENABLED,
+                              client=RecordingClient(response))
+    assert outcome.status == "applied"
+    assert len(outcome.memories) == 2
+    assert outcome.usage is None
+    assert outcome.budget is None
