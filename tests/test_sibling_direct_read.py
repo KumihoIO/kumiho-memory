@@ -104,3 +104,15 @@ def test_direct_and_legacy_reads_produce_identical_sibling_evidence(monkeypatch)
     assert direct == legacy
     assert len(direct) == 3
     assert {r["kref"] for r in direct} == {r.kref.uri for r in revisions}
+
+
+def test_root_level_spelling_keeps_legacy_canonicalization(monkeypatch):
+    client = SimpleNamespace(get_revisions=Mock())
+    revisions = [object()]
+    monkeypatch.setattr(kumiho, "get_client", lambda: client)
+    legacy = Mock(return_value=SimpleNamespace(get_revisions=lambda: revisions))
+    monkeypatch.setattr(kumiho, "get_item", legacy)
+    root_ref = "kref:///space/item.conversation?r=2"
+    assert _get_sibling_revisions(root_ref) is revisions
+    client.get_revisions.assert_not_called()
+    legacy.assert_called_once_with(root_ref)

@@ -114,8 +114,11 @@ def _get_sibling_revisions(item_kref: str):
             # Match get_item_by_kref: validate the full URI before removing any
             # revision/artifact selector. The query may name an existing item.
             parsed = kref_type(item_kref)
-            item = kref_type("kref://" + parsed.get_path())
-            return get_revisions(item)
+            path = parsed.get_path()
+            # Legacy root-level spellings have different server canonicalization.
+            # Normal search results use project-qualified item references.
+            if not path.startswith("/"):
+                return get_revisions(kref_type("kref://" + path))
     return kumiho.get_item(item_kref).get_revisions()
 
 
