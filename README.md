@@ -726,3 +726,24 @@ If you use kumiho-memory in academic work, please cite:
 ### License
 
 MIT
+
+
+### Recall latency diagnostics
+
+Engage returns additive `timing_ms` diagnostics. `total` measures the memory tool
+handler, including its recall lock wait; it excludes host transport, connector
+authentication and routing before the handler. `retrieval` includes search,
+graph expansion and sibling enrichment; `evaluation` includes the optional
+Evaluate RPC and selection; `context_assembly` measures context composition.
+When exercised, nested stages report `search`, `query_reformulation`,
+`graph_edges`, `entity_bridge`, `fact_recall`, `entity_neighbors`, and
+`sibling_enrichment`. Values are milliseconds. Repeated stages are accumulated;
+parallel and nested stages overlap, so their sum is not the total. Missing stages
+were not measured, not necessarily zero. No memory text or credentials are logged.
+
+With SDK 0.14.1 or newer, recall resolves candidate published tags in batches of
+at most 100, resolves latest only for missing published tags, and reuses returned
+revision metadata. Older SDKs use the existing retrieval path. A server must
+support current-tag batch resolution; failures preserve individual resolution
+and back off batch attempts per client for 60 seconds. Graph depth, ranking,
+supersession markers and evaluation thresholds remain unchanged.

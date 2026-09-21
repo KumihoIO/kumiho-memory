@@ -116,6 +116,9 @@ def test_disabled_response_is_unchanged(manager, monkeypatch):
     monkeypatch.setenv("KUMIHO_MEMORY_CONTEXT_OPT_ENABLED", "0")
     again = engage()
 
+    for response in (again, baseline):
+        assert response.pop("timing_ms")["total"] >= 0
+        response.pop("approx_payload_tokens")
     assert again == baseline
 
 

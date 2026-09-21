@@ -39,6 +39,8 @@ from kumiho_memory.context_optimization import (
     resolve_policy,
 )
 
+from kumiho_memory.recall_timing import engage_timing
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -1220,6 +1222,7 @@ def tool_memory_discover_edges(args: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+@engage_timing
 def tool_memory_engage(args: Dict[str, Any]) -> Dict[str, Any]:
     """Check memory before responding — combines recall + context building.
 

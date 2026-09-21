@@ -37,6 +37,8 @@ from kumiho_memory.summarization import (
     build_string_array_wrapper_schema,
 )
 
+from kumiho_memory.recall_timing import timed
+
 logger = logging.getLogger(__name__)
 
 #: CONTRADICTS edge ``basis`` values that mean a fact-level DISPUTE (agent-
@@ -386,21 +388,29 @@ class GraphAugmentedRecall:
             self.config.edge_types if edge_types is None else edge_types
         )
 
-        # --- Stage 1: Multi-query reformulation (requires LLM) ---
-        alt_queries: List[str] = []
-        if self.config.reformulate_queries and self._has_llm:
-            alt_queries = await self._reformulate_query(query)
-        all_queries = [query] + alt_queries
-
-        # --- Stage 2: Parallel recall + merge ---
-        recall_tasks = [
-            self.recall_fn(
-                q, limit=base_limit,
-                space_paths=space_paths, memory_types=memory_types,
-            )
-            for q in all_queries
-        ]
-        recall_results = await asyncio.gather(*recall_tasks, return_exceptions=True)
+        # Start the original query while independent reformulation runs.
+        # Keep merge order original-first, regardless of completion order.
+        primary = asyncio.create_task(self.recall_fn(
+            query, limit=base_limit, space_paths=space_paths,
+            memory_types=memory_types,
+        ))
+        tasks = [primary]
+        try:
+            alt_queries: List[str] = []
+            if self.config.reformulate_queries and self._has_llm:
+                alt_queries = await self._reformulate_query(query)
+            all_queries = [query] + alt_queries
+            tasks.extend(asyncio.create_task(self.recall_fn(
+                q, limit=base_limit, space_paths=space_paths,
+                memory_types=memory_types,
+            )) for q in alt_queries)
+            recall_results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            # No orphan query if reformulation or the enclosing request fails.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         best_by_kref: Dict[str, Dict[str, Any]] = {}
         for result in recall_results:
@@ -837,6 +847,7 @@ class GraphAugmentedRecall:
     # Private — LLM query generation
     # ------------------------------------------------------------------
 
+    @timed("query_reformulation")
     async def _reformulate_query(self, query: str) -> List[str]:
         """Generate alternative search queries via the LLM adapter.
 
@@ -977,6 +988,7 @@ class GraphAugmentedRecall:
     # Private — edge traversal
     # ------------------------------------------------------------------
 
+    @timed("graph_edges")
     async def _traverse_edges(
         self,
         seed_krefs: List[str],
@@ -1158,6 +1170,7 @@ class GraphAugmentedRecall:
         )
         return 0
 
+    @timed("entity_bridge")
     async def _entity_bridge_join(
         self,
         angle_hits: List[List[Tuple[str, float]]],
@@ -1326,6 +1339,7 @@ class GraphAugmentedRecall:
             augmented.extend(results)
         return found
 
+    @timed("fact_recall")
     async def _fact_recall_leg(
         self,
         query: str,
@@ -1493,6 +1507,7 @@ class GraphAugmentedRecall:
             augmented.extend(results)
         return found
 
+    @timed("entity_neighbors")
     async def _traverse_entity_neighbors(
         self,
         seed_krefs: List[str],
