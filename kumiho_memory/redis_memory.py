@@ -687,8 +687,11 @@ class RedisMemoryBuffer:
                     "user_canonical_id": user_canonical_id,
                     "session_id": session_id,
                     "ttl_seconds": ttl_seconds,
-                    # Older proxy servers ignore unknown fields and perform
-                    # the plain SET — the pre-existing behaviour.
+                    # The control-plane proxy validates bodies strictly: a
+                    # server that predates nx rejects the whole request
+                    # (400) rather than ignoring the field, so the pointer is
+                    # not written at all. kumiho-control handles nx from
+                    # KumihoIO/kumiho-control#20.
                     "nx": nx,
                 },
             )
@@ -728,12 +731,12 @@ class RedisMemoryBuffer:
         """
         if self.client is None:
             if only_if is not None:
-                # The compare must happen CLIENT-side here: an older proxy
-                # server ignores unknown payload fields, so forwarding
-                # only_if alone silently restored the unconditional delete on
-                # hosted deployments while the local path was fixed (PR #4
-                # review, round 2). get_active_session is a main-era proxy
-                # action every server implements.
+                # The compare must happen CLIENT-side here: forwarding only_if
+                # alone left the guard to whichever proxy served the request
+                # (PR #4 review, round 2), and a proxy that predates only_if
+                # rejects the request outright under its strict schema.
+                # get_active_session is a main-era proxy action every server
+                # implements.
                 current = await self.get_active_session(
                     context=context, user_canonical_id=user_canonical_id,
                 )
@@ -744,7 +747,8 @@ class RedisMemoryBuffer:
                 payload={
                     "context": context,
                     "user_canonical_id": user_canonical_id,
-                    # Newer servers may enforce this atomically as well.
+                    # Servers with only_if support (kumiho-control#20)
+                    # repeat the compare atomically; null means unconditional.
                     "only_if": only_if,
                 },
             )
