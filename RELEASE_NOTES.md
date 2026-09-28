@@ -1,3 +1,14 @@
+## 1.6.4
+
+- Correct the hosted-proxy notes on `set_active_session` and `clear_active_session`.
+  The control-plane proxy validates requests strictly. A proxy without `nx` or
+  `only_if` support rejects the request (400) instead of ignoring the field.
+  No behavior change.
+- On hosted deployments, session rotation after consolidation needs kumiho-control
+  6fccef2 or later. The same applies to the active-session pointer (`nx` claim and
+  `only_if` clear). Older control planes reject these requests, and the client
+  degrades exactly as in 1.6.3.
+
 ## 1.6.3
 
 - Execute every explicit Engage and Recall request, including identical calls
