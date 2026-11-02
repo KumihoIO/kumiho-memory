@@ -1383,12 +1383,23 @@ class UniversalMemoryManager:
         source = source or None
         if evidence_level:
             evidence_tag(evidence_level)  # validate early — raises ValueError
+        read_limit = 1000
         messages_result = await self.redis_buffer.get_messages(
             project=self.project,
             session_id=session_id,
-            limit=1000,
+            limit=read_limit,
         )
         messages = messages_result["messages"]
+        # How many buffered turns this consolidation covers, for the reset at
+        # the end: turns appended after this read were never summarized, and the
+        # reset must neither delete them unseen nor excuse their loss.  The
+        # list length is exact unless the read was truncated at its limit (then
+        # the total is what gets discarded, as it always was).
+        try:
+            read_total = int(messages_result.get("message_count", len(messages)) or 0)
+        except (TypeError, ValueError):
+            read_total = len(messages)
+        expected_count = len(messages) if read_total <= read_limit else read_total
 
         # An empty buffer stops the LLM path (nothing to summarize) but NOT
         # the keyless one: there the agent wrote the summary from the
@@ -1844,6 +1855,7 @@ class UniversalMemoryManager:
         # live conversation sits on "{env}:c2") must not rotate the live
         # session — the same protection only_if gives the pointer.
         env_session = _host_session_env()
+        carry_to: Optional[str] = None
         if env_session and hasattr(self.redis_buffer, "bump_session_generation"):
             # One retry, then a WARNING — never silent (round 7): an
             # unrotated generation after a flake means identity-less
@@ -1862,7 +1874,14 @@ class UniversalMemoryManager:
                         else f"{env_session}:c{generation}"
                     )
                     if session_id == current_env_id:
-                        await self.redis_buffer.bump_session_generation(env_session)
+                        rotated = await self.redis_buffer.bump_session_generation(
+                            env_session
+                        )
+                        if isinstance(rotated, int) and rotated > 0:
+                            # The id an env-resolving caller gets next. The
+                            # reset marker is carried onto it, so that caller's
+                            # first write reads as the same session continuing.
+                            carry_to = f"{env_session}:c{rotated}"
                     break
                 except Exception as exc:
                     if attempt == 0:
@@ -1883,6 +1902,7 @@ class UniversalMemoryManager:
         # created_bucket=false; see RedisMemoryBuffer.reset_session.
         await self.redis_buffer.reset_session(
             self.project, session_id, reason="consolidate",
+            expected_count=expected_count, carry_to=carry_to,
         )
 
         # Clear the active session pointer so the next conversation starts

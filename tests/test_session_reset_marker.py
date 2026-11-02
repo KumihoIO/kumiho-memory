@@ -13,9 +13,10 @@ Contract pinned here: ``reset_session`` (what consolidate and
 ``kumiho_chat_clear`` now call) leaves a one-shot marker, written before the buffer
 is deleted and only if something is discarded; the first write after it reports
 ``created_bucket: false`` plus an additive ``buffer_reset_by`` and consumes it.  The
-marker lives one working-memory TTL and is single-use, so it never masks a genuine
-loss.  It uses only existing proxy actions and fields (the deployed control-plane
-schema is strict: an unknown field is a 400).  ``clear_session`` is unchanged.
+marker is only pending while nothing was written since, so it lives
+``max(TTL, 24 h)`` without ever hiding a lost turn.  ``clear_session`` is unchanged.
+Races and late turns: ``test_session_reset_marker_races.py``; hosted proxy wire:
+``test_session_reset_marker_hosted.py``.
 """
 
 import asyncio
@@ -29,57 +30,13 @@ from kumiho_memory.memory_manager import UniversalMemoryManager
 from kumiho_memory.redis_memory import RedisMemoryBuffer
 
 from fakes import FakeRedis
-from hosted_fakes import FakeMemoryProxy
-from test_memory_manager import (
-    AGENT_SUMMARY,
-    NeverSummarizer,
-    StubRedactor,
-    _keyless_manager,
+from reset_marker_support import (
+    MARKER_TTL, SESSION, TTL, _short_ttl, add, consolidate, count, env, reflect,
 )
+from test_memory_manager import StubRedactor, StubSummarizer
+from test_session_resolution import _FakeRedis
 
-#: A host conversation id as the Claude Code bootstrap hands it over: passed
-#: explicitly on every call, so it never rotates (unlike the env-derived id).
-SESSION = "2a59ba77-7be2-4eec-8f37-9fc2fb397771"
-TTL = 600
-
-
-@pytest.fixture(autouse=True)
-def _short_ttl(monkeypatch):
-    monkeypatch.setenv("KUMIHO_WORKING_MEMORY_TTL", str(TTL))
-    monkeypatch.setattr("kumiho_memory.memory_manager._load_default_retrieve", lambda: None)
-    monkeypatch.setattr("kumiho_memory.memory_manager._load_default_store", lambda: None)
-
-
-@pytest.fixture
-def env(tmp_path):
-    stored = []
-    manager, buffer = _keyless_manager(str(tmp_path), stored)
-    return manager, buffer, buffer.client
-
-
-def _reflect(text, session_id=SESSION):
-    return mcp_tools_module.tool_memory_reflect(
-        {"response": text, "session_id": session_id},
-    )
-
-
-def _consolidate(session_id=SESSION):
-    return mcp_tools_module.tool_memory_consolidate(
-        {"session_id": session_id, "summary": AGENT_SUMMARY},
-    )
-
-
-def _count(buffer, manager, session_id=SESSION):
-    got = asyncio.run(buffer.get_messages(
-        project=manager.project, session_id=session_id, limit=50,
-    ))
-    return got["message_count"]
-
-
-def _add(buffer, manager, text="hi", session_id=SESSION, role="user"):
-    return buffer.add_message(
-        project=manager.project, session_id=session_id, role=role, content=text,
-    )
+_FIXTURES = (_short_ttl, env)  # imported fixtures: pytest collects them from here
 
 
 # ---------------------------------------------------------------------------
@@ -90,16 +47,16 @@ def _add(buffer, manager, text="hi", session_id=SESSION, role="user"):
 def test_reflect_after_consolidate_keeps_the_session_and_reports_no_new_bucket(env):
     manager, buffer, _fake = env
     with patch.object(mcp_tools_module, "_manager", manager):
-        first = _reflect("first turn")
-        consolidated = _consolidate()
+        first = reflect("first turn")
+        consolidated = consolidate()
         assert consolidated["success"] is True, consolidated
         assert consolidated["session_id"] == SESSION
         # consolidate really did empty the buffer -- the session id is the same
         # and the buffer behind it is empty, which is the situation that used to
         # read as a recreated session.
-        assert _count(buffer, manager) == 0
-        second = _reflect("second turn")
-        third = _reflect("third turn")
+        assert count(buffer, manager) == 0
+        second = reflect("second turn")
+        third = reflect("third turn")
 
     assert first["created_bucket"] is True  # genuinely the first write ever
     assert "buffer_reset_by" not in first
@@ -109,7 +66,7 @@ def test_reflect_after_consolidate_keeps_the_session_and_reports_no_new_bucket(e
     assert second["buffer_reset_by"] == "consolidate"
     assert third["created_bucket"] is False
     assert "buffer_reset_by" not in third  # the marker is single-use
-    assert _count(buffer, manager) == 2
+    assert count(buffer, manager) == 2
 
 
 def test_repeated_consolidates_never_raise_the_alarm(env):
@@ -117,21 +74,21 @@ def test_repeated_consolidates_never_raise_the_alarm(env):
     manager, buffer, _fake = env
     flags = []
     with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn 0")
+        reflect("turn 0")
         for n in range(1, 5):
-            assert _consolidate()["success"] is True
-            flags.append(_reflect(f"turn {n}")["created_bucket"])
+            assert consolidate()["success"] is True
+            flags.append(reflect(f"turn {n}")["created_bucket"])
     assert flags == [False, False, False, False]
 
 
 def test_a_genuinely_new_session_still_reports_a_fresh_bucket(env):
     manager, buffer, _fake = env
     with patch.object(mcp_tools_module, "_manager", manager):
-        fresh = _reflect("hello", session_id="never-seen-before")
+        fresh = reflect("hello", session_id="never-seen-before")
         # ...and an unrelated session's consolidate leaves it a fresh one.
-        _reflect("elsewhere")
-        _consolidate()
-        still_fresh = _reflect("hello again", session_id="another-new-id")
+        reflect("elsewhere")
+        consolidate()
+        still_fresh = reflect("hello again", session_id="another-new-id")
     assert fresh["created_bucket"] is True
     assert "buffer_reset_by" not in fresh
     assert still_fresh["created_bucket"] is True
@@ -139,41 +96,69 @@ def test_a_genuinely_new_session_still_reports_a_fresh_bucket(env):
 
 
 # ---------------------------------------------------------------------------
-# TTL expiry must still be detectable
+# TTL: a true loss is still a loss, a pause after a consolidate is not
 # ---------------------------------------------------------------------------
 
 
 def test_idle_ttl_expiry_of_a_live_buffer_still_reports_a_fresh_bucket(env):
+    """Real loss, no consolidate involved: the buffer held turns and idled out."""
     manager, buffer, fake = env
     with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("before the pause")
+        reflect("before the pause")
         fake.advance(TTL + 1)
-        after = _reflect("after the pause")
-    assert after["created_bucket"] is True
-
-
-def test_consolidate_then_idle_past_the_ttl_is_a_genuine_loss(env):
-    """consolidate, then the session idles past the TTL: the marker expires on the
-    same clock the buffer would have, so a write this late is a true loss."""
-    manager, buffer, fake = env
-    with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn")
-        _consolidate()
-        fake.advance(TTL + 1)
-        after = _reflect("much later")
+        after = reflect("after the pause")
     assert after["created_bucket"] is True
     assert "buffer_reset_by" not in after
 
 
-def test_the_marker_is_honoured_for_a_full_ttl(env):
+def test_a_pause_longer_than_the_buffer_ttl_after_a_consolidate_is_not_a_lost_session(env):
+    """consolidate -> idle past the buffer TTL -> reflect.  Nothing was written
+    after the consolidate, so there was nothing left to lose: the turns are
+    consolidated.  This is the flow the reflex nudge recommends ("consolidate
+    before a long pause"); it must not raise the alarm either."""
     manager, buffer, fake = env
     with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn")
-        _consolidate()
-        fake.advance(TTL - 1)
-        after = _reflect("back within the TTL")
+        reflect("turn")
+        consolidate()
+        fake.advance(TTL + 1)
+        after = reflect("back after the pause")
     assert after["created_bucket"] is False
     assert after["buffer_reset_by"] == "consolidate"
+
+
+def test_the_marker_lives_a_day_not_longer(env):
+    manager, buffer, fake = env
+    with patch.object(mcp_tools_module, "_manager", manager):
+        reflect("turn")
+        consolidate()
+        fake.advance(MARKER_TTL - 1)
+        within = reflect("just inside the day")
+    assert within["created_bucket"] is False
+
+    with patch.object(mcp_tools_module, "_manager", manager):
+        reflect("turn", session_id="other")
+        consolidate(session_id="other")
+        fake.advance(MARKER_TTL + 1)
+        beyond = reflect("a day and a second later", session_id="other")
+    assert beyond["created_bucket"] is True
+    assert "buffer_reset_by" not in beyond
+
+
+@pytest.mark.parametrize("buffer_ttl,expected", [(TTL, MARKER_TTL), (172800, 172800)])
+def test_the_marker_ttl_is_the_longer_of_the_buffer_ttl_and_a_day(
+    buffer_ttl, expected, monkeypatch,
+):
+    monkeypatch.setenv("KUMIHO_WORKING_MEMORY_TTL", str(buffer_ttl))
+    fake = FakeRedis()
+    buffer = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+
+    async def run():
+        await buffer.add_message(project="P", session_id="s", role="user", content="x")
+        await buffer.reset_session("P", "s", reason="consolidate")
+
+    asyncio.run(run())
+    key = buffer._session_metadata_key("P", "s" + redis_memory.RESET_MARKER_SUFFIX)
+    assert fake.ttl_store[key] == expected
 
 
 def test_ttl_loss_after_a_reset_is_not_masked_by_the_spent_marker(env):
@@ -181,11 +166,11 @@ def test_ttl_loss_after_a_reset_is_not_masked_by_the_spent_marker(env):
     post-consolidate buffer is lost to expiry, and that is the true signal."""
     manager, buffer, fake = env
     with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn")
-        _consolidate()
-        assert _reflect("resumed")["buffer_reset_by"] == "consolidate"
+        reflect("turn")
+        consolidate()
+        assert reflect("resumed")["buffer_reset_by"] == "consolidate"
         fake.advance(TTL + 1)
-        after = _reflect("after the pause")
+        after = reflect("after the pause")
     assert after["created_bucket"] is True
     assert "buffer_reset_by" not in after
 
@@ -195,11 +180,11 @@ def test_a_buffer_lost_without_any_reset_is_not_excused_by_an_old_marker(env):
     even though the marker's own TTL has not elapsed."""
     manager, buffer, fake = env
     with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn")
-        _consolidate()
-        assert _reflect("resumed")["created_bucket"] is False
+        reflect("turn")
+        consolidate()
+        assert reflect("resumed")["created_bucket"] is False
         fake.storage.pop(buffer._session_messages_key(manager.project, SESSION))
-        after = _reflect("after the eviction")
+        after = reflect("after the eviction")
     assert after["created_bucket"] is True
 
 
@@ -209,12 +194,12 @@ def test_consolidating_a_buffer_that_already_idled_out_is_still_a_genuine_loss(e
     must not relabel the earlier TTL loss as "reset by consolidate"."""
     manager, buffer, fake = env
     with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("before the pause")
+        reflect("before the pause")
         fake.advance(TTL + 1)
-        consolidated = _consolidate()
+        consolidated = consolidate()
         assert consolidated["success"] is True, consolidated
         assert consolidated["buffer_was_empty"] is True
-        after = _reflect("after the pause")
+        after = reflect("after the pause")
     assert after["created_bucket"] is True
     assert "buffer_reset_by" not in after
 
@@ -222,11 +207,11 @@ def test_consolidating_a_buffer_that_already_idled_out_is_still_a_genuine_loss(e
 def test_a_second_consolidate_with_nothing_new_keeps_the_pending_marker(env):
     manager, buffer, _fake = env
     with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn")
-        assert _consolidate()["success"] is True
-        again = _consolidate()
+        reflect("turn")
+        assert consolidate()["success"] is True
+        again = consolidate()
         assert again["success"] is True and again["buffer_was_empty"] is True
-        after = _reflect("next turn")
+        after = reflect("next turn")
     assert after["created_bucket"] is False
     assert after["buffer_reset_by"] == "consolidate"
 
@@ -236,7 +221,7 @@ def test_clearing_a_session_nobody_used_is_not_a_reset(env):
     with patch.object(mcp_tools_module, "_manager", manager):
         cleared = mcp_tools_module.tool_chat_clear({"session_id": "never-used"})
         assert cleared["cleared_count"] == 0
-        first = _reflect("hello", session_id="never-used")
+        first = reflect("hello", session_id="never-used")
     assert first["created_bucket"] is True
     assert "buffer_reset_by" not in first
 
@@ -247,18 +232,17 @@ def test_clearing_a_session_nobody_used_is_not_a_reset(env):
 
 
 def test_chat_clear_is_a_deliberate_reset_not_a_lost_session(env):
-    """DECISION: ``kumiho_chat_clear`` keeps the session id and empties its
-    buffer exactly as consolidate does, so by the definition of the flag (never
-    had a buffer, or lost it to idle expiry) the next write is not a new bucket.
-    It is reported as ``buffer_reset_by: "clear"``."""
+    """DECISION (owner, 2026-11-02): ``kumiho_chat_clear`` keeps the session id
+    and empties its buffer exactly as consolidate does, so by the definition of
+    the flag the next write is not a new bucket.  ``buffer_reset_by: "clear"``."""
     manager, buffer, _fake = env
     with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn")
+        reflect("turn")
         cleared = mcp_tools_module.tool_chat_clear({"session_id": SESSION})
         assert cleared["success"] is True
         assert cleared["cleared_count"] == 1
         assert cleared["session_id"] == SESSION
-        after = _reflect("after the clear")
+        after = reflect("after the clear")
     assert after["created_bucket"] is False
     assert after["buffer_reset_by"] == "clear"
 
@@ -269,10 +253,10 @@ def test_the_low_level_clear_session_is_still_a_full_wipe(env):
     manager, buffer, _fake = env
 
     async def run():
-        await _add(buffer, manager, "one")
+        await add(buffer, manager, "one")
         cleared = await buffer.clear_session(manager.project, SESSION)
         assert cleared == {"success": True, "cleared_count": 1}
-        return await _add(buffer, manager, "two")
+        return await add(buffer, manager, "two")
 
     result = asyncio.run(run())
     assert result["created_bucket"] is True
@@ -280,120 +264,82 @@ def test_the_low_level_clear_session_is_still_a_full_wipe(env):
 
 
 # ---------------------------------------------------------------------------
-# Concurrency: PR #4 round 3 (the atomic RPUSH count is the mint signal)
+# The id the host derives from its environment: consolidation rotates it
 # ---------------------------------------------------------------------------
 
 
-class _YieldingClient:
-    """Delegates to a fake Redis, yielding to the loop before every command.
-
-    Concurrent coroutines then interleave command by command, like two clients on
-    one Redis server.  ``on_command(n)`` (optional) is called synchronously as the
-    n-th command starts -- a deterministic way to launch a second client at an
-    exact point of another coroutine's command stream.
-    """
-
-    def __init__(self, inner, on_command=None):
-        self._inner = inner
-        self._on_command = on_command
-        self.commands = 0
-
-    def __getattr__(self, name):
-        attribute = getattr(self._inner, name)
-        if not callable(attribute):
-            return attribute
-
-        async def command(*args, **kwargs):
-            await asyncio.sleep(0)
-            self.commands += 1
-            if self._on_command is not None:
-                self._on_command(self.commands)
-            return await attribute(*args, **kwargs)
-
-        return command
+def _env_manager(monkeypatch):
+    monkeypatch.setenv("KUMIHO_SESSION_ID", "host-uuid-9")
+    buffer = RedisMemoryBuffer(client=_FakeRedis(), redis_url="redis://test")
+    manager = UniversalMemoryManager(
+        redis_buffer=buffer, summarizer=StubSummarizer(),
+        pii_redactor=StubRedactor(), memory_store=None,
+    )
+    return manager
 
 
-def _yielding(buffer, on_command=None):
-    client = _YieldingClient(buffer.client, on_command)
-    buffer.client = client
-    return client
+def test_the_rotated_env_id_carries_the_reset_marker_forward(monkeypatch):
+    """Consolidating an env-derived session rotates its id to ``<id>:c<n>``.  The
+    first write on the rotated id is the same conversation continuing, so it
+    reports ``created_bucket: false`` + ``buffer_reset_by``, not a fresh bucket."""
+    manager = _env_manager(monkeypatch)
+
+    async def scenario():
+        first, _ = await manager.resolve_session_id()
+        await manager.add_assistant_response(session_id=first, response="hello")
+        await manager.consolidate_session(session_id=first)
+        rotated, source = await manager.resolve_session_id()
+        after = await manager.add_assistant_response(session_id=rotated, response="again")
+        return first, rotated, source, after
+
+    first, rotated, source, after = asyncio.run(scenario())
+    assert (first, rotated, source) == ("host-uuid-9", "host-uuid-9:c1", "host-env")
+    assert after["created_bucket"] is False, after
+    assert after["buffer_reset_by"] == "consolidate"
 
 
-@pytest.mark.parametrize("yielding", [False, True], ids=["atomic-fake", "interleaving-fake"])
-def test_two_appends_right_after_consolidate_do_not_both_report_a_fresh_bucket(env, yielding):
-    manager, buffer, fake = env
-    with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn")
-        _consolidate()
-    if yielding:
-        _yielding(buffer)
+def test_an_explicit_caller_keeps_its_marker_while_the_generation_rotates(monkeypatch):
+    """The Claude Code bootstrap passes the host id EXPLICITLY, and that id is
+    also the env value: consolidate bumps the generation (the explicit caller
+    never follows it) and the caller keeps writing to the same id.  The marker
+    therefore stays on the id that was reset, as well as being carried forward."""
+    manager = _env_manager(monkeypatch)
 
-    async def race():
-        return await asyncio.gather(*[
-            _add(buffer, manager, f"racer {n}") for n in range(2)
-        ])
-
-    results = asyncio.run(race())
-    assert [r["created_bucket"] for r in results] == [False, False], results
-    assert sorted(r["message_count"] for r in results) == [1, 2]
-    # exactly one writer was first, so exactly one consumed the marker
-    assert sum(1 for r in results if r.get("buffer_reset_by")) == 1
-
-
-def test_many_concurrent_appends_after_consolidate_consume_the_marker_once(env):
-    manager, buffer, fake = env
-    with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn")
-        _consolidate()
-    _yielding(buffer)
-
-    async def race():
-        return await asyncio.gather(*[
-            _add(buffer, manager, f"racer {n}") for n in range(8)
-        ])
-
-    results = asyncio.run(race())
-    assert not any(r["created_bucket"] for r in results), results
-    assert sorted(r["message_count"] for r in results) == list(range(1, 9))
-    assert sum(1 for r in results if r.get("buffer_reset_by") == "consolidate") == 1
-
-
-def test_no_interleaving_of_a_write_with_consolidate_reads_as_a_recreated_session(tmp_path):
-    """The marker is written BEFORE the buffer is deleted.  Written after, a write
-    landing between the delete and the marker saw an empty buffer and no marker --
-    the false alarm, in a window.  The consolidating client is slow (every Redis
-    command yields); a second, fast client writes into the same session at every
-    position of the consolidate's command stream, and once after it finished."""
-
-    async def scenario(launch_at, tag):
-        manager, buffer = _keyless_manager(str(tmp_path / tag), [])
-        fake = buffer.client
-        fast = RedisMemoryBuffer(client=fake, redis_url="redis://test")
-        await _add(buffer, manager, "user turn")
-        await _add(buffer, manager, "assistant turn", role="assistant")
-        late = []
-
-        async def late_write():
-            return await _add(fast, manager, "late write")
-
-        def on_command(n):
-            if n == launch_at and not late:
-                late.append(asyncio.get_running_loop().create_task(late_write()))
-
-        slow = _yielding(buffer, on_command)
-        consolidated = await manager.consolidate_session(
-            session_id=SESSION, summary=AGENT_SUMMARY,
+    async def scenario():
+        await manager.add_assistant_response(session_id="host-uuid-9", response="hello")
+        await manager.consolidate_session(session_id="host-uuid-9")
+        return await manager.add_assistant_response(
+            session_id="host-uuid-9", response="again",
         )
-        assert consolidated["success"] is True, consolidated
-        if not late:  # launched after the consolidate has completely finished
-            late.append(asyncio.get_running_loop().create_task(late_write()))
-        return await late[0], slow.commands
 
-    _result, total_commands = asyncio.run(scenario(None, "dry"))
-    assert total_commands > 5  # the sweep below really spans a command stream
-    for launch_at in range(1, total_commands + 2):
-        late_result, _ = asyncio.run(scenario(launch_at, f"at{launch_at}"))
-        assert late_result["created_bucket"] is False, (launch_at, late_result)
+    after = asyncio.run(scenario())
+    assert after["created_bucket"] is False, after
+    assert after["buffer_reset_by"] == "consolidate"
+
+
+# ---------------------------------------------------------------------------
+# The id space: "<id>:~reset" is reserved for markers
+# ---------------------------------------------------------------------------
+
+
+def test_a_session_id_ending_in_the_reserved_suffix_is_refused_on_write(env):
+    manager, buffer, _fake = env
+    with pytest.raises(ValueError, match="reserved"):
+        asyncio.run(add(buffer, manager, "x", session_id=SESSION + ":~reset"))
+    assert redis_memory.RESET_MARKER_SUFFIX == ":~reset"
+
+
+@pytest.mark.parametrize("session_id", [
+    SESSION,
+    "km1_0133494e0123456789abcdef01234567_" + "ab" * 32,
+    "host-uuid-9:c3",
+    "personal:user-ab12cd34ef:20261102:001",
+    "~reset",
+    "x:~resetx",
+])
+def test_every_id_the_system_mints_or_hosts_hand_over_is_still_accepted(env, session_id):
+    manager, buffer, _fake = env
+    assert asyncio.run(add(buffer, manager, "x", session_id=session_id))["created_bucket"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -407,11 +353,11 @@ def test_the_response_shape_only_ever_grows_by_one_field(env):
     manager, buffer, _fake = env
 
     async def run():
-        first = await _add(buffer, manager, "one")
-        second = await _add(buffer, manager, "two")
+        first = await add(buffer, manager, "one")
+        second = await add(buffer, manager, "two")
         await buffer.reset_session(manager.project, SESSION, reason="consolidate")
-        after_reset = await _add(buffer, manager, "three")
-        later = await _add(buffer, manager, "four")
+        after_reset = await add(buffer, manager, "three")
+        later = await add(buffer, manager, "four")
         return first, second, after_reset, later
 
     first, second, after_reset, later = asyncio.run(run())
@@ -426,15 +372,15 @@ def test_reset_session_returns_the_clear_session_result_shape(env):
     manager, buffer, _fake = env
 
     async def run():
-        await _add(buffer, manager, "one")
-        await _add(buffer, manager, "two")
+        await add(buffer, manager, "one")
+        await add(buffer, manager, "two")
         return await buffer.reset_session(manager.project, SESSION, reason="clear")
 
     assert asyncio.run(run()) == {"success": True, "cleared_count": 2}
 
 
 # ---------------------------------------------------------------------------
-# A marker that cannot be written degrades to the old behaviour, never worse
+# A marker that cannot be written or read degrades to the old behaviour
 # ---------------------------------------------------------------------------
 
 
@@ -449,11 +395,11 @@ def test_a_failed_marker_write_does_not_fail_or_skip_the_consolidate(env, caplog
 
     buffer.set_session_metadata = flaky_set
     with patch.object(mcp_tools_module, "_manager", manager):
-        _reflect("turn")
-        consolidated = _consolidate()
+        reflect("turn")
+        consolidated = consolidate()
         assert consolidated["success"] is True, consolidated
-        assert _count(buffer, manager) == 0  # the buffer was still cleared
-        after = _reflect("next")
+        assert count(buffer, manager) == 0  # the buffer was still cleared
+        after = reflect("next")
     assert after["created_bucket"] is True  # pre-marker behaviour, not a crash
     assert "reset marker" in caplog.text
 
@@ -465,132 +411,33 @@ def test_an_unreadable_marker_degrades_to_a_fresh_bucket(env):
         raise RuntimeError("redis hiccup")
 
     async def run():
-        await _add(buffer, manager, "one")
+        await add(buffer, manager, "one")
         await buffer.reset_session(manager.project, SESSION, reason="consolidate")
         buffer.get_session_metadata = broken_get
-        return await _add(buffer, manager, "two")
+        return await add(buffer, manager, "two")
 
     assert asyncio.run(run())["created_bucket"] is True
 
 
-# ---------------------------------------------------------------------------
-# Hosted proxy: no new action, no new field, no longer-lived marker than the buffer
-# ---------------------------------------------------------------------------
+def test_an_unreadable_buffer_length_still_leaves_the_marker(env):
+    """If the length cannot be read the reset assumes the session was in use: a
+    false alarm is the worse error (documented trade-off, see _message_count)."""
+    manager, buffer, fake = env
+    real_llen = fake.llen
+    calls = {"n": 0}
 
-#: The 12 actions kumiho-memory sends (WORK_PLAN P2-min: the session API contract).
-PROXY_ACTIONS = {
-    "add_message", "get_messages", "set_session_metadata", "get_session_metadata",
-    "clear_session", "list_sessions", "next_sequence", "get_active_session",
-    "set_active_session", "clear_active_session", "get_session_generation",
-    "bump_session_generation",
-}
-#: Body fields of the deployed control-plane schema (kumiho-control
-#: packages/origin/src/app/api/memory/redis/route.ts, ``z.strictObject``): any
-#: other key makes the proxy answer 400 invalid_payload.
-PROXY_FIELDS = {
-    "action", "project", "session_id", "base_session_id", "role", "content",
-    "metadata", "limit", "offset", "default_ttl", "user_canonical_id", "date_str",
-    "ttl_seconds", "context", "nx", "only_if", "tenant_hint",
-}
-
-
-class _DeployedProxy(FakeMemoryProxy):
-    """The deployed control plane: ``add_message`` returns no ``created_bucket``
-    (the client derives it from ``message_count``) and the body is strict."""
-
-    def _dispatch(self, state, action, body):
-        assert action in PROXY_ACTIONS, f"new proxy action {action!r}"
-        unknown = set(body) - PROXY_FIELDS
-        assert not unknown, f"{action}: fields the strict schema rejects: {sorted(unknown)}"
-        result = super()._dispatch(state, action, body)
-        if action == "add_message":
-            result.pop("created_bucket", None)
-        return result
-
-
-@pytest.fixture
-def proxied(monkeypatch, tmp_path):
-    for var in ("UPSTASH_REDIS_URL", "KUMIHO_UPSTASH_REDIS_URL", "KUMIHO_MEMORY_PROXY_URL"):
-        monkeypatch.delenv(var, raising=False)
-    fake = _DeployedProxy()
-    monkeypatch.setattr(redis_memory.requests, "post", fake)
-    monkeypatch.setattr(
-        RedisMemoryBuffer, "_get_fresh_token", staticmethod(lambda **kwargs: "tok"),
-    )
-    buffer = RedisMemoryBuffer(
-        proxy_url="https://cp.test.invalid/api/memory/redis",
-        tenant_id="tenant-p",
-        prefer_discovery=False,
-    )
-    stored = []
-
-    async def store_stub(**kwargs):
-        stored.append(kwargs)
-        return {"item_kref": "kref://m/i", "revision_kref": "kref://m/i?r=1"}
-
-    manager = UniversalMemoryManager(
-        redis_buffer=buffer,
-        summarizer=NeverSummarizer(),
-        pii_redactor=StubRedactor(),
-        memory_store=store_stub,
-        consolidation_threshold=2,
-        artifact_root=str(tmp_path),
-    )
-    return manager, buffer, fake
-
-
-def test_hosted_proxy_consolidate_then_reflect_reports_no_new_bucket(proxied):
-    manager, buffer, fake = proxied
-    with patch.object(mcp_tools_module, "_manager", manager):
-        first = _reflect("turn")
-        assert _consolidate()["success"] is True
-        second = _reflect("after")
-        third = _reflect("again")
-        fresh = _reflect("elsewhere", session_id="a-genuinely-new-id")
-    assert first["created_bucket"] is True
-    assert (second["created_bucket"], second["buffer_reset_by"]) == (False, "consolidate")
-    assert third["created_bucket"] is False and "buffer_reset_by" not in third
-    assert fresh["created_bucket"] is True
-    # every call that reached the proxy used an existing action and field
-    assert {c["action"] for c in fake.calls} <= PROXY_ACTIONS
-
-
-def test_hosted_proxy_marker_carries_the_buffer_ttl_and_other_calls_are_unchanged(proxied):
-    manager, buffer, fake = proxied
+    async def flaky_llen(key):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("redis hiccup")
+        return await real_llen(key)
 
     async def run():
-        await _add(buffer, manager, "one")
-        await buffer.set_session_metadata(manager.project, SESSION, {"user_id": "u"})
+        await add(buffer, manager, "one")
+        fake.llen = flaky_llen
         await buffer.reset_session(manager.project, SESSION, reason="consolidate")
+        return await add(buffer, manager, "two")
 
-    asyncio.run(run())
-    sets = [c["body"] for c in fake.calls if c["action"] == "set_session_metadata"]
-    ordinary = [b for b in sets if not b["session_id"].endswith(redis_memory.RESET_MARKER_SUFFIX)]
-    marker = [b for b in sets if b["session_id"].endswith(redis_memory.RESET_MARKER_SUFFIX)]
-    # an ordinary metadata write is byte-for-byte what it was (no new field)
-    assert ordinary == [{
-        "action": "set_session_metadata", "project": manager.project,
-        "session_id": SESSION, "metadata": {"user_id": "u"},
-    }]
-    # the marker asks for the buffer's own TTL, not the proxy's 3600 default
-    assert len(marker) == 1 and marker[0]["default_ttl"] == TTL
-    # a reset is: look at the buffer, write the marker, then delete the buffer
-    reset_calls = [c["action"] for c in fake.calls][-3:]
-    assert reset_calls == ["get_messages", "set_session_metadata", "clear_session"]
-    # the marker is written before the buffer is deleted
-    actions = [c["action"] for c in fake.calls]
-    first_marker = next(
-        i for i, c in enumerate(fake.calls)
-        if c["action"] == "set_session_metadata"
-        and c["body"]["session_id"].endswith(redis_memory.RESET_MARKER_SUFFIX)
-    )
-    assert first_marker < actions.index("clear_session")
-
-
-def test_hosted_proxy_clear_session_payload_is_unchanged(proxied):
-    manager, buffer, fake = proxied
-    asyncio.run(buffer.clear_session(manager.project, SESSION))
-    (call,) = [c for c in fake.calls if c["action"] == "clear_session"]
-    assert call["body"] == {
-        "action": "clear_session", "project": manager.project, "session_id": SESSION,
-    }
+    after = asyncio.run(run())
+    assert after["created_bucket"] is False
+    assert after["buffer_reset_by"] == "consolidate"

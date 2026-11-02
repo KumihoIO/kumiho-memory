@@ -56,6 +56,20 @@ class FakeRedis:
         self.ttl_store.pop(key, None)
         self._deadlines.pop(key, None)
 
+    async def ltrim(self, key, start, end):
+        """Keep items ``start..end`` (inclusive, negative counts from the tail);
+        an empty result removes the key, as Redis does."""
+        items = self.storage.get(key, [])
+        length = len(items)
+        start = max(length + start, 0) if start < 0 else start
+        end = length + end if end < 0 else end
+        kept = items[start:end + 1] if start <= end else []
+        if kept:
+            self.storage[key] = kept
+        else:
+            await self.delete(key)
+        return True
+
     async def scan(self, cursor, match, count=100):
         keys = [k for k in self.storage.keys() if fnmatch.fnmatch(k, match)]
         return 0, keys

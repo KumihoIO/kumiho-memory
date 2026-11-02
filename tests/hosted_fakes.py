@@ -133,9 +133,10 @@ class FakeMemoryProxy:
                 "ttl_remaining": 3600,
             }
         if action == "clear_session":
-            state["messages"].pop(session_id, None)
+            cleared = len(state["messages"].pop(session_id, []))
             state["metadata"].pop(session_id, None)
-            return {"success": True, "cleared": True}
+            # The real proxy answers {success, cleared_count} (route.ts).
+            return {"success": True, "cleared": True, "cleared_count": cleared}
         if action == "set_session_metadata":
             state["metadata"].setdefault(session_id, {}).update(
                 body.get("metadata") or {}

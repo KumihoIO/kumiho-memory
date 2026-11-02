@@ -3,16 +3,25 @@
 - A consolidate (or `kumiho_chat_clear`) no longer makes the same session look
   recreated. They used to delete the buffer, so the next write into the unchanged
   session id reported `created_bucket: true`, and hosts warned the user mid-conversation.
-  `RedisMemoryBuffer.reset_session` now leaves a one-shot marker (one working-memory TTL,
-  consumed by the next write): that write reports `created_bucket: false` plus an
-  additive `buffer_reset_by` (`"consolidate"` or `"clear"`).
-  `created_bucket: true` keeps meaning only "this id had no buffer": never used, or lost
-  to idle-TTL expiry. `clear_session` is unchanged and leaves no marker.
-- No wire change: the marker uses the existing `set_session_metadata` and
-  `get_session_metadata` proxy actions on a reserved sibling id (`<session_id>:~reset`),
-  and `set_session_metadata` gains an optional `ttl_seconds` that only the marker sets
-  (it sends the existing `default_ttl` field). A control plane or SDK that predates this
-  change keeps working; an unreadable or unwritable marker degrades to the old behaviour.
+  `RedisMemoryBuffer.reset_session` now leaves a one-shot marker (consumed by the next
+  write; it lives `max(TTL, 24 h)` because it is only pending while nothing was written
+  since): that write reports `created_bucket: false` plus an additive `buffer_reset_by`
+  (`"consolidate"` or `"clear"`). `created_bucket: true` keeps meaning only "this id had
+  no buffer": never used, or lost to idle-TTL expiry. `clear_session` is unchanged and
+  leaves no marker. For a host-env session the marker is also carried onto the rotated
+  `<id>:c<n>`.
+- Turns appended while a consolidate was summarizing are no longer deleted unseen on a
+  direct Redis: the buffer is trimmed by the number of turns that were read (LTRIM), not
+  deleted. Through the hosted proxy, which can only delete, they are still discarded, but
+  now logged and never excused (no marker; the next write reports `true`).
+- No schema or action change: the marker uses the existing `set_session_metadata`,
+  `get_session_metadata`, `get_messages` and `clear_session` proxy actions on a reserved
+  sibling id (`<session_id>:~reset`), and `set_session_metadata` gains an optional
+  `ttl_seconds` that only the marker sets (it sends the existing `default_ttl` field). A
+  control plane or SDK that predates this change keeps working; an unreadable or
+  unwritable marker degrades to the old behaviour.
+- Session ids ending in `:~reset` are refused by `add_message` (reserved for markers).
+  Generated and host-supplied ids never contain a `~`.
 
 ## 1.6.4
 

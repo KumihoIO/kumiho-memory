@@ -651,14 +651,22 @@ A write into a session's working-memory buffer (`kumiho_chat_add`,
 
 `kumiho_memory_consolidate` and `kumiho_chat_clear` empty the buffer; they do
 not create a new session, and an explicit `session_id` never changes. They
-leave a one-shot marker that lives one working-memory TTL and is consumed by the
-next write, so that write reports `created_bucket: false` with
-`buffer_reset_by`. The marker never hides a real loss: if the TTL passes first,
-or the post-reset buffer later disappears, the next write reports `true`.
+leave a one-shot marker that is consumed by the next write, so that write
+reports `created_bucket: false` with `buffer_reset_by`. The marker is only
+pending while nothing has been written since the reset, so it cannot hide a
+lost turn: it lives `max(TTL, 24 h)`, which means a pause longer than the
+buffer TTL after a consolidate is not reported as a lost session either (a
+pause longer than a day is). It never excuses a real loss: if the
+post-reset buffer later disappears (idle expiry, eviction), or the reset
+discarded nothing (an already-expired buffer), the next write reports `true`.
+Turns appended while a consolidate was summarizing were never consolidated:
+on a direct Redis they are kept in the buffer; through the hosted proxy, which
+can only delete, they are discarded as before, logged, and not excused.
 `RedisMemoryBuffer.clear_session` is the unchanged low-level full wipe and
-leaves no marker. (A session resolved from the host environment rather than
-passed explicitly rotates to a new id, `<id>:c<n>`, after consolidation; that
-new id is reported as a new bucket.)
+leaves no marker. A session resolved from the host environment rotates to a new
+id, `<id>:c<n>`, after consolidation; the marker is carried onto the new id, so
+its first write is reported the same way. Ids ending in `:~reset` are reserved
+for markers and refused on write.
 
 ---
 
