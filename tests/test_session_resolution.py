@@ -125,6 +125,18 @@ class _FakeRedis:
         value = self.kv.get(key)
         return dict(value) if isinstance(value, dict) else {}
 
+    async def ltrim(self, key, start, end):
+        items = self.lists.get(key, [])
+        n = len(items)
+        start = max(n + start, 0) if start < 0 else start
+        end = n + end if end < 0 else end
+        kept = items[start:end + 1] if start <= end else []
+        if kept:
+            self.lists[key] = kept
+        else:
+            self.lists.pop(key, None)
+        return True
+
     async def lrange(self, key, start, end):
         items = self.lists.get(key, [])
         n = len(items)
@@ -437,6 +449,12 @@ def test_the_generation_bump_happens_before_the_buffer_clear(monkeypatch):
                 self.ops.append(("delete", key))
             return await super().delete(*keys)
 
+        async def ltrim(self, key, start, end):
+            # A consolidate empties the buffer with LTRIM (it keeps turns that
+            # arrived after its read); that is the buffer clear for ordering.
+            self.ops.append(("ltrim", key))
+            return await super().ltrim(key, start, end)
+
     client = _OpOrderRedis()
     buffer = RedisMemoryBuffer(client=client, redis_url="redis://test")
     manager = UniversalMemoryManager(
@@ -457,7 +475,7 @@ def test_the_generation_bump_happens_before_the_buffer_clear(monkeypatch):
     incr_at = next(i for i, (op, k) in enumerate(client.ops)
                    if op == "incr" and "session_gen" in k)
     clear_at = next(i for i, (op, k) in enumerate(client.ops)
-                    if op == "delete" and ":messages" in k)
+                    if op in ("delete", "ltrim") and ":messages" in k)
     assert incr_at < clear_at
 
 
@@ -682,6 +700,10 @@ class _StubManager:
                         "message_count": 0, "ttl_remaining": 0}
 
             async def clear_session(self, project, session_id):
+                mgr.seen["op_session"] = session_id
+                return {"success": True, "cleared_count": 0}
+
+            async def reset_session(self, project, session_id, *, reason):
                 mgr.seen["op_session"] = session_id
                 return {"success": True, "cleared_count": 0}
 

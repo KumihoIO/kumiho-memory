@@ -24,6 +24,11 @@ from kumiho.discovery import (
 )
 
 from kumiho_memory._request_context import current_request, hosted_mode, is_hosted
+from kumiho_memory.session_reset import (
+    RESET_MARKER_MIN_TTL,  # noqa: F401 - re-exported
+    RESET_MARKER_SUFFIX,
+    SessionResetMixin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +152,7 @@ class RedisDiscoveryResult:
     region_code: Optional[str] = None
 
 
-class RedisMemoryBuffer:
+class RedisMemoryBuffer(SessionResetMixin):
     """Short-term memory buffer using Upstash Redis.
 
     Uses the `kumiho:memory:*` namespace to avoid conflicts with event streaming.
@@ -421,6 +426,15 @@ class RedisMemoryBuffer:
             raise ValueError("project must be a non-empty string")
         if not session_id or not session_id.strip():
             raise ValueError("session_id must be a non-empty string")
+        if session_id.endswith(RESET_MARKER_SUFFIX):
+            # Reserved for reset markers (see reset_session): a real session
+            # called "X:~reset" would share its metadata with X's marker.
+            # Checked on the write that CREATES a session, so only new ids are
+            # affected; no generated or host-supplied id contains a "~".
+            raise ValueError(
+                f"session_id must not end with {RESET_MARKER_SUFFIX!r} "
+                "(reserved for session reset markers)"
+            )
         if not content:
             raise ValueError("content must be a non-empty string")
         if len(content) > self.MAX_MESSAGE_SIZE:
@@ -443,8 +457,10 @@ class RedisMemoryBuffer:
             # An older proxy server returns its payload without the mint
             # flag; derive it from message_count so hosted mode carries the
             # same drift signal as the local path (PR #4 review, round 4).
-            if isinstance(result, dict) and "created_bucket" not in result:
-                result["created_bucket"] = result.get("message_count") == 1
+            if isinstance(result, dict):
+                if "created_bucket" not in result:
+                    result["created_bucket"] = result.get("message_count") == 1
+                await self._excuse_deliberate_reset(project, session_id, result)
             return result
 
         key = self._session_messages_key(project, session_id)
@@ -461,7 +477,7 @@ class RedisMemoryBuffer:
         count = await self.client.rpush(key, json.dumps(message))
         await self.client.expire(key, self.default_ttl)
 
-        return {
+        result = {
             "success": True,
             "message_id": f"{session_id}:{count}",
             "message_count": count,
@@ -471,8 +487,13 @@ class RedisMemoryBuffer:
             # message (issue #3). Surfacing it lets the caller notice; a read
             # of a wrong id returns a clean empty indistinguishable from a
             # new session, so the write is where the signal has to live.
+            #
+            # "Did not exist" excludes a session that was deliberately reset
+            # (consolidate, chat_clear): see _excuse_deliberate_reset.
             "created_bucket": count == 1,
         }
+        await self._excuse_deliberate_reset(project, session_id, result)
+        return result
 
     async def get_messages(
         self,
@@ -526,22 +547,37 @@ class RedisMemoryBuffer:
         project: str,
         session_id: str,
         metadata: Dict[str, str],
+        *,
+        ttl_seconds: Optional[int] = None,
     ) -> None:
-        """Store session-level metadata (e.g. user_id, context)."""
+        """Store session-level metadata (e.g. user_id, context).
+
+        ``ttl_seconds`` overrides the idle TTL of the metadata hash; omitted, a
+        direct Redis uses :attr:`default_ttl` and the proxy its own default, and
+        the request is byte-identical to what it always was.  Only the reset
+        marker passes it, so that the marker lives as long as the buffer would
+        have even where the proxy default (an hour) is shorter.
+        """
         if self.client is None:
+            payload: Dict[str, Any] = {
+                "project": project,
+                "session_id": session_id,
+                "metadata": metadata,
+            }
+            if ttl_seconds is not None:
+                # ``default_ttl`` is an existing field of the proxy schema
+                # (add_message sends it); no new field reaches the wire.
+                payload["default_ttl"] = ttl_seconds
             await self._proxy_request(
-                action="set_session_metadata",
-                payload={
-                    "project": project,
-                    "session_id": session_id,
-                    "metadata": metadata,
-                },
+                action="set_session_metadata", payload=payload,
             )
             return
 
         key = self._session_metadata_key(project, session_id)
         await self.client.hset(key, mapping=metadata)
-        await self.client.expire(key, self.default_ttl)
+        await self.client.expire(
+            key, self.default_ttl if ttl_seconds is None else ttl_seconds,
+        )
 
     async def get_session_metadata(
         self,
