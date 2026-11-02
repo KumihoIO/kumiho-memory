@@ -14,6 +14,7 @@ The invariants (see ``test_session_reset_marker.py`` for the basic contract):
 """
 
 import asyncio
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -76,6 +77,36 @@ def test_many_concurrent_appends_after_consolidate_consume_the_marker_once(env):
     assert not any(r["created_bucket"] for r in results), results
     assert sorted(r["message_count"] for r in results) == list(range(1, 9))
     assert sum(1 for r in results if r.get("buffer_reset_by") == "consolidate") == 1
+
+
+def test_a_faster_second_writer_cannot_take_the_marker_from_the_first(env):
+    """Why a write that gets count 2 must NOT retire a pending marker (the idea of
+    clearing stale markers that way): it cannot tell a stale marker from one the
+    in-flight count-1 writer is about to consume.  Here the first writer is slow,
+    the second (count 2) is fast and finishes first; the first must still be
+    excused.  See the "Known residual" note of ``reset_session``."""
+    manager, buffer, fake = env
+    with patch.object(mcp_tools_module, "_manager", manager):
+        reflect("turn")
+        consolidate()
+    fast = RedisMemoryBuffer(client=fake, redis_url="redis://test")
+    second = []
+
+    def on_command(n):
+        if n == 2 and not second:  # the slow writer's rpush ran; its expire is next
+            second.append(asyncio.get_running_loop().create_task(add(fast, manager, "second")))
+
+    yielding(buffer, on_command)
+
+    async def run():
+        first = await add(buffer, manager, "first")
+        return first, await second[0]
+
+    first, second_result = asyncio.run(run())
+    assert (first["message_count"], second_result["message_count"]) == (1, 2)
+    assert (first["created_bucket"], first["buffer_reset_by"]) == (False, "consolidate")
+    assert second_result["created_bucket"] is False
+    assert "buffer_reset_by" not in second_result
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +265,10 @@ def test_a_turn_landing_between_the_length_check_and_the_trim_withdraws_the_mark
     assert lost["created_bucket"] is True
 
 
-def test_consolidating_a_buffer_longer_than_the_read_limit_clears_it_all(env):
-    """The read returns the last 1000 turns; the older ones were always dropped
-    with the buffer.  They must not look like turns appended during the consolidate."""
+def test_the_unread_turns_of_a_buffer_longer_than_the_read_limit_are_not_excused(env, caplog):
+    """The read returns the last 1000 turns; the older ones were never summarized
+    and are dropped with the buffer.  That loss must not be called "consolidate":
+    no marker, a WARNING, and the next write reports a fresh bucket."""
     manager, buffer, _fake = env
 
     async def run():
@@ -244,10 +276,45 @@ def test_consolidating_a_buffer_longer_than_the_read_limit_clears_it_all(env):
             await add(buffer, manager, f"m{n}")
         return await manager.consolidate_session(session_id=SESSION, summary=AGENT_SUMMARY)
 
-    assert asyncio.run(run())["success"] is True
+    with caplog.at_level(logging.WARNING, logger="kumiho_memory.session_reset"):
+        assert asyncio.run(run())["success"] is True
     assert count(buffer, manager) == 0
     follow = asyncio.run(add(buffer, manager, "next"))
+    assert follow["created_bucket"] is True and "buffer_reset_by" not in follow
+    assert "never summarized" in caplog.text
+
+
+def test_a_buffer_of_exactly_the_read_limit_is_fully_read_and_excused(env):
+    manager, buffer, _fake = env
+
+    async def run():
+        for n in range(1000):
+            await add(buffer, manager, f"m{n}")
+        return await manager.consolidate_session(session_id=SESSION, summary=AGENT_SUMMARY)
+
+    assert asyncio.run(run())["success"] is True
+    follow = asyncio.run(add(buffer, manager, "next"))
     assert (follow["created_bucket"], follow["buffer_reset_by"]) == (False, "consolidate")
+
+
+def test_a_second_concurrent_reset_does_not_excuse_the_loss_of_the_first_ones_late_turn(env):
+    """Two consolidates read the same 2 turns; a third arrived; the first trims 2
+    and keeps it; the second finds FEWER turns than it read (1) and trims 2,
+    deleting the late turn.  That loss must not be excused."""
+    manager, buffer, _fake = env
+
+    async def run():
+        for n in range(3):
+            await add(buffer, manager, f"m{n}")
+        await buffer.reset_session(manager.project, SESSION, reason="consolidate", expected_count=2)
+        kept = await read_contents(buffer, manager)
+        await buffer.reset_session(manager.project, SESSION, reason="consolidate", expected_count=2)
+        follow = await add(buffer, manager, "next")
+        return kept, follow
+
+    kept, follow = asyncio.run(run())
+    assert kept == ["m2"]
+    assert follow["created_bucket"] is True and "buffer_reset_by" not in follow
 
 
 # ---------------------------------------------------------------------------

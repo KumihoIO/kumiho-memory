@@ -12,7 +12,8 @@ own and uses only the buffer's existing primitives (``client``, ``default_ttl``,
 Contract (``created_bucket`` semantics): a write that creates a buffer reports
 ``created_bucket: true`` unless a reset marker is pending for that session id, in
 which case it reports ``false`` plus ``buffer_reset_by: <reason>`` and consumes the
-marker.  So ``true`` means the id never had a buffer or lost it to idle-TTL expiry.
+marker.  So ``true`` means the id never had a buffer or lost it to idle-TTL expiry --
+with the residual cases listed in :meth:`SessionResetMixin.reset_session`.
 No schema or action change on the hosted proxy: markers are session metadata of the
 reserved sibling id ``"<session_id>:~reset"``.
 """
@@ -35,11 +36,18 @@ RESET_MARKER_SUFFIX = ":~reset"
 
 #: A reset marker lives at least this long (seconds), whatever the buffer TTL.
 #: The marker is only ever pending while NOTHING has been written since the
-#: reset, so a long life cannot hide a loss of turns -- there are none to lose.
+#: reset, so a long life normally hides no loss of turns -- there are none to
+#: lose (the residual cases are listed in ``reset_session``).
 #: What it prevents is the false alarm after "consolidate, then a pause longer
 #: than the buffer TTL".  Same day-long horizon as the generation counter; a
 #: memory-only hosted tier clamps it to its own ceiling (6 h) server-side.
 RESET_MARKER_MIN_TTL = 86400
+
+#: A memory-only hosted tenant's server trims the buffer to its last 250 turns on
+#: every append (kumiho-control ``MEMORY_APPEND_SCRIPT``, ``LTRIM -250``).  At the
+#: cap a turn appended during a consolidate leaves the count unchanged, so it
+#: cannot be told apart from "nothing arrived".
+HOSTED_BUFFER_CAP = 250
 
 
 class SessionResetMixin:
@@ -56,6 +64,7 @@ class SessionResetMixin:
         *,
         reason: str,
         expected_count: Optional[int] = None,
+        read_complete: bool = True,
         carry_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Empty a session's buffer while the session itself carries on.
@@ -78,8 +87,14 @@ class SessionResetMixin:
         consolidated: on a direct Redis they are KEPT (the buffer is trimmed by
         ``expected_count`` instead of deleted) and no marker is written, since the
         buffer is not empty.  Through the proxy, which can only delete, they are
-        discarded as before -- but never excused: no marker, a WARNING, and the
-        next write reports ``created_bucket: true``.
+        discarded as before -- but not excused: no marker and a WARNING, so the
+        next write normally reports ``created_bucket: true``.
+
+        The reset also refuses to excuse what it cannot vouch for, and says so in
+        a WARNING: ``read_complete=False`` (the read was truncated, so older turns
+        were never summarized), fewer turns present than were read (a concurrent
+        reset, or the buffer expired meanwhile), and -- through the proxy -- a
+        buffer at the server's 250-turn cap (:data:`HOSTED_BUFFER_CAP`).
 
         ``carry_to`` names a second id that will carry the session on (the
         generation-rotated ``"<env id>:c<n>"`` of a host-env session); it gets
@@ -97,9 +112,10 @@ class SessionResetMixin:
         * **Single use, long lived.**  The first write after the reset consumes
           it (a ``reset_id`` nonce, so a newer reset is never overwritten by an
           older consume).  It lives ``max(TTL, 24 h)``: it is only pending while
-          nothing was written since, so it cannot hide a loss of turns, and a
-          pause after a consolidate must not read as a lost session.  A later
-          loss of the post-reset buffer reads as ``true``.
+          nothing was written since, so normally it hides no loss of turns, and a
+          pause after a consolidate does not read as a lost session.  A later
+          loss of the post-reset buffer reads as ``true`` (but see the residual
+          below).
         * **Best effort.**  If the marker cannot be written, the buffer is still
           cleared and the old behaviour (``true`` on the next write) applies.
         * **No schema or action change.**  It uses the existing
@@ -107,6 +123,18 @@ class SessionResetMixin:
           / ``get_messages`` actions on the reserved sibling id
           ``"{session_id}:~reset"`` (:data:`RESET_MARKER_SUFFIX`; ids ending in
           it are refused by :meth:`add_message`).
+
+        **Known residual, not closed.**  A marker stays pending over a live buffer
+        when the first write after a reset is made by a client that predates the
+        marker, or -- hosted, non-memory tier, whose server-side rPush/lLen is not
+        atomic -- when two first writes both receive count 2.  Until it expires
+        (up to 24 h) such a marker can excuse a REAL idle-TTL loss of that buffer
+        as "reset by consolidate".  A write that gets count 2 cannot safely retire
+        it: it cannot tell a stale marker from one the in-flight count-1 writer is
+        about to consume, and consuming it first makes that writer report a fresh
+        bucket (the two-appends race test).  Two concurrent consolidates of one
+        session that read the same turns are caught by the "fewer turns than were
+        read" check except when exactly as many turns arrived as were read.
 
         :meth:`clear_session` itself is unchanged: it is the full wipe.
         """
@@ -117,7 +145,10 @@ class SessionResetMixin:
         )
         owners = [session_id] + ([carry_to] if carry_to and carry_to != session_id else [])
         marked: List[str] = []
-        if not late and (count is None or count > 0):
+        unvouched = self._cannot_vouch(
+            session_id, count, expected_count, read_complete,
+        )
+        if not late and not unvouched and (count is None or count > 0):
             reset_id = uuid.uuid4().hex
             for owner in owners:
                 if await self._write_reset_marker(project, owner, reason, reset_id):
@@ -138,10 +169,49 @@ class SessionResetMixin:
             else:
                 logger.warning(
                     "reset of session %s discarded %d turn(s) appended after "
-                    "the consolidation read (never summarized); the next write "
-                    "will report created_bucket=true.", session_id, extra,
+                    "the consolidation read (never summarized); no reset marker "
+                    "is left for them, so the next write normally reports "
+                    "created_bucket=true (a write racing this reset may not).",
+                    session_id, extra,
                 )
         return result
+
+    def _cannot_vouch(
+        self,
+        session_id: str,
+        count: Optional[int],
+        expected_count: Optional[int],
+        read_complete: bool,
+    ) -> bool:
+        """True when the reset cannot say that it discards only what was read.
+
+        Then no marker is written (the loss is not excused) and a WARNING says
+        why.  ``expected_count`` is None for a plain clear, which read nothing and
+        so has nothing to compare.
+        """
+        why: Optional[str] = None
+        if not read_complete:
+            why = "turns older than the consolidation read limit were never summarized"
+        elif expected_count is not None and count is not None and count < expected_count:
+            why = (
+                "the buffer holds fewer turns than the consolidation read "
+                "(a concurrent reset, or it expired meanwhile)"
+            )
+        elif (
+            self.client is None and expected_count is not None
+            and count is not None and count >= HOSTED_BUFFER_CAP
+        ):
+            why = (
+                f"the buffer is at the hosted cap of {HOSTED_BUFFER_CAP} turns, "
+                "where a turn appended during the consolidation cannot be seen"
+            )
+        if why is None:
+            return False
+        logger.warning(
+            "reset of session %s is not excused: %s; the next write may report "
+            "created_bucket=true.", session_id, why,
+        )
+        return True
 
     async def _message_count(self, project: str, session_id: str) -> Optional[int]:
         """How many messages the session's buffer holds right now (None: unknown).

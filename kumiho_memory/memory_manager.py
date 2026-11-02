@@ -1399,7 +1399,8 @@ class UniversalMemoryManager:
             read_total = int(messages_result.get("message_count", len(messages)) or 0)
         except (TypeError, ValueError):
             read_total = len(messages)
-        expected_count = len(messages) if read_total <= read_limit else read_total
+        read_complete = read_total <= read_limit
+        expected_count = len(messages) if read_complete else read_total
 
         # An empty buffer stops the LLM path (nothing to summarize) but NOT
         # the keyless one: there the agent wrote the summary from the
@@ -1902,7 +1903,8 @@ class UniversalMemoryManager:
         # created_bucket=false; see RedisMemoryBuffer.reset_session.
         await self.redis_buffer.reset_session(
             self.project, session_id, reason="consolidate",
-            expected_count=expected_count, carry_to=carry_to,
+            expected_count=expected_count, read_complete=read_complete,
+            carry_to=carry_to,
         )
 
         # Clear the active session pointer so the next conversation starts

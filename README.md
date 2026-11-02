@@ -653,15 +653,29 @@ A write into a session's working-memory buffer (`kumiho_chat_add`,
 not create a new session, and an explicit `session_id` never changes. They
 leave a one-shot marker that is consumed by the next write, so that write
 reports `created_bucket: false` with `buffer_reset_by`. The marker is only
-pending while nothing has been written since the reset, so it cannot hide a
-lost turn: it lives `max(TTL, 24 h)`, which means a pause longer than the
-buffer TTL after a consolidate is not reported as a lost session either (a
-pause longer than a day is). It never excuses a real loss: if the
-post-reset buffer later disappears (idle expiry, eviction), or the reset
-discarded nothing (an already-expired buffer), the next write reports `true`.
-Turns appended while a consolidate was summarizing were never consolidated:
-on a direct Redis they are kept in the buffer; through the hosted proxy, which
-can only delete, they are discarded as before, logged, and not excused.
+pending while nothing has been written since the reset, so normally it hides no
+lost turn; it lives `max(TTL, 24 h)`, which means a pause longer than the
+buffer TTL right after a consolidate is not reported as a lost session either
+(a pause longer than a day is). If the post-reset buffer later disappears (idle
+expiry, eviction) the next write reports `true`, and so does a write after a
+reset that discarded nothing (an already-expired buffer).
+
+Known limits. The marker can be excused wrongly in two residual cases: it stays
+pending over a live buffer when the first write after a reset comes from a client
+that predates the marker, or (hosted, non-memory tier, where the server's
+append is not atomic) when two first writes both receive count 2. Until it
+expires (up to 24 h) it can then excuse a real idle-TTL loss of that buffer as
+"reset by consolidate". Mixed old/new clients on one session id are not
+supported. The reset declines to excuse what it cannot vouch for (and logs a
+WARNING): turns appended while a consolidate was summarizing, a buffer longer
+than the 1000-turn read, a hosted buffer at the server's 250-turn cap, and fewer
+turns present than were read (a concurrent reset, or expiry mid-consolidate) --
+in those cases the next write normally reports `true`. Turns appended during a
+consolidate are kept on a direct Redis and discarded (logged) through the hosted
+proxy, which can only delete. Two consolidates of one session that read the same
+turns are caught by the fewer-turns check except when exactly as many turns
+arrived as were read.
+
 `RedisMemoryBuffer.clear_session` is the unchanged low-level full wipe and
 leaves no marker. A session resolved from the host environment rotates to a new
 id, `<id>:c<n>`, after consolidation; the marker is carried onto the new id, so

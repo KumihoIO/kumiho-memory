@@ -169,11 +169,36 @@ def test_hosted_proxy_a_turn_appended_during_a_consolidate_is_never_excused(prox
     assert marker == {}
     assert follow["created_bucket"] is True and "buffer_reset_by" not in follow
     assert "discarded 1 turn(s)" in caplog.text
+    # a WARNING that describes, and promises nothing (a first write racing the
+    # withdrawal could still see the marker)
+    assert "will report created_bucket=true" not in caplog.text
     # the late turn was seen before anything was written: no marker went out at all
     assert not [
         c for c in fake.calls
         if c["action"] == "set_session_metadata" and c["body"]["session_id"] == MARKER_ID
     ]
+
+
+def _seed_buffer(fake, held):
+    # the unregistered bearer "tok" is its own tenant in the fake (see FakeMemoryProxy)
+    fake._bucket("tok")["messages"][SESSION] = [
+        {"role": "user", "content": f"m{n}", "metadata": {}} for n in range(held)
+    ]
+
+
+@pytest.mark.parametrize("held,excused", [(249, True), (250, False)])
+def test_hosted_proxy_a_buffer_at_the_server_cap_gets_no_marker(proxied, held, excused):
+    """A memory-only tenant's server trims to the last 250 turns on every append, so
+    at the cap a late append leaves the count unchanged and cannot be told apart
+    from "nothing arrived".  At the cap the reset excuses nothing."""
+    manager, buffer, fake = proxied
+    _seed_buffer(fake, held)
+    asyncio.run(buffer.reset_session(
+        manager.project, SESSION, reason="consolidate", expected_count=held,
+    ))
+    follow = asyncio.run(add(buffer, manager, "next"))
+    assert follow["created_bucket"] is (not excused)
+    assert ("buffer_reset_by" in follow) is excused
 
 
 def test_hosted_proxy_a_turn_landing_between_the_check_and_the_delete_withdraws_the_marker(proxied):

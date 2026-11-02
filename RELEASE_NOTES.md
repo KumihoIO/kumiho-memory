@@ -22,6 +22,17 @@
   unwritable marker degrades to the old behaviour.
 - Session ids ending in `:~reset` are refused by `add_message` (reserved for markers).
   Generated and host-supplied ids never contain a `~`.
+- The reset declines to excuse what it cannot vouch for (WARNING, no marker, so the next
+  write normally reports `created_bucket: true`): a consolidate read truncated at 1000
+  turns, a hosted buffer at the 250-turn server cap, and fewer turns present than were read
+  (a concurrent reset or expiry mid-consolidate).
+- Known limits: a marker can stay pending over a live buffer (first write after a reset
+  made by a client that predates the marker, or two simultaneous first writes on the hosted
+  non-memory tier, both receiving count 2); for up to 24 h it can then excuse a real
+  idle-TTL loss of that buffer. A write that gets count 2 cannot safely retire it (it cannot
+  tell a stale marker from one the in-flight first writer is about to consume). Mixed
+  old/new clients on one session id are not supported. Two consolidates that read the same
+  turns are caught except when exactly as many turns arrived as were read.
 
 ## 1.6.4
 
