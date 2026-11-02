@@ -685,6 +685,10 @@ class _StubManager:
                 mgr.seen["op_session"] = session_id
                 return {"success": True, "cleared_count": 0}
 
+            async def reset_session(self, project, session_id, *, reason):
+                mgr.seen["op_session"] = session_id
+                return {"success": True, "cleared_count": 0}
+
         self.redis_buffer = _Buf()
 
     async def resolve_session_id(self, user_id=None, context=None):

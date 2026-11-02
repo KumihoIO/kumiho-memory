@@ -35,6 +35,15 @@ DEFAULT_WORKING_MEMORY_TTL = 3600
 WORKING_MEMORY_TTL_ENV = "KUMIHO_WORKING_MEMORY_TTL"
 
 
+#: Suffix of the reserved sibling session id that holds a session's one-shot
+#: reset marker (see :meth:`RedisMemoryBuffer.reset_session`).  The marker is
+#: kept as the *session metadata* of ``"{session_id}:~reset"`` rather than under
+#: a purpose-built key so the identical bytes work against a direct Redis and
+#: against the control-plane proxy, whose action list is closed and whose
+#: request schema is strict (an unknown action or field is a 400).
+RESET_MARKER_SUFFIX = ":~reset"
+
+
 def resolve_working_memory_ttl(explicit: Optional[int] = None) -> int:
     """The buffer TTL to use: explicit argument, else the env knob, else 3600.
 
@@ -443,8 +452,10 @@ class RedisMemoryBuffer:
             # An older proxy server returns its payload without the mint
             # flag; derive it from message_count so hosted mode carries the
             # same drift signal as the local path (PR #4 review, round 4).
-            if isinstance(result, dict) and "created_bucket" not in result:
-                result["created_bucket"] = result.get("message_count") == 1
+            if isinstance(result, dict):
+                if "created_bucket" not in result:
+                    result["created_bucket"] = result.get("message_count") == 1
+                await self._excuse_deliberate_reset(project, session_id, result)
             return result
 
         key = self._session_messages_key(project, session_id)
@@ -461,7 +472,7 @@ class RedisMemoryBuffer:
         count = await self.client.rpush(key, json.dumps(message))
         await self.client.expire(key, self.default_ttl)
 
-        return {
+        result = {
             "success": True,
             "message_id": f"{session_id}:{count}",
             "message_count": count,
@@ -471,8 +482,13 @@ class RedisMemoryBuffer:
             # message (issue #3). Surfacing it lets the caller notice; a read
             # of a wrong id returns a clean empty indistinguishable from a
             # new session, so the write is where the signal has to live.
+            #
+            # "Did not exist" excludes a session that was deliberately reset
+            # (consolidate, chat_clear): see _excuse_deliberate_reset.
             "created_bucket": count == 1,
         }
+        await self._excuse_deliberate_reset(project, session_id, result)
+        return result
 
     async def get_messages(
         self,
@@ -526,22 +542,37 @@ class RedisMemoryBuffer:
         project: str,
         session_id: str,
         metadata: Dict[str, str],
+        *,
+        ttl_seconds: Optional[int] = None,
     ) -> None:
-        """Store session-level metadata (e.g. user_id, context)."""
+        """Store session-level metadata (e.g. user_id, context).
+
+        ``ttl_seconds`` overrides the idle TTL of the metadata hash; omitted, a
+        direct Redis uses :attr:`default_ttl` and the proxy its own default, and
+        the request is byte-identical to what it always was.  Only the reset
+        marker passes it, so that the marker lives as long as the buffer would
+        have even where the proxy default (an hour) is shorter.
+        """
         if self.client is None:
+            payload: Dict[str, Any] = {
+                "project": project,
+                "session_id": session_id,
+                "metadata": metadata,
+            }
+            if ttl_seconds is not None:
+                # ``default_ttl`` is an existing field of the proxy schema
+                # (add_message sends it); no new field reaches the wire.
+                payload["default_ttl"] = ttl_seconds
             await self._proxy_request(
-                action="set_session_metadata",
-                payload={
-                    "project": project,
-                    "session_id": session_id,
-                    "metadata": metadata,
-                },
+                action="set_session_metadata", payload=payload,
             )
             return
 
         key = self._session_metadata_key(project, session_id)
         await self.client.hset(key, mapping=metadata)
-        await self.client.expire(key, self.default_ttl)
+        await self.client.expire(
+            key, self.default_ttl if ttl_seconds is None else ttl_seconds,
+        )
 
     async def get_session_metadata(
         self,
@@ -576,6 +607,135 @@ class RedisMemoryBuffer:
         await self.client.delete(key)
         await self.client.delete(self._session_metadata_key(project, session_id))
         return {"success": True, "cleared_count": count}
+
+    async def reset_session(
+        self, project: str, session_id: str, *, reason: str,
+    ) -> Dict[str, Any]:
+        """Empty a session's buffer while the session itself carries on.
+
+        What ``consolidate_session`` (``reason="consolidate"``) and
+        ``kumiho_chat_clear`` (``reason="clear"``) do.  The result is
+        :meth:`clear_session`'s; the difference is a one-shot *reset marker*
+        that makes the next write into this same session id report
+        ``created_bucket: false`` (plus ``buffer_reset_by: <reason>``) instead of
+        a fresh bucket.
+
+        ``created_bucket: true`` therefore means one thing only: this session id
+        has no buffer and no pending deliberate reset -- it never existed, or its
+        buffer was lost to idle-TTL expiry.  Without the marker a consolidate
+        emptied the buffer, the next RPUSH returned 1, and the unchanged session
+        looked recreated mid-conversation.
+
+        Properties the callers rely on:
+
+        * **Only when something was discarded.**  The marker is written only if
+          the buffer held messages; resetting an empty buffer leaves any
+          existing marker (or the absence of one) as it was.
+        * **Written before the buffer is deleted.**  A write racing the reset
+          either lands in the still-live buffer (count > 1) or finds the marker;
+          none can see "empty buffer, no marker".
+        * **One TTL, single use.**  The marker lives one working-memory TTL from
+          the reset and is consumed by the first write after it, so a later loss
+          (idle expiry, eviction) of the post-reset buffer reads as ``true``.
+        * **Best effort.**  If the marker cannot be written, the buffer is still
+          cleared and the old behaviour (``true`` on the next write) applies.
+        * **No wire change.**  It uses the existing ``set_session_metadata`` /
+          ``get_session_metadata`` actions on the reserved sibling id
+          ``"{session_id}:~reset"`` (:data:`RESET_MARKER_SUFFIX`), so a deployed
+          control plane needs nothing new.
+
+        :meth:`clear_session` itself is unchanged: it is the full wipe.
+        """
+        if await self._holds_messages(project, session_id):
+            await self._write_reset_marker(project, session_id, reason)
+        return await self.clear_session(project, session_id)
+
+    async def _holds_messages(self, project: str, session_id: str) -> bool:
+        """Whether the session's buffer holds any message right now.
+
+        A reset only needs to excuse the next write when it actually discarded
+        buffered turns.  Resetting an empty buffer -- consolidating a session
+        whose buffer already idled out, a second consolidate before anything new
+        was written, a clear of an id nobody used -- discards nothing, so it must
+        neither turn a genuine TTL loss into "reset by consolidate" nor overwrite
+        a marker that is still pending.  If the length cannot be read the answer
+        is "yes": the caller is resetting a session it has been using, and a
+        false alarm is the worse error.
+        """
+        try:
+            if self.client is None:
+                got = await self._proxy_request(
+                    action="get_messages",
+                    payload={
+                        "project": project, "session_id": session_id,
+                        "limit": 1, "offset": 0,
+                    },
+                )
+                return int(got.get("message_count", 0)) > 0
+            return await self.client.llen(
+                self._session_messages_key(project, session_id)
+            ) > 0
+        except Exception:  # noqa: BLE001 - unknown counts as "yes"
+            return True
+
+    @staticmethod
+    def _reset_marker_session_id(session_id: str) -> str:
+        return f"{session_id}{RESET_MARKER_SUFFIX}"
+
+    async def _write_reset_marker(
+        self, project: str, session_id: str, reason: str,
+    ) -> None:
+        try:
+            await self.set_session_metadata(
+                project,
+                self._reset_marker_session_id(session_id),
+                {"state": "pending", "reason": reason},
+                ttl_seconds=self.default_ttl,
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail the reset over it
+            logger.warning(
+                "Could not write the reset marker for session %s (%s); the "
+                "next write into it will report created_bucket=true.",
+                session_id, exc,
+            )
+
+    async def _excuse_deliberate_reset(
+        self, project: str, session_id: str, result: Dict[str, Any],
+    ) -> None:
+        """Turn a write's ``created_bucket: true`` into ``false`` after a reset.
+
+        Only a write that minted the bucket (count == 1) ever looks at the
+        marker, and RPUSH hands "1" to exactly one concurrent writer, so the
+        marker is consumed once.  Adds ``buffer_reset_by`` (additive) when it
+        applies; leaves ``result`` untouched otherwise.
+        """
+        if result.get("created_bucket") is not True:
+            return
+        marker_id = self._reset_marker_session_id(session_id)
+        try:
+            marker = await self.get_session_metadata(project, marker_id)
+        except Exception as exc:  # noqa: BLE001 - unreadable == absent
+            logger.warning(
+                "Could not read the reset marker for session %s (%s); "
+                "reporting created_bucket=true.",
+                session_id, exc,
+            )
+            return
+        if marker.get("state") != "pending":
+            return
+        try:
+            await self.set_session_metadata(
+                project, marker_id, {"state": "consumed"},
+                ttl_seconds=self.default_ttl,
+            )
+        except Exception as exc:  # noqa: BLE001 - the reset is real regardless
+            logger.warning(
+                "Could not mark the reset marker of session %s consumed (%s); "
+                "it stays pending until its TTL.",
+                session_id, exc,
+            )
+        result["created_bucket"] = False
+        result["buffer_reset_by"] = str(marker.get("reason") or "reset")
 
     async def list_sessions(self, project: str, limit: int = 20) -> Dict[str, Any]:
         """List active sessions with working memory."""

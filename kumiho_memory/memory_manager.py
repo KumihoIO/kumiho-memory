@@ -1017,18 +1017,23 @@ class UniversalMemoryManager:
                 timeout=self.auto_assess_timeout,
                 label=f"auto-assess ({session_id})",
             )
-        return {
+        response_result = {
             "success": True,
             "message_count": result["message_count"],
             # True when this write MINTED the bucket. An assistant response
             # normally lands in a session that already holds the user's turns;
             # a fresh bucket here means the caller addressed a session that
             # did not exist — the drifted-id case issue #3 calls silent. The
-            # flag is how it stops being silent.
+            # flag is how it stops being silent. A session that was merely
+            # RESET (consolidate, chat_clear) is not one that did not exist:
+            # that write reports false and says so in buffer_reset_by.
             "created_bucket": result.get(
                 "created_bucket", result.get("message_count") == 1
             ),
         }
+        if result.get("buffer_reset_by"):
+            response_result["buffer_reset_by"] = result["buffer_reset_by"]
+        return response_result
 
     async def _background_assess(self, session_id: str) -> None:
         """Background task: decide if recent buffer content is worth storing.
@@ -1871,7 +1876,14 @@ class UniversalMemoryManager:
                         exc, env_session,
                     )
 
-        await self.redis_buffer.clear_session(self.project, session_id)
+        # reset_session, not clear_session: consolidating empties the buffer but
+        # the session itself carries on under the same id (an explicit id never
+        # rotates), so the next write must not read as a recreated session.
+        # It leaves the one-shot marker that makes that write report
+        # created_bucket=false; see RedisMemoryBuffer.reset_session.
+        await self.redis_buffer.reset_session(
+            self.project, session_id, reason="consolidate",
+        )
 
         # Clear the active session pointer so the next conversation starts
         # fresh — but ONLY if it still points at the session just consolidated.

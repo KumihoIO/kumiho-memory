@@ -637,6 +637,29 @@ core `kumiho` MCP server:
 | `kumiho_code_capture` | *(opt-in)* Record explicit code decisions and evidence |
 | `kumiho_code_mine_session` | *(opt-in)* Extract decisions from a session transcript |
 
+#### Session continuity: `created_bucket` and `buffer_reset_by`
+
+A write into a session's working-memory buffer (`kumiho_chat_add`,
+`kumiho_memory_add_response`, `kumiho_memory_reflect`) reports whether it
+*minted* the buffer:
+
+| `created_bucket` | `buffer_reset_by` | Meaning |
+| ---------------- | ----------------- | ------- |
+| `true` | absent | The session id had no buffer: it was never used before, or the buffer was lost to idle-TTL expiry (`KUMIHO_WORKING_MEMORY_TTL`). On a turn that is not the first, the earlier turns are gone (or the id drifted). |
+| `false` | absent | An ordinary write into a live buffer. |
+| `false` | `"consolidate"` or `"clear"` | The first write after a deliberate reset of the *same* session. |
+
+`kumiho_memory_consolidate` and `kumiho_chat_clear` empty the buffer; they do
+not create a new session, and an explicit `session_id` never changes. They
+leave a one-shot marker that lives one working-memory TTL and is consumed by the
+next write, so that write reports `created_bucket: false` with
+`buffer_reset_by`. The marker never hides a real loss: if the TTL passes first,
+or the post-reset buffer later disappears, the next write reports `true`.
+`RedisMemoryBuffer.clear_session` is the unchanged low-level full wipe and
+leaves no marker. (A session resolved from the host environment rather than
+passed explicitly rotates to a new id, `<id>:c<n>`, after consolidation; that
+new id is reported as a new bucket.)
+
 ---
 
 ### Modules

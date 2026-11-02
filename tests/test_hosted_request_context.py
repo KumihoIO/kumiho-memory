@@ -1013,7 +1013,12 @@ def test_every_proxy_call_carries_the_requesting_tenants_bearer(proxy, hosted_ma
 
     assert proxy.unauthenticated_calls == []
     by_session = {c["body"].get("session_id"): c["bearer"] for c in proxy.calls}
-    assert by_session == {"s-a": "jwt-a", "s-b": "jwt-b"}
+    # A write that mints a bucket also looks up the session's reset marker (the
+    # sibling id "<session>:~reset"); that side call is the requester's too.
+    assert by_session == {
+        "s-a": "jwt-a", "s-a:~reset": "jwt-a",
+        "s-b": "jwt-b", "s-b:~reset": "jwt-b",
+    }
 
 
 def test_the_token_is_resolved_per_call_not_frozen_into_the_buffer(proxy, hosted_managers):
@@ -1035,7 +1040,13 @@ def test_the_token_is_resolved_per_call_not_frozen_into_the_buffer(proxy, hosted
             project="P", session_id="s1", role="user", content="two",
         ))
     assert same is manager
-    assert [c["bearer"] for c in proxy.calls] == ["jwt-first", "jwt-second"]
+    # The first write mints the bucket, so it is followed by the reset-marker
+    # lookup (same request, same token); the second request's write is not.
+    assert [(c["action"], c["bearer"]) for c in proxy.calls] == [
+        ("add_message", "jwt-first"),
+        ("get_session_metadata", "jwt-first"),
+        ("add_message", "jwt-second"),
+    ]
 
 
 # ---------------------------------------------------------------------------

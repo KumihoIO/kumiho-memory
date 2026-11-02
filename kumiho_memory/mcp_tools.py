@@ -836,9 +836,14 @@ def tool_chat_clear(args: Dict[str, Any]) -> Dict[str, Any]:
 
     async def _run():
         session_id, source = await _resolve_session(args, manager)
-        result = await manager.redis_buffer.clear_session(
+        # reset_session, not clear_session: the id stays, only the buffer is
+        # emptied, so the next write is a deliberate reset and must not be
+        # reported as a recreated session (created_bucket stays false, with
+        # buffer_reset_by="clear").  clear_session remains the full wipe.
+        result = await manager.redis_buffer.reset_session(
             args.get("project", manager.project),
             session_id,
+            reason="clear",
         )
         return _annotate_session(result, session_id, source)
 
@@ -1620,6 +1625,11 @@ def tool_memory_reflect(args: Dict[str, Any]) -> Dict[str, Any]:
         # a success that filed the turn somewhere nobody will read.
         "created_bucket": buf_result.get("created_bucket", False),
     }
+    if buf_result.get("buffer_reset_by"):
+        # Additive: this write followed a deliberate reset (consolidate,
+        # chat_clear) of the SAME session, so created_bucket is false. Only
+        # present when it applies.
+        result["buffer_reset_by"] = buf_result["buffer_reset_by"]
     if capture_results is not None:
         result["capture_results"] = capture_results
     if dropped_event_dates:
